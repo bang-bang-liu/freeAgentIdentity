@@ -118,6 +118,40 @@ function getCredentials(acc: any) {
   return Array.isArray(acc?.credentials) ? acc.credentials : []
 }
 
+function getPlatformCredentialValue(acc: any, key: string) {
+  const credential = getCredentials(acc).find((item: any) => (
+    item?.scope === 'platform' && item?.key === key && item?.value != null && item?.value !== ''
+  ))
+  return credential?.value || ''
+}
+
+function getSecuritySettings(acc: any) {
+  const overview = getAccountOverview(acc)
+  const legacyExtra = overview?.legacy_extra && typeof overview.legacy_extra === 'object'
+    ? overview.legacy_extra
+    : {}
+  const totpSecret = String(
+    getPlatformCredentialValue(acc, 'totp_secret')
+      || acc?.totp_secret
+      || legacyExtra.totp_secret
+      || '',
+  )
+  const otpauth = String(
+    getPlatformCredentialValue(acc, 'otpauth')
+      || acc?.otpauth
+      || legacyExtra.otpauth
+      || '',
+  )
+  const explicitTotpSet = legacyExtra.totp_set ?? acc?.totp_set
+  return {
+    password: String(acc?.password || ''),
+    passwordSet: Boolean(legacyExtra.password_set ?? acc?.password_set ?? acc?.password),
+    totpSet: explicitTotpSet == null ? Boolean(totpSecret || otpauth) : Boolean(explicitTotpSet),
+    totpSecret,
+    otpauth,
+  }
+}
+
 function getCashierUrl(acc: any) {
   const overview = getAccountOverview(acc)
   return overview?.cashier_url || acc?.cashier_url || ''
@@ -1221,7 +1255,10 @@ function DetailModal({ acc, onClose, onSave }: { acc: any; onClose: () => void; 
   const displayBadges = getDisplayBadges(acc)
   const displaySections = getDisplaySections(acc)
   const copyText = (text: string) => navigator.clipboard.writeText(text)
-  const platformCredentials = credentials.filter((item: any) => item.scope === 'platform')
+  const securitySettings = getSecuritySettings(acc)
+  const platformCredentials = credentials.filter((item: any) => (
+    item.scope === 'platform' && !['totp_secret', 'otpauth'].includes(item.key)
+  ))
 
   const save = async () => {
     setSaving(true)
@@ -1288,6 +1325,76 @@ function DetailModal({ acc, onClose, onSave }: { acc: any; onClose: () => void; 
 
           <DisplayWarnings warnings={warnings} />
           <DisplaySections sections={displaySections} />
+
+          <div className="space-y-3 rounded-xl border border-[var(--border)] bg-[var(--bg-hover)] p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <label className="text-xs font-semibold text-[var(--text-primary)]">安全设置</label>
+              <div className="flex flex-wrap gap-1.5 text-[11px]">
+                <span className="rounded-full border border-[var(--border)] px-2 py-0.5 text-[var(--text-secondary)]">
+                  密码: {securitySettings.passwordSet ? '已设置' : '未设置'}
+                </span>
+                <span className="rounded-full border border-[var(--border)] px-2 py-0.5 text-[var(--text-secondary)]">
+                  2FA: {securitySettings.totpSet ? '已启用' : '未设置'}
+                </span>
+              </div>
+            </div>
+            <div className="grid gap-2">
+              <div>
+                <div className="text-[11px] text-[var(--text-muted)]">ChatGPT 密码</div>
+                <div className="mt-1 flex items-start gap-1">
+                  <div className="flex-1 rounded-md border border-[var(--border)] bg-black/20 px-2 py-1.5 text-xs font-mono text-[var(--text-secondary)] break-all">
+                    {securitySettings.password || '未记录'}
+                  </div>
+                  {securitySettings.password && (
+                    <button
+                      title="复制密码"
+                      aria-label="复制密码"
+                      onClick={() => copyText(securitySettings.password)}
+                      className="mt-1 shrink-0 text-[var(--text-muted)] hover:text-[var(--text-secondary)]"
+                    >
+                      <Copy className="h-3 w-3" />
+                    </button>
+                  )}
+                </div>
+              </div>
+              <div>
+                <div className="text-[11px] text-[var(--text-muted)]">TOTP Secret</div>
+                <div className="mt-1 flex items-start gap-1">
+                  <div className="flex-1 rounded-md border border-[var(--border)] bg-black/20 px-2 py-1.5 text-xs font-mono text-[var(--text-secondary)] break-all">
+                    {securitySettings.totpSecret || (securitySettings.totpSet ? '已启用，未返回密钥' : '未记录')}
+                  </div>
+                  {securitySettings.totpSecret && (
+                    <button
+                      title="复制 TOTP Secret"
+                      aria-label="复制 TOTP Secret"
+                      onClick={() => copyText(securitySettings.totpSecret)}
+                      className="mt-1 shrink-0 text-[var(--text-muted)] hover:text-[var(--text-secondary)]"
+                    >
+                      <Copy className="h-3 w-3" />
+                    </button>
+                  )}
+                </div>
+              </div>
+              <div>
+                <div className="text-[11px] text-[var(--text-muted)]">otpauth URI</div>
+                <div className="mt-1 flex items-start gap-1">
+                  <div className="flex-1 rounded-md border border-[var(--border)] bg-black/20 px-2 py-1.5 text-xs font-mono text-[var(--text-secondary)] break-all max-h-32 overflow-y-auto">
+                    {securitySettings.otpauth || (securitySettings.totpSet ? '已启用，未返回 URI' : '未记录')}
+                  </div>
+                  {securitySettings.otpauth && (
+                    <button
+                      title="复制 otpauth URI"
+                      aria-label="复制 otpauth URI"
+                      onClick={() => copyText(securitySettings.otpauth)}
+                      className="mt-1 shrink-0 text-[var(--text-muted)] hover:text-[var(--text-secondary)]"
+                    >
+                      <Copy className="h-3 w-3" />
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
 
           {(displayBadges.length > 0 || verificationMailbox?.email) && (
             <div className="space-y-2">

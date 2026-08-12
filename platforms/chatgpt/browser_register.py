@@ -1,5 +1,7 @@
 """ChatGPT 浏览器注册流程（Camoufox）。"""
 import base64
+import hashlib
+import hmac
 import json
 import random
 import re
@@ -7,7 +9,7 @@ import secrets
 import time
 import uuid
 from typing import Any, Callable, Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urlencode, urljoin, urlparse
 
 from camoufox.sync_api import Camoufox
 
@@ -1443,6 +1445,861 @@ def _build_browser_sentinel_token(page, device_id: str, flow: str, user_agent: s
     )
 
 
+def _decode_totp_secret(secret: str) -> bytes:
+    cleaned = re.sub(r"\s+", "", str(secret or "")).upper().rstrip("=")
+    if not cleaned or re.search(r"[^A-Z2-7]", cleaned):
+        raise ValueError("TOTP secret 不是有效的 Base32 字符串")
+    padded = cleaned + "=" * (-len(cleaned) % 8)
+    try:
+        return base64.b32decode(padded, casefold=True)
+    except Exception as exc:
+        raise ValueError("TOTP secret Base32 解码失败") from exc
+
+
+def _generate_totp_code(secret: str, *, timestamp: float | None = None) -> str:
+    key = _decode_totp_secret(secret)
+    counter = int((time.time() if timestamp is None else timestamp) // 30)
+    digest = hmac.new(key, counter.to_bytes(8, "big"), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    value = (
+        ((digest[offset] & 0x7F) << 24)
+        | ((digest[offset + 1] & 0xFF) << 16)
+        | ((digest[offset + 2] & 0xFF) << 8)
+        | (digest[offset + 3] & 0xFF)
+    )
+    return str(value % 1_000_000).zfill(6)
+
+
+def _build_totp_otpauth(email: str, secret: str) -> str:
+    label = quote(str(email or "chatgpt"), safe="")
+    return (
+        f"otpauth://totp/OpenAI:{label}?secret={secret}"
+        "&issuer=OpenAI&algorithm=SHA1&digits=6&period=30"
+    )
+
+
+def _security_page_text(page) -> str:
+    try:
+        return str(page.evaluate("() => document.body?.innerText || ''") or "").lower()
+    except Exception:
+        return ""
+
+
+def _security_page_has_code_input(page) -> bool:
+    return bool(
+        _find_first_selector(
+            page,
+            [
+                'input[name="code"]',
+                'input[autocomplete="one-time-code"]',
+                "input[inputmode='numeric']",
+                "input[pattern*='[0-9]']",
+                'input[type="tel"]',
+            ],
+        )
+    )
+
+
+def _security_is_email_otp_page(page) -> bool:
+    current_url = str(getattr(page, "url", "") or "").lower()
+    text = _security_page_text(page)
+    if "email-verification" in current_url or "email-otp" in current_url:
+        return True
+    if "/mfa-challenge" in current_url and any(
+        marker in text
+        for marker in (
+            "sent to",
+            "check your inbox",
+            "检查你的收件箱",
+            "验证码已发送",
+            "发送到",
+        )
+    ):
+        return not any(
+            marker in text
+            for marker in (
+                "authenticator",
+                "one-time password application",
+                "身份验证应用",
+                "验证器",
+            )
+        )
+    return False
+
+
+def _security_is_mfa_selection_page(page) -> bool:
+    current_url = str(getattr(page, "url", "") or "").lower()
+    if "/mfa-challenge" not in current_url:
+        return False
+    if "/mfa-challenge/" not in current_url:
+        return True
+    if _security_page_has_code_input(page):
+        return False
+    text = _security_page_text(page)
+    return any(
+        marker in text
+        for marker in (
+            "authenticator",
+            "one-time password",
+            "验证器",
+            "身份验证应用",
+            "try another method",
+            "选择",
+        )
+    )
+
+
+def _security_is_totp_page(page, secret: str = "") -> bool:
+    if not _security_page_has_code_input(page):
+        return False
+    current_url = str(getattr(page, "url", "") or "").lower()
+    text = _security_page_text(page)
+    if "new-password" in current_url or "reset-password" in current_url:
+        return False
+    if _security_is_email_otp_page(page):
+        return False
+    totp_markers = (
+        "one-time password application",
+        "check your preferred one-time password",
+        "authenticator",
+        "身份验证应用",
+        "验证器应用",
+        "one-time code",
+        "一次性验证码",
+        "totp",
+    )
+    if "/mfa-challenge" in current_url and any(marker in text for marker in totp_markers):
+        return True
+    return bool(secret and "/mfa-challenge" in current_url and "phone" not in text and "whatsapp" not in text)
+
+
+def _security_is_password_page(page) -> bool:
+    current_url = str(getattr(page, "url", "") or "").lower()
+    if _security_is_login_password_page(page):
+        return False
+    has_password_input = bool(_find_first_selector(page, PASSWORD_INPUT_SELECTORS))
+    if "reset-password" in current_url or "new-password" in current_url:
+        return has_password_input
+    text = _security_page_text(page)
+    return bool(
+        has_password_input
+        and any(marker in text for marker in ("password", "密码"))
+    )
+
+
+def _security_is_login_password_page(page) -> bool:
+    return _is_login_password_url(str(getattr(page, "url", "") or "")) and bool(
+        _find_first_selector(page, PASSWORD_INPUT_SELECTORS)
+    )
+
+
+def _security_error_code(data: Any) -> str:
+    if not isinstance(data, dict):
+        return ""
+    error = data.get("error")
+    if isinstance(error, str):
+        return error
+    if isinstance(error, dict):
+        return str(error.get("code") or error.get("message") or "")
+    return str(data.get("code") or data.get("detail") or "")
+
+
+def _security_result_error(result: dict) -> str:
+    code = _security_error_code(result.get("data"))
+    text = str(result.get("text") or "").strip()
+    return (code or text or f"HTTP {int(result.get('status') or 0)}")[:300]
+
+
+def _build_browser_sentinel_headers(page, flow: str, log) -> dict:
+    """Build Sentinel headers using the page SDK, with the existing fallback."""
+    invocation_id = str(uuid.uuid4())
+    sdk_urls = [
+        f"{SENTINEL_BASE}/backend-api/sentinel/sdk.js",
+        SENTINEL_SDK_URL,
+        f"{CHATGPT_APP}/backend-api/sentinel/sdk.js",
+    ]
+    try:
+        sdk_result = page.evaluate(
+            """
+            async ({ flow, sdkUrls }) => {
+              const waitForSdk = () => {
+                const current = window.SentinelSDK;
+                return current && typeof current.token === 'function' ? current : null;
+              };
+              let sdk = waitForSdk();
+              if (!sdk) {
+                for (const src of sdkUrls) {
+                  try {
+                    await new Promise((resolve, reject) => {
+                      const script = document.createElement('script');
+                      script.src = src;
+                      script.onload = resolve;
+                      script.onerror = reject;
+                      (document.head || document.documentElement).appendChild(script);
+                    });
+                    sdk = waitForSdk();
+                    if (sdk) break;
+                  } catch (_) {}
+                }
+              }
+              if (!sdk) return { token: '', so: '' };
+              if (typeof sdk.init === 'function') {
+                try { await sdk.init(flow); } catch (_) {}
+              }
+              let token = '';
+              try { token = await sdk.token(flow); } catch (_) {}
+              let so = '';
+              if (typeof sdk.sessionObserverToken === 'function') {
+                try { so = await sdk.sessionObserverToken(flow); } catch (_) {}
+              }
+              return {
+                token: typeof token === 'string' ? token : JSON.stringify(token || ''),
+                so: typeof so === 'string' ? so : JSON.stringify(so || ''),
+              };
+            }
+            """,
+            {"flow": flow, "sdkUrls": sdk_urls},
+        )
+        token = str((sdk_result or {}).get("token") or "").strip()
+        if token:
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "x-access-flow-invocation-id": invocation_id,
+                "OpenAI-Sentinel-Token": token,
+            }
+            so = str((sdk_result or {}).get("so") or "").strip()
+            if so:
+                headers["OpenAI-Sentinel-SO-Token"] = so
+            log(f"Sentinel headers ready: flow={flow}, sdk=yes")
+            return headers
+    except Exception as exc:
+        log(f"Sentinel SDK 获取失败，使用 fallback: {str(exc)[:160]}")
+
+    user_agent = _random_chrome_ua()
+    try:
+        user_agent = str(page.evaluate("() => navigator.userAgent") or user_agent)
+    except Exception:
+        pass
+    try:
+        device_id = str(_get_cookies(page).get("oai-did") or "").strip() or str(uuid.uuid4())
+    except Exception:
+        device_id = str(uuid.uuid4())
+    fallback = _build_browser_sentinel_token(page, device_id, flow, user_agent)
+    if not fallback:
+        raise RuntimeError("无法生成 Sentinel token")
+    log(f"Sentinel headers ready: flow={flow}, sdk=fallback")
+    return {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "x-access-flow-invocation-id": invocation_id,
+        "OpenAI-Sentinel-Token": fallback,
+    }
+
+
+def _chatgpt_security_api(
+    page,
+    path: str,
+    *,
+    token: str,
+    method: str = "GET",
+    body: dict | None = None,
+) -> dict:
+    headers = {
+        "authorization": f"Bearer {token}",
+        "accept": "application/json",
+        "content-type": "application/json",
+        "oai-language": "en-US",
+    }
+    return _browser_fetch(
+        page,
+        f"{CHATGPT_APP}{path}",
+        method=method,
+        headers=headers,
+        body=json.dumps(body, separators=(",", ":")) if body is not None else None,
+        redirect="follow",
+    )
+
+
+def _chatgpt_security_session(page, log) -> dict:
+    result = _browser_fetch(
+        page,
+        f"{CHATGPT_APP}/api/auth/session",
+        method="GET",
+        headers={"accept": "application/json"},
+        redirect="follow",
+    )
+    data = result.get("data") if isinstance(result, dict) else None
+    access_token = str((data or {}).get("accessToken") or "").strip() if isinstance(data, dict) else ""
+    if int(result.get("status") or 0) != 200 or not access_token:
+        raise RuntimeError(f"安全设置前获取 ChatGPT accessToken 失败: {_security_result_error(result)}")
+    log("安全设置前置认证完成")
+    return data
+
+
+def _start_chatgpt_security_reauth(page, email: str, params: dict, callback_url: str, log) -> str:
+    csrf_token = _get_browser_csrf_token(page)
+    if not csrf_token:
+        raise RuntimeError("安全设置 re-auth 获取 CSRF token 失败")
+    try:
+        device_id = str(_get_cookies(page).get("oai-did") or "").strip() or str(uuid.uuid4())
+    except Exception:
+        device_id = str(uuid.uuid4())
+    query = {"login_hint": email or "", "ext-oai-did": device_id}
+    query.update({str(key): str(value) for key, value in (params or {}).items() if value not in (None, "")})
+    result = _browser_fetch(
+        page,
+        f"{CHATGPT_APP}/api/auth/signin/openai?{urlencode(query)}",
+        method="POST",
+        headers={
+            "accept": "application/json",
+            "content-type": "application/x-www-form-urlencoded",
+            "origin": CHATGPT_APP,
+            "referer": f"{CHATGPT_APP}/",
+        },
+        body=urlencode({"csrfToken": csrf_token, "callbackUrl": callback_url, "json": "true"}),
+        redirect="follow",
+    )
+    data = result.get("data") if isinstance(result, dict) else None
+    auth_url = str((data or {}).get("url") or "").strip() if isinstance(data, dict) else ""
+    if not auth_url:
+        raise RuntimeError(f"安全设置 re-auth 未返回 URL: {_security_result_error(result)}")
+    log("安全设置 re-auth 已启动")
+    _goto_with_retry(page, auth_url, wait_until="domcontentloaded", timeout=30000, log=log)
+    return auth_url
+
+
+def _click_totp_method(page, log) -> bool:
+    selector = _click_first_no_wait(
+        page,
+        [
+            'a[href*="/mfa-challenge/"]',
+            'button:has-text("Authenticator")',
+            'button:has-text("authenticator")',
+            'button:has-text("One-time password")',
+            'button:has-text("one-time password")',
+            'button:has-text("Authentication app")',
+            'button:has-text("验证器")',
+            'button:has-text("身份验证应用")',
+        ],
+        timeout=2,
+    )
+    if selector:
+        log(f"MFA 选择页已选择 TOTP: {selector}")
+        time.sleep(0.8)
+        return True
+    try:
+        clicked = bool(
+            page.evaluate(
+                """
+                () => {
+                  const visible = (el) => {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style && style.display !== 'none' && style.visibility !== 'hidden'
+                      && rect.width > 0 && rect.height > 0;
+                  };
+                  const nodes = Array.from(document.querySelectorAll('a,button,[role="button"]'));
+                  const target = nodes.find((el) => {
+                    const text = String(el.textContent || '').toLowerCase();
+                    const href = String(el.getAttribute('href') || '').toLowerCase();
+                    return visible(el) && (
+                      href.includes('/mfa-challenge/') || text.includes('authenticator')
+                      || text.includes('one-time password') || text.includes('验证器')
+                      || text.includes('身份验证应用')
+                    );
+                  });
+                  if (!target) return false;
+                  target.click();
+                  return true;
+                }
+                """
+            )
+        )
+    except Exception:
+        clicked = False
+    if clicked:
+        log("MFA 选择页已选择 TOTP")
+        time.sleep(0.8)
+    return clicked
+
+
+def _submit_security_code(page, code: str, log, *, timeout: int = 25) -> bool:
+    otp = str(code or "").strip()
+    if not otp:
+        return False
+    start_url = str(getattr(page, "url", "") or "")
+    filled = False
+    try:
+        digit_inputs = page.locator(
+            "input[inputmode='numeric'], input[autocomplete='one-time-code'], input[type='tel'], input[type='number']"
+        )
+        count = digit_inputs.count()
+        if count > 1 and count >= len(otp):
+            done = 0
+            for index in range(min(count, len(otp))):
+                try:
+                    box = digit_inputs.nth(index)
+                    box.wait_for(state="visible", timeout=800)
+                    box.fill("")
+                    box.type(otp[index], delay=random.randint(20, 60))
+                    done += 1
+                except Exception:
+                    break
+            filled = done >= len(otp)
+        if not filled:
+            for selector in (
+                'input[name="code"]',
+                'input[autocomplete="one-time-code"]',
+                "input[inputmode='numeric']",
+                "input[type='tel']",
+                "input[type='text']",
+            ):
+                if _fill_input_like_user(page, selector, otp):
+                    filled = True
+                    break
+    except Exception:
+        filled = False
+    if not filled:
+        return False
+
+    submit_selector = _click_first_no_wait(
+        page,
+        [
+            'button[type="submit"]',
+            'button[data-testid="continue-button"]',
+            'button:has-text("Continue")',
+            'button:has-text("Verify")',
+            'button:has-text("确认")',
+            'button:has-text("验证")',
+            'button:has-text("提交")',
+        ],
+        timeout=5,
+    )
+    if not submit_selector:
+        return False
+    log("安全设置验证码已提交")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        current_url = str(getattr(page, "url", "") or "")
+        text = _security_page_text(page)
+        if any(marker in text for marker in ("invalid code", "incorrect code", "代码无效", "验证码错误")):
+            return False
+        if current_url != start_url and not _security_page_has_code_input(page):
+            return True
+        if _security_is_mfa_selection_page(page) or _security_is_totp_page(page):
+            time.sleep(0.5)
+            continue
+        if _security_is_email_otp_page(page):
+            time.sleep(0.5)
+            continue
+        if not _security_page_has_code_input(page):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def _fill_security_password_form(page, password: str) -> bool:
+    try:
+        return bool(
+            page.evaluate(
+                """
+                (value) => {
+                  const nodes = Array.from(document.querySelectorAll(
+                    'input[name="new-password"], input[name="confirm-password"], '
+                    + 'input[autocomplete="new-password"], input[type="password"]'
+                  )).filter((el) => {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style && style.display !== 'none' && style.visibility !== 'hidden'
+                      && rect.width > 0 && rect.height > 0 && !el.disabled && !el.readOnly;
+                  });
+                  if (!nodes.length) return false;
+                  const setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                  )?.set;
+                  if (!setter) return false;
+                  nodes.slice(0, 2).forEach((input) => {
+                    setter.call(input, value);
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                    input.dispatchEvent(new Event('change', { bubbles: true }));
+                  });
+                  return nodes.slice(0, 2).every((input) => String(input.value || '') === String(value || ''));
+                }
+                """,
+                password,
+            )
+        )
+    except Exception:
+        return False
+
+
+def _complete_security_reauth(
+    page,
+    *,
+    password: str,
+    secret: str,
+    otp_callback: Callable[[], str] | None,
+    log,
+    expect_password_page: bool,
+    timeout: int = 120,
+) -> bool:
+    deadline = time.time() + timeout
+    password_submitted = False
+    email_submitted = False
+    while time.time() < deadline:
+        if _security_is_mfa_selection_page(page):
+            if not _click_totp_method(page, log):
+                raise RuntimeError("安全设置 MFA 选择页未找到 TOTP 选项")
+            continue
+        if _security_is_totp_page(page, secret):
+            if not secret:
+                raise RuntimeError("安全设置遇到 TOTP 挑战，但没有可用的 TOTP secret")
+            code = _generate_totp_code(secret)
+            if not _submit_security_code(page, code, log):
+                raise RuntimeError("安全设置 TOTP 验证失败")
+            continue
+        if _security_is_email_otp_page(page):
+            if not callable(otp_callback):
+                raise RuntimeError("安全设置 re-auth 需要邮箱验证码，但未提供 otp_callback")
+            if email_submitted:
+                time.sleep(0.5)
+                continue
+            code = str(otp_callback() or "").strip()
+            if not code or not _submit_security_code(page, code, log):
+                raise RuntimeError("安全设置 re-auth 邮箱验证码验证失败")
+            email_submitted = True
+            continue
+        if _security_is_password_page(page):
+            return True
+        if _security_is_login_password_page(page):
+            if password_submitted:
+                time.sleep(0.5)
+                continue
+            input_selector = _find_first_selector(page, PASSWORD_INPUT_SELECTORS)
+            if not input_selector or not _fill_input_like_user(page, input_selector, password):
+                raise RuntimeError("安全设置 re-auth 登录密码页填写失败")
+            _browser_pause(page)
+            submit_selector = _click_first_no_wait(
+                page,
+                PASSWORD_SUBMIT_SELECTORS,
+                timeout=8,
+            )
+            if not submit_selector and not _submit_form_with_fallback(page, input_selector):
+                raise RuntimeError("安全设置 re-auth 登录密码页提交失败")
+            log("安全设置 re-auth 登录密码已提交")
+            password_submitted = True
+            time.sleep(0.8)
+            continue
+        if "chatgpt.com" in str(getattr(page, "url", "") or "").lower():
+            if expect_password_page:
+                raise RuntimeError("安全设置 re-auth 未进入设置密码页面")
+            return True
+        current_url = str(getattr(page, "url", "") or "")
+        if "code=" in current_url:
+            if expect_password_page:
+                raise RuntimeError("安全设置 re-auth 未进入设置密码页面")
+            _goto_with_retry(page, f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=30000, log=log)
+            return True
+        error_text = _extract_auth_error_text(page)
+        if error_text and any(
+            marker in error_text.lower()
+            for marker in ("invalid", "incorrect", "failed", "error", "错误", "失败")
+        ):
+            raise RuntimeError(f"安全设置 re-auth 失败: {error_text[:300]}")
+        time.sleep(0.5)
+    raise RuntimeError("安全设置 re-auth 超时")
+
+
+def _submit_security_password_dom(
+    page,
+    *,
+    password: str,
+    secret: str,
+    otp_callback: Callable[[], str] | None,
+    log,
+    timeout: int = 90,
+) -> bool:
+    input_selector = _find_first_selector(page, PASSWORD_INPUT_SELECTORS)
+    if not input_selector:
+        return False
+    if not _fill_security_password_form(page, password) and not _fill_input_like_user(page, input_selector, password):
+        return False
+    _browser_pause(page)
+    submit_selector = _click_first_no_wait(
+        page,
+        [
+            'button[type="submit"]',
+            'button:has-text("Continue")',
+            'button:has-text("Confirm")',
+            'button:has-text("Save")',
+            'button:has-text("确认")',
+            'button:has-text("保存")',
+            'button:has-text("提交")',
+        ],
+        timeout=8,
+    )
+    if not submit_selector and not _submit_form_with_fallback(page, input_selector):
+        return False
+    log("设置密码页面已提交")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _security_is_mfa_selection_page(page):
+            if not _click_totp_method(page, log):
+                return False
+            continue
+        if _security_is_totp_page(page, secret):
+            if not secret:
+                return False
+            if not _submit_security_code(page, _generate_totp_code(secret), log):
+                return False
+            continue
+        if _security_is_email_otp_page(page):
+            if not callable(otp_callback):
+                return False
+            code = str(otp_callback() or "").strip()
+            if not code or not _submit_security_code(page, code, log):
+                return False
+            continue
+        text = _security_page_text(page)
+        if any(
+            marker in text
+            for marker in (
+                "password must not be reused",
+                "password is too weak",
+                "passwords must match",
+                "密码过弱",
+                "密码不匹配",
+            )
+        ):
+            return False
+        if not _security_is_password_page(page) and not _security_is_login_password_page(page):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def _submit_security_password_api(page, password: str, mode: str, log) -> dict:
+    endpoints = (
+        ["/api/accounts/password/reset", "/api/accounts/password/add"]
+        if mode == "reset"
+        else ["/api/accounts/password/add", "/api/accounts/password/reset"]
+    )
+    results = []
+    for path in endpoints:
+        headers = _build_browser_sentinel_headers(page, "password_reset", log)
+        response = _browser_fetch(
+            page,
+            f"{OPENAI_AUTH}{path}",
+            method="POST",
+            headers=headers,
+            body=json.dumps({"password": password}, separators=(",", ":")),
+            redirect="follow",
+        )
+        data = response.get("data") if isinstance(response, dict) else None
+        error_code = _security_error_code(data).lower()
+        text = str(response.get("text") or "").lower()
+        item = {
+            "path": path,
+            "status": int(response.get("status") or 0),
+            "error": error_code or text[:160],
+        }
+        results.append(item)
+        if bool(response.get("ok")):
+            log(f"设置密码 API 成功: {path}")
+            return {
+                "ok": True,
+                "path": path,
+                "continue_url": str((data or {}).get("continue_url") or "") if isinstance(data, dict) else "",
+                "results": results,
+            }
+        if "password_already_set" in error_code or "password_already_set" in text:
+            log(f"设置密码 API 返回已设置: {path}")
+            return {"ok": True, "path": path, "already_set": True, "results": results}
+    return {"ok": False, "results": results}
+
+
+def _setup_chatgpt_totp(
+    page,
+    *,
+    email: str,
+    password: str,
+    otp_callback: Callable[[], str] | None,
+    log,
+    session_data: dict,
+) -> dict:
+    token = str(session_data.get("accessToken") or "").strip()
+    info = _chatgpt_security_api(page, "/backend-api/accounts/mfa_info", token=token)
+    info_data = info.get("data") if isinstance(info, dict) else None
+    if isinstance(info_data, dict) and bool(info_data.get("mfa_enabled_v2")):
+        log("2FA 已启用，跳过重复 enrollment")
+        return {"totp_set": True, "totp_already_enabled": True, "totp_secret": "", "otpauth": ""}
+
+    enroll = _chatgpt_security_api(
+        page,
+        "/backend-api/accounts/mfa/enroll",
+        token=token,
+        method="POST",
+        body={"factor_type": "totp"},
+    )
+    enroll_data = enroll.get("data") if isinstance(enroll, dict) else None
+    if not bool(enroll.get("ok")) or not isinstance(enroll_data, dict):
+        log(f"TOTP enrollment 需要 re-auth: {_security_result_error(enroll)}")
+        callback_url = f"{CHATGPT_APP}/?security_setup=totp_continue"
+        _start_chatgpt_security_reauth(
+            page,
+            email,
+            {"connection": "password", "reauth": "password", "max_age": "0"},
+            callback_url,
+            log,
+        )
+        _complete_security_reauth(
+            page,
+            password=password,
+            secret="",
+            otp_callback=otp_callback,
+            log=log,
+            expect_password_page=False,
+        )
+        if "chatgpt.com" not in str(getattr(page, "url", "") or "").lower():
+            _goto_with_retry(page, f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=30000, log=log)
+        session_data = _chatgpt_security_session(page, log)
+        token = str(session_data.get("accessToken") or "").strip()
+        enroll = _chatgpt_security_api(
+            page,
+            "/backend-api/accounts/mfa/enroll",
+            token=token,
+            method="POST",
+            body={"factor_type": "totp"},
+        )
+        enroll_data = enroll.get("data") if isinstance(enroll, dict) else None
+    secret = str((enroll_data or {}).get("secret") or "").replace(" ", "").upper()
+    session_id = str((enroll_data or {}).get("session_id") or "").strip()
+    if not secret or not session_id:
+        raise RuntimeError(f"TOTP enrollment 未返回 secret/session_id: {_security_result_error(enroll)}")
+
+    code = _generate_totp_code(secret)
+    activate = _chatgpt_security_api(
+        page,
+        "/backend-api/accounts/mfa/user/activate_enrollment",
+        token=token,
+        method="POST",
+        body={"code": code, "factor_type": "totp", "session_id": session_id},
+    )
+    activate_data = activate.get("data") if isinstance(activate, dict) else None
+    if not bool(activate.get("ok")) or not isinstance(activate_data, dict) or activate_data.get("success") is not True:
+        raise RuntimeError(f"TOTP activate 失败: {_security_result_error(activate)}")
+    log("TOTP enrollment/activate 成功")
+    return {
+        "totp_set": True,
+        "totp_already_enabled": False,
+        "totp_secret": secret,
+        "otpauth": _build_totp_otpauth(email, secret),
+        "totp_code": code,
+    }
+
+
+def _setup_chatgpt_password(
+    page,
+    *,
+    email: str,
+    password: str,
+    secret: str,
+    otp_callback: Callable[[], str] | None,
+    log,
+) -> dict:
+    callback_url = f"{CHATGPT_APP}/?security_setup=password_done"
+    _start_chatgpt_security_reauth(
+        page,
+        email,
+        {"post_login_add_password": "true", "prompt": "login", "max_age": "0"},
+        callback_url,
+        log,
+    )
+    _complete_security_reauth(
+        page,
+        password=password,
+        secret=secret,
+        otp_callback=otp_callback,
+        log=log,
+        expect_password_page=True,
+    )
+    mode = "reset" if "reset-password" in str(getattr(page, "url", "") or "").lower() else "add"
+    if _submit_security_password_dom(
+        page,
+        password=password,
+        secret=secret,
+        otp_callback=otp_callback,
+        log=log,
+    ):
+        return {"password_set": True, "password_path": "dom"}
+
+    api_result = _submit_security_password_api(page, password, mode, log)
+    if not api_result.get("ok"):
+        summary = "; ".join(
+            f"{item.get('path', '?')}->{item.get('status', '?')}"
+            for item in api_result.get("results") or []
+        )
+        raise RuntimeError(f"设置密码 API 失败: {summary or 'unknown'}")
+    continue_url = str(api_result.get("continue_url") or "").strip()
+    if continue_url:
+        _goto_with_retry(
+            page,
+            _normalize_url(continue_url, OPENAI_AUTH),
+            wait_until="domcontentloaded",
+            timeout=30000,
+            log=log,
+        )
+    elif "auth.openai.com" in str(getattr(page, "url", "") or "").lower():
+        _goto_with_retry(
+            page,
+            callback_url,
+            wait_until="domcontentloaded",
+            timeout=30000,
+            log=log,
+        )
+    return {
+        "password_set": True,
+        "password_path": f"{'already_set:' if api_result.get('already_set') else ''}{api_result.get('path') or 'api'}",
+    }
+
+
+def _setup_chatgpt_password_and_totp(
+    page,
+    *,
+    email: str,
+    password: str,
+    otp_callback: Callable[[], str] | None,
+    log,
+) -> dict:
+    """Run the user-script security flow before the final session request."""
+    session_data = _chatgpt_security_session(page, log)
+    session_email = str(((session_data.get("user") or {}).get("email") if isinstance(session_data.get("user"), dict) else "") or email).strip()
+    totp_result = _setup_chatgpt_totp(
+        page,
+        email=session_email,
+        password=password,
+        otp_callback=otp_callback,
+        log=log,
+        session_data=session_data,
+    )
+    if totp_result.get("totp_already_enabled") and not totp_result.get("totp_secret"):
+        # The existing registration password was already submitted.  Without
+        # the account's existing TOTP secret a second re-auth cannot be solved.
+        log("2FA 已存在且未返回 secret，保留注册时已设置的密码")
+        password_result = {"password_set": True, "password_path": "registration_existing"}
+    else:
+        password_result = _setup_chatgpt_password(
+            page,
+            email=session_email,
+            password=password,
+            secret=str(totp_result.get("totp_secret") or ""),
+            otp_callback=otp_callback,
+            log=log,
+        )
+    return {**totp_result, **password_result}
+
+
 def _is_registration_complete(state: dict) -> bool:
     page_type = str(state.get("page_type") or "")
     url = str(state.get("current_url") or state.get("continue_url") or "").lower()
@@ -2681,7 +3538,23 @@ class ChatGPTBrowserRegister:
             )
             self.log(f"注册流程完成: page={final_state.get('page_type') or '-'}")
 
-            # 获取 session token 和 cookies
+            # 原步骤 7、8 完成后，先执行用户脚本中的 TOTP -> 密码安全设置。
+            self.log("步骤 9: 设置密码+2FA")
+            security_info = _setup_chatgpt_password_and_totp(
+                page,
+                email=email,
+                password=password,
+                otp_callback=self.otp_callback,
+                log=self.log,
+            )
+            self.log(
+                "步骤 9 完成: "
+                f"password={'yes' if security_info.get('password_set') else 'no'}, "
+                f"totp={'yes' if security_info.get('totp_set') else 'no'}"
+            )
+
+            # 原步骤 9：获取 session token 和 cookies（插入安全设置后顺延为步骤 10）。
+            self.log("步骤 10: 获取 session")
             cookies_dict = _get_cookies(page)
             session_info = _fetch_chatgpt_session_from_page(page, cookies_dict, self.log)
             result = {
@@ -2698,5 +3571,10 @@ class ChatGPTBrowserRegister:
                 "expires_at": session_info.get("expires_at", ""),
                 "session": session_info.get("session", {}),
                 "registration_state": final_state,
+                "password_set": bool(security_info.get("password_set")),
+                "password_path": security_info.get("password_path", ""),
+                "totp_set": bool(security_info.get("totp_set")),
+                "totp_secret": security_info.get("totp_secret", ""),
+                "otpauth": security_info.get("otpauth", ""),
             }
             return result

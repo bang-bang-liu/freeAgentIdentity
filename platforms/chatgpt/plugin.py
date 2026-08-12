@@ -146,6 +146,11 @@ class ChatGPTPlatform(BasePlatform):
                 "cookies": result.get("cookies", ""),
                 "profile": result.get("profile", {}),
                 "expires_at": result.get("expires_at", ""),
+                "password_set": bool(result.get("password_set")),
+                "password_path": result.get("password_path", ""),
+                "totp_set": bool(result.get("totp_set")),
+                "totp_secret": result.get("totp_secret", ""),
+                "otpauth": result.get("otpauth", ""),
             },
         )
 
@@ -330,4 +335,3 @@ class ChatGPTPlatform(BasePlatform):
         data["local_app_account"] = read_current_codex_account()
         data["desktop_app_state"] = get_codex_desktop_state()
         return {"ok": True, "data": data}
-
