@@ -30,6 +30,21 @@ class _AlwaysInvalidPlatform:
         return False
 
 
+class _UnavailablePlatform:
+    def __init__(self, config: RegisterConfig | None = None):
+        self.config = config
+
+    def check_valid(self, account) -> bool:
+        return False
+
+    def get_last_check_overview(self) -> dict:
+        return {
+            "check_state": "unavailable",
+            "check_error": "connection timed out",
+            "network_path": "direct",
+        }
+
+
 def _create_account(*, platform: str = "chatgpt", lifecycle_status: str = "registered") -> int:
     with Session(engine) as session:
         model = AccountModel(platform=platform, email=f"{platform}@example.com", password="secret")
@@ -80,6 +95,48 @@ def test_lifecycle_validity_check_does_not_overwrite_lifecycle_status(monkeypatc
     assert overview.validity_status == "invalid"
     assert overview.display_status == "invalid"
     assert overview.checked_at
+
+
+def test_single_check_network_failure_keeps_validity_unknown(monkeypatch):
+    account_id = _create_account(lifecycle_status="registered")
+    monkeypatch.setattr("application.tasks.get", lambda _platform: _UnavailablePlatform)
+
+    valid, result = _run_single_account_check(account_id)
+
+    assert valid is False
+    assert result["check_state"] == "unavailable"
+    overview = _overview(account_id)
+    assert overview.lifecycle_status == "registered"
+    assert overview.validity_status == "unknown"
+    assert overview.get_summary()["check_error"] == "connection timed out"
+
+
+def test_lifecycle_network_failure_is_counted_as_check_error(monkeypatch):
+    account_id = _create_account(lifecycle_status="registered")
+    monkeypatch.setattr("core.lifecycle.get", lambda _platform: _UnavailablePlatform)
+
+    results = check_accounts_validity(platform="chatgpt", limit=10)
+
+    assert results["valid"] == 0
+    assert results["invalid"] == 0
+    assert results["error"] == 1
+    assert _overview(account_id).validity_status == "unknown"
+
+
+def test_single_check_rejected_token_keeps_account_validity_unknown(monkeypatch):
+    account_id = _create_account(lifecycle_status="registered")
+
+    class _RejectedTokenPlatform(_UnavailablePlatform):
+        def get_last_check_overview(self) -> dict:
+            return {"check_state": "credential_invalid", "check_error": "token rejected"}
+
+    monkeypatch.setattr("application.tasks.get", lambda _platform: _RejectedTokenPlatform)
+
+    valid, result = _run_single_account_check(account_id)
+
+    assert valid is False
+    assert result["check_state"] == "credential_invalid"
+    assert _overview(account_id).validity_status == "unknown"
 
 
 def test_chatgpt_subscription_status_falls_back_to_wham_usage(monkeypatch):

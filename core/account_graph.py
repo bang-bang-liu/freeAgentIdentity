@@ -153,7 +153,13 @@ def _derive_plan_name(overview: dict[str, Any]) -> str:
 def _derive_validity_status(lifecycle_status: str, overview: dict[str, Any]) -> str:
     if lifecycle_status == "invalid":
         return "invalid"
+    if _text(overview.get("check_state")).lower() in {
+        "unavailable", "unknown", "credential_missing", "credential_invalid",
+    }:
+        return "unknown"
     if "valid" in overview:
+        if overview.get("valid") is None:
+            return "unknown"
         return "valid" if bool(overview.get("valid")) else "invalid"
     return "unknown"
 

@@ -536,14 +536,16 @@ def _run_single_account_check(account_id: int, logger: TaskLogger | None = None)
         account = build_platform_account(session, model)
 
     valid = plugin.check_valid(account)
+    check_overview = plugin.get_last_check_overview() if hasattr(plugin, "get_last_check_overview") else {}
+    check_state = str((check_overview or {}).get("check_state") or "").strip().lower()
+    unavailable = check_state in {"unavailable", "unknown", "credential_missing", "credential_invalid"}
     with Session(engine) as session:
         model = session.get(AccountModel, account_id)
         if model:
             model.updated_at = _utcnow()
             current_graph = load_account_graphs(session, [account_id]).get(account_id, {})
-            summary_updates = {"checked_at": _utcnow_iso(), "valid": bool(valid)}
-            if hasattr(plugin, "get_last_check_overview"):
-                summary_updates.update(plugin.get_last_check_overview() or {})
+            summary_updates = {"checked_at": _utcnow_iso(), "valid": None if unavailable else bool(valid)}
+            summary_updates.update(check_overview or {})
             lifecycle_status = None
             if valid:
                 # **bug 修复**：原实现 ``recover_lifecycle_status_for_valid_account``
@@ -565,9 +567,15 @@ def _run_single_account_check(account_id: int, logger: TaskLogger | None = None)
             session.add(model)
             session.commit()
 
-    result = {"account_id": account_id, "valid": bool(valid), "platform": account.platform, "email": account.email}
+    result = {
+        "account_id": account_id,
+        "valid": bool(valid),
+        "check_state": check_state or ("valid" if valid else "invalid"),
+        "platform": account.platform,
+        "email": account.email,
+    }
     if logger:
-        logger.log(f"{account.email}: {'有效' if valid else '失效'}")
+        logger.log(f"{account.email}: {'有效' if valid else ('检测失败' if unavailable else '失效')}")
     return valid, result
 
 
@@ -871,9 +879,14 @@ def _execute_account_check_all_task(payload: dict[str, Any], logger: TaskLogger)
             logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
             return
         try:
-            valid, _ = _run_single_account_check(int(model.id or 0), logger)
+            valid, result = _run_single_account_check(int(model.id or 0), logger)
             if valid:
                 results["valid"] += 1
+            elif str(result.get("check_state") or "").lower() in {
+                "unavailable", "unknown", "credential_missing", "credential_invalid",
+            }:
+                results["error"] += 1
+                logger.log(f"{model.email}: 检测失败", level="error")
             else:
                 results["invalid"] += 1
         except Exception as exc:

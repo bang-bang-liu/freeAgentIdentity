@@ -70,13 +70,15 @@ def check_accounts_validity(
                 account_obj = build_platform_account(session, current)
 
             valid = plugin.check_valid(account_obj)
+            check_overview = plugin.get_last_check_overview() if hasattr(plugin, "get_last_check_overview") else {}
+            check_state = str((check_overview or {}).get("check_state") or "").strip().lower()
+            unavailable = check_state in {"unavailable", "unknown", "credential_missing", "credential_invalid"}
             with Session(engine) as session:
                 model = session.get(AccountModel, acc.id)
                 if model:
                     model.updated_at = _utcnow()
-                    summary_updates = {"checked_at": _utcnow_iso(), "valid": valid}
-                    if hasattr(plugin, "get_last_check_overview"):
-                        summary_updates.update(plugin.get_last_check_overview() or {})
+                    summary_updates = {"checked_at": _utcnow_iso(), "valid": None if unavailable else valid}
+                    summary_updates.update(check_overview or {})
                     patch_account_graph(
                         session, model,
                         summary_updates=summary_updates,
@@ -85,6 +87,9 @@ def check_accounts_validity(
                     session.commit()
             if valid:
                 results["valid"] += 1
+            elif unavailable:
+                results["error"] += 1
+                log(f"  {acc.email} ({acc.platform}): 检测失败")
             else:
                 results["invalid"] += 1
                 log(f"  {acc.email} ({acc.platform}): 失效")

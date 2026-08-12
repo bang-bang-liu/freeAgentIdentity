@@ -2276,7 +2276,7 @@ def _setup_chatgpt_password_and_totp(
     session_data = _chatgpt_security_session(page, log)
     session_email = str(((session_data.get("user") or {}).get("email") if isinstance(session_data.get("user"), dict) else "") or email).strip()
     totp_result = _setup_chatgpt_totp(
-        page,
+        page=page,
         email=session_email,
         password=password,
         otp_callback=otp_callback,
@@ -2290,7 +2290,7 @@ def _setup_chatgpt_password_and_totp(
         password_result = {"password_set": True, "password_path": "registration_existing"}
     else:
         password_result = _setup_chatgpt_password(
-            page,
+            page=page,
             email=session_email,
             password=password,
             secret=str(totp_result.get("totp_secret") or ""),

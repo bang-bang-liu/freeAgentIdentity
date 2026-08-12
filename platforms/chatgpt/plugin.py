@@ -64,16 +64,18 @@ class ChatGPTPlatform(BasePlatform):
 
             region = str(getattr(account, "region", "") or extra.get("region", "") or "").strip()
             configured_proxy = self.config.proxy if self.config else None
-            proxy_candidates: list[tuple[str | None, bool]] = []
+            proxy_candidates: list[tuple[str | None, str, bool]] = []
             if configured_proxy:
-                proxy_candidates.append((configured_proxy, False))
+                proxy_candidates.append((configured_proxy, "explicit_proxy", False))
             else:
                 pooled_proxy = proxy_pool.get_next(region=region)
                 if pooled_proxy:
-                    proxy_candidates.append((pooled_proxy, True))
-            proxy_candidates.append((None, False))
+                    proxy_candidates.append((pooled_proxy, "project_proxy", True))
+            proxy_candidates.append((None, "direct", False))
 
-            for proxy, should_report in proxy_candidates:
+            last_error = ""
+            last_network_path = "direct"
+            for proxy, network_path, should_report in proxy_candidates:
                 try:
                     details = fetch_subscription_status_details(a, proxy=proxy)
                     if should_report and proxy:
@@ -102,17 +104,28 @@ class ChatGPTPlatform(BasePlatform):
                         "plan_state": plan_state,
                         "chips": chips,
                         "check_source": details.get("source"),
+                        "network_path": network_path,
+                        "check_state": "invalid" if status in ("expired", "invalid", "banned") else "valid",
                     }
                     if isinstance(details.get("usage"), dict):
                         overview["chatgpt_usage"] = details["usage"]
                     self._last_check_overview = overview
                     return status not in ("expired", "invalid", "banned", None)
-                except Exception:
+                except Exception as exc:
+                    last_error = str(exc)
+                    last_network_path = network_path
                     if should_report and proxy:
                         proxy_pool.report_fail(proxy)
                     continue
         except Exception:
-            return False
+            last_error = "Unable to initialize ChatGPT state check"
+            last_network_path = "direct"
+        self._last_check_overview = {
+            "check_state": "unavailable",
+            "check_error": last_error or "State check did not reach ChatGPT",
+            "network_path": last_network_path,
+            "chips": ["检测失败"],
+        }
         return False
 
     def get_last_check_overview(self) -> dict:
@@ -212,8 +225,8 @@ class ChatGPTPlatform(BasePlatform):
 
     def get_platform_actions(self) -> list:
         return [
-            {"id": "switch_account", "label": "切换到 Codex 桌面端", "params": []},
-            {"id": "get_account_state", "label": "查询账号状态/订阅", "params": []},
+            {"id": "switch_desktop", "label": "切换到 Codex 桌面端", "params": []},
+            {"id": "query_state", "label": "查询账号状态/订阅", "params": []},
             {"id": "upload_cpa", "label": "上传 CPA",
              "params": [
                  {"key": "api_url", "label": "CPA API URL", "type": "text"},
@@ -223,8 +236,16 @@ class ChatGPTPlatform(BasePlatform):
              "params": [
                  {"key": "api_url", "label": "TM API URL", "type": "text"},
                  {"key": "api_key", "label": "TM API Key", "type": "text"},
-             ]},
+            ]},
         ]
+
+    def execute_action(self, action_id: str, account: Account, params: dict) -> dict:
+        # Keep tasks created by older frontends compatible with the capability IDs.
+        aliases = {
+            "get_account_state": "query_state",
+            "switch_account": "switch_desktop",
+        }
+        return super().execute_action(aliases.get(action_id, action_id), account, params)
 
     def get_desktop_state(self) -> dict:
         from platforms.chatgpt.switch import get_codex_desktop_state
@@ -315,7 +336,6 @@ class ChatGPTPlatform(BasePlatform):
     # Override specific capability handlers
     def _handle_query_state(self, account: Account, params: dict) -> dict:
         """Handle query_state capability for ChatGPT."""
-        proxy = self.config.proxy if self.config else None
         extra = account.extra or {}
 
         class _A: pass
@@ -324,14 +344,81 @@ class ChatGPTPlatform(BasePlatform):
         a.session_token = extra.get("session_token", "")
         a.cookies = extra.get("cookies", "")
 
+        from core.proxy_pool import proxy_pool
         from platforms.chatgpt.switch import fetch_chatgpt_account_state, get_codex_desktop_state, read_current_codex_account
 
-        data = fetch_chatgpt_account_state(
-            access_token=a.access_token,
-            session_token=a.session_token,
-            cookies=a.cookies,
-            proxy=proxy,
-        )
+        configured_proxy = self.config.proxy if self.config else None
+        region = str(getattr(account, "region", "") or extra.get("region", "") or "").strip()
+        proxy_candidates: list[tuple[str | None, str, bool]] = []
+        if configured_proxy:
+            proxy_candidates.append((configured_proxy, "explicit_proxy", False))
+        else:
+            pooled_proxy = proxy_pool.get_next(region=region)
+            if pooled_proxy:
+                proxy_candidates.append((pooled_proxy, "project_proxy", True))
+        proxy_candidates.append((None, "direct", False))
+
+        data: dict = {}
+        for proxy, network_path, should_report in proxy_candidates:
+            candidate = fetch_chatgpt_account_state(
+                access_token=a.access_token,
+                session_token=a.session_token,
+                cookies=a.cookies,
+                proxy=proxy,
+            )
+            candidate["network_path"] = network_path
+            if self._state_query_is_terminal(candidate):
+                if should_report and proxy:
+                    proxy_pool.report_success(proxy)
+                data = candidate
+                break
+            if should_report and proxy:
+                proxy_pool.report_fail(proxy)
+            data = candidate
+        if self._state_query_has_credential_error(data):
+            # A 401 response proves the saved bearer credential is no longer
+            # usable. The account itself can still be active through a newer
+            # browser session, so do not turn it into an account-invalid flag.
+            data.pop("valid", None)
+            data["check_state"] = "credential_invalid"
+            data["check_error"] = data.get("profile_error") or "ChatGPT rejected the saved access token"
+        elif not self._state_query_is_terminal(data):
+            # A timeout, rate limit, or connection failure says nothing about
+            # account validity. A 403 can also be a WAF or network policy
+            # response, so preserve the account lifecycle and make it retryable.
+            data.pop("valid", None)
+            data["check_state"] = "unavailable"
+            data["check_error"] = data.get("profile_error") or "State check did not reach ChatGPT"
+        elif data.get("valid") is False:
+            data["check_state"] = "invalid"
+        else:
+            data["check_state"] = "valid"
+
         data["local_app_account"] = read_current_codex_account()
         data["desktop_app_state"] = get_codex_desktop_state()
         return {"ok": True, "data": data}
+
+    @staticmethod
+    def _state_query_is_terminal(data: dict) -> bool:
+        if data.get("valid") is True:
+            return True
+        profile_error = data.get("profile_error")
+        if isinstance(profile_error, dict):
+            return int(profile_error.get("status_code") or 0) == 401
+        return False
+
+    @staticmethod
+    def _state_query_has_credential_error(data: dict) -> bool:
+        profile_error = data.get("profile_error")
+        if not isinstance(profile_error, dict):
+            return False
+        return int(profile_error.get("status_code") or 0) == 401
+
+    def _handle_switch_desktop(self, account: Account, params: dict) -> dict:
+        return self._execute_platform_action("switch_desktop", account, params)
+
+    def _handle_upload_cpa(self, account: Account, params: dict) -> dict:
+        return self._execute_platform_action("upload_cpa", account, params)
+
+    def _handle_upload_tm(self, account: Account, params: dict) -> dict:
+        return self._execute_platform_action("upload_tm", account, params)

@@ -1,8 +1,12 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChevronDown, ChevronRight, CircleStop, LoaderCircle } from "lucide-react";
 
 import { API_BASE, apiFetch } from "@/lib/utils";
-import { getTaskStatusText, isTerminalTaskStatus } from "@/lib/tasks";
+import {
+  getTaskStatusText,
+  isCancellableTaskStatus,
+  isTerminalTaskStatus,
+} from "@/lib/tasks";
 import { useI18n } from "@/lib/i18n-context";
 
 /**
@@ -43,6 +47,8 @@ export function TaskLogPanel({
   const [events, setEvents] = useState<LogEvent[]>([]);
   const [task, setTask] = useState<any | null>(null);
   const [doneStatus, setDoneStatus] = useState<string | null>(null);
+  const [cancelSubmitting, setCancelSubmitting] = useState(false);
+  const [cancelError, setCancelError] = useState("");
   // 折叠状态：默认全展开（undefined / false 都视为展开）
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const seenEventIdsRef = useRef<Set<number>>(new Set());
@@ -56,6 +62,16 @@ export function TaskLogPanel({
     onDoneRef.current = onDone;
   }, [onDone]);
 
+  const completeTask = useCallback((status: string) => {
+    if (doneRef.current) return;
+    doneRef.current = true;
+    sseHealthyRef.current = false;
+    eventSourceRef.current?.close();
+    eventSourceRef.current = null;
+    setDoneStatus(status);
+    onDoneRef.current(status);
+  }, []);
+
   useEffect(() => {
     if (!taskId) return;
     seenEventIdsRef.current = new Set();
@@ -65,6 +81,8 @@ export function TaskLogPanel({
     setEvents([]);
     setTask(null);
     setDoneStatus(null);
+    setCancelSubmitting(false);
+    setCancelError("");
     setCollapsed({});
 
     const pushEvent = (payload: any) => {
@@ -87,13 +105,8 @@ export function TaskLogPanel({
         ]);
       }
       if (payload?.done && !doneRef.current) {
-        doneRef.current = true;
-        sseHealthyRef.current = false;
-        eventSourceRef.current?.close();
-        eventSourceRef.current = null;
         const nextStatus = payload.status || "succeeded";
-        setDoneStatus(nextStatus);
-        onDoneRef.current(nextStatus);
+        completeTask(nextStatus);
       }
     };
 
@@ -156,7 +169,7 @@ export function TaskLogPanel({
       window.clearInterval(progressPoll);
       window.clearInterval(fallbackPoll);
     };
-  }, [taskId]);
+  }, [completeTask, taskId]);
 
   // 按 subtaskId 把事件切成分组：主任务 + 每个 worker。
   // 顺序按"首次出现"排，保证 worker 折叠面板顺序稳定（worker_1 / worker_2…）。
@@ -190,6 +203,10 @@ export function TaskLogPanel({
   };
 
   const currentStatus = doneStatus || task?.status || "running";
+  const canCancel =
+    (task?.cancellable !== false || isCancellableTaskStatus(currentStatus)) &&
+    isCancellableTaskStatus(currentStatus) &&
+    currentStatus !== "cancel_requested";
   const progress = task?.progress_detail || {};
   const progressTotal = Number(progress.total || 0);
   const progressCurrent = Number(progress.current || 0);
@@ -212,6 +229,25 @@ export function TaskLogPanel({
     navigator.clipboard
       ?.writeText(events.map((ev) => ev.line).join("\n"))
       .catch(() => {});
+  };
+
+  const cancelTask = async () => {
+    if (!canCancel || cancelSubmitting) return;
+    setCancelSubmitting(true);
+    setCancelError("");
+    try {
+      const latest = await apiFetch(`/tasks/${taskId}/cancel`, {
+        method: "POST",
+      });
+      setTask(latest);
+      if (isTerminalTaskStatus(latest.status)) {
+        completeTask(latest.status);
+      }
+    } catch (error: any) {
+      setCancelError(error?.message || t("taskLog.cancelFailed"));
+    } finally {
+      setCancelSubmitting(false);
+    }
   };
 
   return (
@@ -267,6 +303,12 @@ export function TaskLogPanel({
         </div>
       ) : null}
 
+      {cancelError ? (
+        <div className="rounded-lg border border-red-400/35 bg-red-500/10 px-3 py-2 text-xs text-red-100">
+          {cancelError}
+        </div>
+      ) : null}
+
       <div className="flex items-center justify-between gap-3">
         <div>
           <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--text-muted)]">
@@ -276,13 +318,33 @@ export function TaskLogPanel({
             {t("taskLog.liveTitle")}
           </div>
         </div>
-        <button
-          type="button"
-          onClick={copyLogs}
-          className="rounded-full border border-[var(--border)] bg-[var(--bg-hover)] px-3 py-1.5 text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
-        >
-          {t("taskLog.copyLogs")}
-        </button>
+        <div className="flex items-center gap-2">
+          {(canCancel || currentStatus === "cancel_requested") && (
+            <button
+              type="button"
+              onClick={cancelTask}
+              disabled={!canCancel || cancelSubmitting}
+              title={t("taskLog.cancelTask")}
+              className="inline-flex items-center gap-1.5 rounded-full border border-red-400/35 bg-red-500/10 px-3 py-1.5 text-xs text-red-200 hover:bg-red-500/15 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {cancelSubmitting || currentStatus === "cancel_requested" ? (
+                <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <CircleStop className="h-3.5 w-3.5" />
+              )}
+              {cancelSubmitting || currentStatus === "cancel_requested"
+                ? t("taskLog.cancelling")
+                : t("taskLog.cancelTask")}
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={copyLogs}
+            className="rounded-full border border-[var(--border)] bg-[var(--bg-hover)] px-3 py-1.5 text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+          >
+            {t("taskLog.copyLogs")}
+          </button>
+        </div>
       </div>
 
       <div className="min-h-[260px] flex-1 overflow-y-auto rounded-xl border border-[var(--border)] bg-[var(--bg-input)] p-3 font-mono text-xs">

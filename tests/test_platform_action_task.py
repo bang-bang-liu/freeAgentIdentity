@@ -77,6 +77,34 @@ def test_platform_action_task_passes_task_logger_to_runtime(monkeypatch):
     assert logger.finished == (tasks_module.TASK_STATUS_SUCCEEDED, "")
 
 
+def test_account_check_task_counts_unavailable_as_error(monkeypatch):
+    class _Account:
+        id = 1
+        email = "user@example.com"
+
+    class _Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def exec(self, query):
+            return type("Result", (), {"all": lambda self: [_Account()]})()
+
+    monkeypatch.setattr(tasks_module, "Session", lambda _engine: _Session())
+    monkeypatch.setattr(tasks_module, "_run_single_account_check", lambda account_id, logger: (
+        False,
+        {"check_state": "unavailable"},
+    ))
+    logger = _FakeLogger()
+
+    tasks_module._execute_account_check_all_task({"platform": "chatgpt", "limit": 1}, logger)
+
+    assert logger.result_data == {"valid": 0, "invalid": 0, "error": 1}
+    assert logger.finished == (tasks_module.TASK_STATUS_SUCCEEDED, "")
+
+
 def test_chatgpt_register_task_succeeds_after_successful_registration(monkeypatch):
     class FakePlatform:
         def register(self, email=None, password=None):

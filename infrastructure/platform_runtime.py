@@ -57,9 +57,22 @@ def _build_account_overview(platform: str, data: dict[str, Any]) -> dict[str, An
         "checked_at": _utcnow_iso(),
         "chips": [],
     }
+    check_state = str(data.get("check_state") or "").strip().lower()
+    if check_state:
+        overview["check_state"] = check_state
+    if data.get("network_path"):
+        overview["network_path"] = str(data["network_path"])
+    if check_state in {"unavailable", "credential_invalid"}:
+        # Explicitly replace a previous false value.  Otherwise a transient
+        # network or credential error would leave an old "invalid" summary visible.
+        overview["valid"] = None
+        overview["chips"].append("凭证需更新" if check_state == "credential_invalid" else "检测失败")
+        if data.get("check_error"):
+            overview["check_error"] = data["check_error"]
     if "valid" in data:
-        overview["valid"] = bool(data.get("valid"))
-        overview["chips"].append("有效" if data.get("valid") else "失效")
+        if data.get("valid") is not None:
+            overview["valid"] = bool(data.get("valid"))
+            overview["chips"].append("有效" if data.get("valid") else "失效")
 
     remote_email = ""
     if isinstance(data.get("remote_user"), dict):

@@ -75,7 +75,22 @@ def extract_session_token(session_token: str = "", cookies: str = "") -> str:
     token = (session_token or "").strip()
     if token:
         return token
-    return _parse_cookie_header(cookies).get("__Secure-next-auth.session-token", "")
+    cookie_map = _parse_cookie_header(cookies)
+    token = cookie_map.get("__Secure-next-auth.session-token", "")
+    if token:
+        return token
+
+    # NextAuth stores long session values in numbered cookies.  Keep their
+    # numeric order when reconstructing the value from an exported header.
+    chunks: list[tuple[int, str]] = []
+    prefix = "__Secure-next-auth.session-token."
+    for name, value in cookie_map.items():
+        if not name.startswith(prefix) or not value:
+            continue
+        suffix = name[len(prefix):]
+        if suffix.isdigit():
+            chunks.append((int(suffix), value))
+    return "".join(value for _, value in sorted(chunks))
 
 
 def _get_codex_support_dir() -> str:
@@ -309,27 +324,55 @@ def get_codex_desktop_state() -> dict:
     return state
 
 
-def _fetch_profile(access_token: str, proxy: str | None = None) -> tuple[bool, dict]:
-    if not access_token:
-        return False, {}
-    try:
-        response = curl_requests.get(
-            "https://chatgpt.com/backend-api/me",
-            headers={
-                "authorization": f"Bearer {access_token}",
-                "accept": "application/json",
-                "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-            },
-            proxies=_build_proxies(proxy),
-            timeout=20,
-            impersonate="chrome124",
-        )
-        if response.status_code == 200:
-            return True, response.json()
-        return False, {"status_code": response.status_code, "body": response.text[:400]}
-    except Exception as exc:
-        return False, {"error": str(exc)}
+def _fetch_profile(
+    access_token: str = "",
+    cookies: str = "",
+    proxy: str | None = None,
+) -> tuple[bool, dict, str]:
+    """Fetch /backend-api/me with one authentication method per request."""
+    url = "https://chatgpt.com/backend-api/me"
+    headers = {
+        "accept": "application/json",
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+    }
+    session_cookies = _parse_cookie_header(cookies)
+    last_error: dict = {}
+
+    # A current browser session is the native authentication mechanism for
+    # this endpoint. Do not mix it with a Bearer token in the same request.
+    if session_cookies:
+        try:
+            response = curl_requests.get(
+                url,
+                headers=headers,
+                cookies=session_cookies,
+                proxies=_build_proxies(proxy),
+                timeout=20,
+                impersonate="chrome124",
+            )
+            if response.status_code == 200:
+                return True, response.json(), "cookies"
+            last_error = {"status_code": response.status_code, "body": response.text[:400]}
+        except Exception as exc:
+            last_error = {"error": str(exc)}
+
+    if access_token:
+        try:
+            response = curl_requests.get(
+                url,
+                headers={**headers, "authorization": f"Bearer {access_token}"},
+                proxies=_build_proxies(proxy),
+                timeout=20,
+                impersonate="chrome124",
+            )
+            if response.status_code == 200:
+                return True, response.json(), "access_token"
+            last_error = {"status_code": response.status_code, "body": response.text[:400]}
+        except Exception as exc:
+            last_error = {"error": str(exc)}
+
+    return False, last_error, ""
 
 
 def fetch_chatgpt_account_state(
@@ -349,11 +392,16 @@ def fetch_chatgpt_account_state(
     resolved_session = extract_session_token(session_token, cookies)
     resolved_access = access_token
 
-    if resolved_access:
-        ok, profile = _fetch_profile(resolved_access, proxy=proxy)
+    if resolved_access or cookies:
+        ok, profile, profile_auth_method = _fetch_profile(
+            access_token=resolved_access,
+            cookies=cookies,
+            proxy=proxy,
+        )
         state["valid"] = ok
         if ok:
             state["profile"] = profile
+            state["profile_auth_method"] = profile_auth_method
             try:
                 from platforms.chatgpt.subscription import check_subscription_status
 
@@ -363,7 +411,8 @@ def fetch_chatgpt_account_state(
                 account = _A()
                 account.access_token = resolved_access
                 account.cookies = cookies
-                state["subscription_status"] = check_subscription_status(account, proxy=proxy)
+                if profile_auth_method == "access_token":
+                    state["subscription_status"] = check_subscription_status(account, proxy=proxy)
             except Exception as exc:
                 state["subscription_error"] = str(exc)
         else:
