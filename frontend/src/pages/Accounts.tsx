@@ -245,6 +245,7 @@ function RegisterModal({
   const [selection, setSelection] = useState({
     identityProvider: 'mailbox',
     executorType: 'headless',
+    mailboxProvider: '',
   })
   const [taskId, setTaskId] = useState<string | null>(null)
   const [done, setDone] = useState(false)
@@ -315,7 +316,7 @@ function RegisterModal({
       ) {
         return current
       }
-      return { identityProvider, executorType }
+      return { ...current, identityProvider, executorType }
     })
   }, [configLoading, registrationOptions, supportedExecutors])
 
@@ -341,7 +342,11 @@ function RegisterModal({
     }
   }, [selection.identityProvider, selection.executorType, supportedExecutors])
 
-  const defaultMailboxProvider = (configOptions.mailbox_settings || []).find(item => item.is_default) || configOptions.mailbox_settings?.[0] || null
+  const enabledMailboxProviders = (configOptions.mailbox_settings || []).filter(item => item.enabled)
+  const defaultMailboxProvider = enabledMailboxProviders.find(item => item.is_default) || enabledMailboxProviders[0] || null
+  const selectedMailboxProvider = enabledMailboxProviders.find(
+    item => item.provider_key === selection.mailboxProvider,
+  ) || defaultMailboxProvider
 
   const start = async () => {
     setStarting(true)
@@ -363,10 +368,10 @@ function RegisterModal({
           extra.mail_provider = 'local_ms_pool'
           extra.local_ms_pool_text = outlookPoolText.trim()
         } else {
-          if (!defaultMailboxProvider?.provider_key) {
+          if (!selectedMailboxProvider?.provider_key) {
             throw new Error(t('accounts.missingDefaultMailbox'))
           }
-          extra.mail_provider = defaultMailboxProvider.provider_key
+          extra.mail_provider = selectedMailboxProvider.provider_key
         }
       }
       const res = await apiFetch('/tasks/register', {
@@ -470,6 +475,30 @@ function RegisterModal({
                   </div>
                 </div>
 
+                {selection.identityProvider === 'mailbox' && selection.executorType !== 'protocol' ? (
+                  <div>
+                    <label className="text-xs text-[var(--text-muted)] block mb-1">
+                      {t('register.mailboxService')}
+                    </label>
+                    <select
+                      value={selectedMailboxProvider?.provider_key || ''}
+                      onChange={event => setSelection(current => ({
+                        ...current,
+                        mailboxProvider: event.target.value,
+                      }))}
+                      className="control-surface control-surface-compact w-full"
+                    >
+                      {enabledMailboxProviders.length === 0 ? (
+                        <option value="">{t('accounts.missingDefaultMailbox')}</option>
+                      ) : enabledMailboxProviders.map(provider => (
+                        <option key={provider.provider_key} value={provider.provider_key}>
+                          {provider.display_name || provider.catalog_label || provider.provider_key}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                ) : null}
+
                 {selection.executorType === 'protocol' ? (
                   <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-pane)]/45 p-4">
                     <label className="text-sm font-semibold text-[var(--text-primary)] block mb-1">
@@ -558,6 +587,11 @@ function RegisterModal({
                 <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-hover)] px-4 py-3 text-xs text-[var(--text-secondary)]">
                   <div>{t('accounts.identitySummary')}: <span className="text-[var(--text-primary)]">{selectedRegistration?.label || '-'}</span></div>
                   <div className="mt-1">{t('accounts.executorSummary')}: <span className="text-[var(--text-primary)]">{selectedExecutor?.label || '-'}</span></div>
+                  {selection.identityProvider === 'mailbox' && selection.executorType !== 'protocol' ? (
+                    <div className="mt-1">{t('register.mailboxService')}: <span className="text-[var(--text-primary)]">
+                      {selectedMailboxProvider?.display_name || selectedMailboxProvider?.catalog_label || '-'}
+                    </span></div>
+                  ) : null}
                   <div className="mt-1">{t('accounts.verificationSummary')}: <span className="text-[var(--text-primary)]">{
                     selection.executorType === 'protocol'
                       ? t('accounts.protocolVerificationSummary')

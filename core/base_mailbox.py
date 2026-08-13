@@ -151,9 +151,28 @@ def _create_api_mailbox(extra: dict, proxy: str | None) -> BaseMailbox:
     )
 
 
+def _create_icloud_workbench(extra: dict, proxy: str | None) -> BaseMailbox:
+    from core.icloud_workbench_mailbox import ICloudWorkbenchMailbox
+
+    del proxy  # Workbench 是独立的本地/内网服务，不跟随注册目标代理。
+    return ICloudWorkbenchMailbox(
+        base_url=extra.get("icloud_workbench_base_url", "http://127.0.0.1:4173"),
+        username=extra.get("icloud_workbench_username", "admin"),
+        password=extra.get("icloud_workbench_password", ""),
+        account_id=extra.get("icloud_workbench_account_id", ""),
+        auto_generate=str(extra.get("icloud_workbench_auto_generate", "true")).strip().lower()
+        in {"1", "true", "yes", "on"},
+        batch_size=extra.get("icloud_workbench_batch_size", 1),
+        label_prefix=extra.get("icloud_workbench_label_prefix", "freeagent"),
+        poll_interval=extra.get("icloud_workbench_poll_interval", 3),
+        request_timeout=extra.get("icloud_workbench_request_timeout", 20),
+    )
+
+
 MAILBOX_FACTORY_REGISTRY = {
     "local_ms_pool": _create_local_ms_pool,
     "api_mailbox": _create_api_mailbox,
+    "icloud_workbench": _create_icloud_workbench,
 }
 
 

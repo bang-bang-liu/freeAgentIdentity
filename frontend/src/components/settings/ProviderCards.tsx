@@ -133,7 +133,7 @@ function EditModal({
   const [form, setForm] = useState<Record<string, string>>(() => {
     const data: Record<string, string> = {}
     for (const field of fields) {
-      data[field.key] = (setting?.auth?.[field.key] || '') || (setting?.config?.[field.key] || '')
+      data[field.key] = (setting?.auth?.[field.key] || '') || (setting?.config?.[field.key] || '') || field.default_value || ''
     }
     return data
   })

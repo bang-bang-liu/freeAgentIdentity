@@ -9,7 +9,7 @@ from core.db import ProviderDefinitionModel, ProviderSettingModel, engine
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_MAILBOX_PROVIDER_KEYS = ("local_ms_pool", "api_mailbox")
+SUPPORTED_MAILBOX_PROVIDER_KEYS = ("local_ms_pool", "api_mailbox", "icloud_workbench")
 
 
 def _utcnow() -> datetime:
@@ -112,6 +112,83 @@ _BUILTIN_DEFINITIONS: list[dict] = [
                 "type": "toggle",
                 "category": "connection",
                 "hint": "测试时可开启；批量注册建议关闭。",
+            },
+        ],
+    },
+    {
+        "provider_type": "mailbox",
+        "provider_key": "icloud_workbench",
+        "label": "iCloud Workbench",
+        "description": "连接 icloud-create-workbench，领取已有 unused 隐藏邮箱，并可在库存为空时自动生产后用于注册收件",
+        "driver_type": "icloud_workbench",
+        "default_auth_mode": "admin",
+        "enabled": True,
+        "category": "selfhost",
+        "auth_modes": [{"value": "admin", "label": "Workbench 管理员"}],
+        "fields": [
+            {
+                "key": "icloud_workbench_base_url",
+                "label": "Workbench 地址",
+                "placeholder": "http://127.0.0.1:4173",
+                "default_value": "http://127.0.0.1:4173",
+                "category": "connection",
+                "hint": "填写 icloud-create-workbench 的 APP_ORIGIN 地址；本机默认使用 http://127.0.0.1:4173。",
+            },
+            {
+                "key": "icloud_workbench_username",
+                "label": "管理员用户名",
+                "placeholder": "admin",
+                "default_value": "admin",
+                "category": "auth",
+            },
+            {
+                "key": "icloud_workbench_password",
+                "label": "管理员密码",
+                "secret": True,
+                "category": "auth",
+            },
+            {
+                "key": "icloud_workbench_account_id",
+                "label": "指定 iCloud 账号 ID",
+                "category": "connection",
+                "hint": "可选；留空时自动选择 Workbench 中第一个 active iCloud 账号生产邮箱。",
+            },
+            {
+                "key": "icloud_workbench_auto_generate",
+                "label": "库存为空时自动生产",
+                "type": "toggle",
+                "default_value": "true",
+                "category": "connection",
+                "hint": "开启后会在没有 unused 邮箱时发起一批隐藏邮箱生成任务。",
+            },
+            {
+                "key": "icloud_workbench_batch_size",
+                "label": "单次生产数量",
+                "placeholder": "1",
+                "default_value": "1",
+                "category": "connection",
+                "hint": "范围 1-5；生产后本次只领取一个，其余继续留在 unused 库存中。",
+            },
+            {
+                "key": "icloud_workbench_label_prefix",
+                "label": "邮箱标签前缀",
+                "placeholder": "freeagent",
+                "default_value": "freeagent",
+                "category": "connection",
+            },
+            {
+                "key": "icloud_workbench_poll_interval",
+                "label": "收件轮询间隔秒",
+                "placeholder": "3",
+                "default_value": "3",
+                "category": "connection",
+            },
+            {
+                "key": "icloud_workbench_request_timeout",
+                "label": "单次请求超时秒",
+                "placeholder": "20",
+                "default_value": "20",
+                "category": "connection",
             },
         ],
     },

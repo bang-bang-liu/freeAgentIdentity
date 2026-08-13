@@ -12,6 +12,7 @@ export type ProviderField = {
   secret?: boolean
   category?: string
   hint?: string
+  default_value?: string
   type?: 'text' | 'select' | 'textarea' | 'toggle' | 'async-select'
   options?: Array<{ value: string; label: string }>
   asyncUrl?: string
