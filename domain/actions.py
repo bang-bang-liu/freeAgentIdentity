@@ -10,6 +10,8 @@ class ActionParameter:
     label: str
     type: str
     options: list[str] = field(default_factory=list)
+    placeholder: str = ""
+    required: bool = False
 
 
 @dataclass(slots=True)

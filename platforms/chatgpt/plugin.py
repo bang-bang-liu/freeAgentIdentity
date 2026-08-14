@@ -107,6 +107,14 @@ class ChatGPTPlatform(BasePlatform):
                         "network_path": network_path,
                         "check_state": "invalid" if status in ("expired", "invalid", "banned") else "valid",
                     }
+                    if "plus_trial_eligible" in details:
+                        overview["plus_trial_eligible"] = details.get("plus_trial_eligible")
+                    if details.get("plus_trial_check_state"):
+                        overview["plus_trial_check_state"] = details.get("plus_trial_check_state")
+                    if details.get("plus_trial_error"):
+                        overview["plus_trial_error"] = details.get("plus_trial_error")
+                    if details.get("plus_trial_eligible") is True:
+                        overview["chips"].append("带Plus试用")
                     if isinstance(details.get("usage"), dict):
                         overview["chatgpt_usage"] = details["usage"]
                     self._last_check_overview = overview
@@ -226,7 +234,15 @@ class ChatGPTPlatform(BasePlatform):
     def get_platform_actions(self) -> list:
         return [
             {"id": "switch_desktop", "label": "切换到 Codex 桌面端", "params": []},
-            {"id": "query_state", "label": "查询账号状态/订阅", "params": []},
+            {"id": "query_state", "label": "查询账号状态/订阅", "params": [
+                {
+                    "key": "proxy",
+                    "label": "查询代理",
+                    "type": "text",
+                    "placeholder": "http://user:pass@host:port",
+                    "required": True,
+                },
+            ]},
             {"id": "upload_cpa", "label": "上传 CPA",
              "params": [
                  {"key": "api_url", "label": "CPA API URL", "type": "text"},
@@ -347,16 +363,23 @@ class ChatGPTPlatform(BasePlatform):
         from core.proxy_pool import proxy_pool
         from platforms.chatgpt.switch import fetch_chatgpt_account_state, get_codex_desktop_state, read_current_codex_account
 
-        configured_proxy = self.config.proxy if self.config else None
+        # The proxy entered in the action dialog applies only to this query.
+        # Keep the configured/project-pool behavior as a fallback when the
+        # field is left blank, and never persist the manually entered value.
+        manual_proxy = str((params or {}).get("proxy") or "").strip()
+        configured_proxy = manual_proxy or (self.config.proxy if self.config else None)
         region = str(getattr(account, "region", "") or extra.get("region", "") or "").strip()
         proxy_candidates: list[tuple[str | None, str, bool]] = []
         if configured_proxy:
-            proxy_candidates.append((configured_proxy, "explicit_proxy", False))
-        else:
+            proxy_candidates.append((configured_proxy, "manual_proxy" if manual_proxy else "explicit_proxy", False))
+        elif not manual_proxy:
             pooled_proxy = proxy_pool.get_next(region=region)
             if pooled_proxy:
                 proxy_candidates.append((pooled_proxy, "project_proxy", True))
-        proxy_candidates.append((None, "direct", False))
+        # A manually supplied proxy is an explicit per-query choice. Do not
+        # silently retry through the local direct connection if it fails.
+        if not manual_proxy:
+            proxy_candidates.append((None, "direct", False))
 
         data: dict = {}
         for proxy, network_path, should_report in proxy_candidates:

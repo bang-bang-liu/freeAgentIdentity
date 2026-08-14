@@ -4,12 +4,21 @@ from platforms.chatgpt.plugin import ChatGPTPlatform
 
 
 def test_chatgpt_actions_use_capability_ids():
-    action_ids = {item["id"] for item in ChatGPTPlatform().get_platform_actions()}
+    actions = ChatGPTPlatform().get_platform_actions()
+    action_ids = {item["id"] for item in actions}
 
     assert "query_state" in action_ids
     assert "switch_desktop" in action_ids
     assert "get_account_state" not in action_ids
     assert "switch_account" not in action_ids
+    query_action = next(item for item in actions if item["id"] == "query_state")
+    assert query_action["params"] == [{
+        "key": "proxy",
+        "label": "查询代理",
+        "type": "text",
+        "placeholder": "http://user:pass@host:port",
+        "required": True,
+    }]
 
 
 def test_chatgpt_legacy_get_account_state_routes_to_query_state(monkeypatch):
@@ -71,6 +80,34 @@ def test_chatgpt_query_state_uses_project_proxy_before_direct(monkeypatch):
     assert calls == ["http://127.0.0.1:7890"]
     assert proxy_events == [("success", "http://127.0.0.1:7890")]
     assert result["data"]["network_path"] == "project_proxy"
+    assert result["data"]["check_state"] == "valid"
+
+
+def test_chatgpt_query_state_uses_manual_proxy_without_fallback(monkeypatch):
+    from platforms.chatgpt import switch
+
+    calls = []
+    proxy_events = []
+    platform = ChatGPTPlatform()
+    account = Account(platform="chatgpt", email="user@example.com", password="secret")
+    account.extra = {"access_token": "token"}
+
+    def fake_state(**kwargs):
+        calls.append(kwargs["proxy"])
+        return {"valid": True}
+
+    monkeypatch.setattr(switch, "fetch_chatgpt_account_state", fake_state)
+    monkeypatch.setattr(switch, "read_current_codex_account", lambda: {})
+    monkeypatch.setattr(switch, "get_codex_desktop_state", lambda: {})
+    monkeypatch.setattr(proxy_pool, "get_next", lambda region="": (_ for _ in ()).throw(AssertionError("pool should not be used")))
+    monkeypatch.setattr(proxy_pool, "report_success", lambda url: proxy_events.append(("success", url)))
+    monkeypatch.setattr(proxy_pool, "report_fail", lambda url: proxy_events.append(("fail", url)))
+
+    result = platform.execute_action("query_state", account, {"proxy": "  http://127.0.0.1:8080  "})
+
+    assert calls == ["http://127.0.0.1:8080"]
+    assert proxy_events == []
+    assert result["data"]["network_path"] == "manual_proxy"
     assert result["data"]["check_state"] == "valid"
 
 

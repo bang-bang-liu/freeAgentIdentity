@@ -784,6 +784,7 @@ function DisplaySections({ sections }: { sections: any[] }) {
 
 function ActionResultHighlights({ payload }: { payload: any }) {
   if (!payload || typeof payload !== 'object') return null
+  const { t } = useI18n()
 
   const stats: Array<{ label: string; value: any }> = []
   if ('valid' in payload) stats.push({ label: '账号有效', value: payload.valid })
@@ -792,6 +793,7 @@ function ActionResultHighlights({ payload }: { payload: any }) {
   if (payload.plan_id) stats.push({ label: 'Plan ID', value: payload.plan_id })
   if (typeof payload.has_valid_payment_method === 'boolean') stats.push({ label: '已绑卡', value: payload.has_valid_payment_method })
   if ('trial_eligible' in payload) stats.push({ label: '可试用', value: payload.trial_eligible })
+  if (payload.plus_trial_eligible === true) stats.push({ label: t('accounts.plusTrialEligible'), value: '是' })
   if (payload.trial_length_days) stats.push({ label: '试用天数', value: payload.trial_length_days })
   if (payload.remaining_credits) stats.push({ label: '剩余额度', value: payload.remaining_credits })
   if (payload.usage_total) stats.push({ label: '已用额度', value: payload.usage_total })
@@ -928,6 +930,7 @@ function ActionParamsModal({
   }, [action?.id, initialValues])
 
   const params = Array.isArray(action?.params) ? action.params : []
+  const missingRequired = params.some((param: any) => param?.required && !String(form[param.key] ?? '').trim())
 
   return (
     <div className="dialog-backdrop" onClick={onClose}>
@@ -969,6 +972,7 @@ function ActionParamsModal({
                   <div className="mb-1 text-xs text-[var(--text-muted)]">{param.label || param.key}</div>
                   <textarea
                     value={value}
+                    placeholder={param.placeholder || undefined}
                     onChange={e => setForm(current => ({ ...current, [param.key]: e.target.value }))}
                     rows={3}
                     className="w-full rounded-xl border border-[var(--border)] bg-[var(--bg-hover)] px-3 py-2 text-sm outline-none focus:border-[var(--text-accent)]"
@@ -982,6 +986,7 @@ function ActionParamsModal({
                 <input
                   type={param.type === 'number' ? 'number' : 'text'}
                   value={value}
+                  placeholder={param.placeholder || undefined}
                   onChange={e => setForm(current => ({ ...current, [param.key]: e.target.value }))}
                   className="w-full rounded-xl border border-[var(--border)] bg-[var(--bg-hover)] px-3 py-2 text-sm outline-none focus:border-[var(--text-accent)]"
                 />
@@ -989,9 +994,12 @@ function ActionParamsModal({
             )
           })}
         </div>
-        <div className="px-6 py-4 border-t border-[var(--border)] flex gap-3">
-          <Button onClick={() => onSubmit(form)} disabled={submitting} className="flex-1">
-            {submitting ? '执行中...' : '执行'}
+        <div className="relative px-6 py-4 border-t border-[var(--border)] flex gap-3">
+          {missingRequired && (
+            <div className="absolute left-6 -translate-y-7 text-[11px] text-[#f0b0b0]">请填写必填参数</div>
+          )}
+          <Button onClick={() => onSubmit(form)} disabled={submitting || missingRequired} className="flex-1">
+            {submitting ? '执行中...' : action?.id === 'query_state' ? '开始查询' : '执行'}
           </Button>
           <Button variant="outline" onClick={onClose} disabled={submitting} className="flex-1">取消</Button>
         </div>
@@ -1273,6 +1281,7 @@ function ActionMenu({
 
 // ── 账号详情弹框 ───────────────────────────────────────────
 function DetailModal({ acc, onClose, onSave }: { acc: any; onClose: () => void; onSave: () => void }) {
+  const { t } = useI18n()
   const [form, setForm] = useState({
     lifecycle_status: getLifecycleStatus(acc),
     primary_token: getPrimaryToken(acc),
@@ -1323,6 +1332,11 @@ function DetailModal({ acc, onClose, onSave }: { acc: any; onClose: () => void; 
                 <div className="mt-2 flex flex-wrap items-center gap-2">
                   <Badge variant={STATUS_VARIANT[getDisplayStatus(acc)] || 'secondary'}>{getDisplayStatus(acc)}</Badge>
                   <span className="text-lg font-semibold tracking-[-0.03em] text-[var(--text-primary)]">{acc.plan_name || overview.plan_name || overview.plan || getPlanState(acc)}</span>
+                  {overview?.plus_trial_eligible === true && (
+                    <span className="inline-flex items-center rounded-full bg-violet-500/10 px-2 py-0.5 text-xs font-medium text-violet-500 ring-1 ring-inset ring-violet-500/20">
+                      {t('accounts.plusTrialEligible')}
+                    </span>
+                  )}
                 </div>
               </div>
               <div className="grid grid-cols-2 gap-2 text-right text-[11px] text-[var(--text-muted)] sm:grid-cols-3">
@@ -2029,6 +2043,11 @@ export default function Accounts() {
                         </span>
                       );
                     })()}
+                    {overview?.plus_trial_eligible === true && (
+                      <span className="inline-flex items-center rounded-full bg-violet-500/10 px-2 py-0.5 text-xs font-medium text-violet-500 ring-1 ring-inset ring-violet-500/20">
+                        {t('accounts.plusTrialEligible')}
+                      </span>
+                    )}
                     {primaryMetrics.length > 0 ? (
                       <div className="flex max-w-full flex-col gap-1">
                         {primaryMetrics.slice(0, 2).map((metric: any) => (

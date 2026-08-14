@@ -104,6 +104,14 @@ def _build_account_overview(platform: str, data: dict[str, Any]) -> dict[str, An
     if "trial_eligible" in data:
         overview["trial_eligible"] = data.get("trial_eligible")
         overview["chips"].append("可试用" if data.get("trial_eligible") else "不可试用")
+    if "plus_trial_eligible" in data:
+        overview["plus_trial_eligible"] = data.get("plus_trial_eligible")
+        if data.get("plus_trial_eligible") is True:
+            overview["chips"].append("带Plus试用")
+        if data.get("plus_trial_check_state"):
+            overview["plus_trial_check_state"] = data.get("plus_trial_check_state")
+        if data.get("plus_trial_error"):
+            overview["plus_trial_error"] = data.get("plus_trial_error")
     if data.get("trial_length_days"):
         overview["trial_length_days"] = data.get("trial_length_days")
         overview["chips"].append(f"{data['trial_length_days']}天试用")
@@ -242,6 +250,8 @@ class PlatformRuntime:
                     label=str(param.get("label", "")),
                     type=str(param.get("type", "text")),
                     options=list(param.get("options", []) or []),
+                    placeholder=str(param.get("placeholder", "") or ""),
+                    required=bool(param.get("required", False)),
                 )
                 for param in item.get("params", [])
             ]

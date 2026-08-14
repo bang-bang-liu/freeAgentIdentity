@@ -24,6 +24,8 @@ class ActionsService:
                             "label": param.label,
                             "type": param.type,
                             "options": param.options,
+                            "placeholder": param.placeholder,
+                            "required": param.required,
                         }
                         for param in action.params
                     ],

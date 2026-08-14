@@ -179,6 +179,133 @@ def test_chatgpt_subscription_status_falls_back_to_wham_usage(monkeypatch):
     assert captured_headers["Chatgpt-Account-Id"] == "acct-123"
 
 
+def test_chatgpt_plus_trial_eligibility_uses_bearer_and_proxy(monkeypatch):
+    captured: dict = {}
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "plan_type": "free",
+                "subscription_plan": "chatgptfreeplan",
+                "eligible_promo_campaigns": {"plus": True},
+            }
+
+    def _fake_get(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return _Resp()
+
+    monkeypatch.setattr(subscription.requests, "get", _fake_get)
+    account = type("AccountStub", (), {"access_token": "token"})()
+
+    result = subscription.fetch_plus_trial_eligibility(account, proxy="http://proxy:8080")
+
+    assert result["plus_trial_eligible"] is True
+    assert result["plus_trial_check_state"] == "available"
+    assert captured["url"].endswith("/backend-api/accounts/check/v4-2023-04-27")
+    assert captured["params"]["timezone_offset_min"].lstrip("-").isdigit()
+    assert captured["headers"]["Authorization"] == "Bearer token"
+    assert captured["proxies"] == {"http": "http://proxy:8080", "https": "http://proxy:8080"}
+
+
+def test_chatgpt_plus_trial_retries_403_with_browser_cookies(monkeypatch):
+    calls: list[dict] = []
+
+    class _Resp:
+        def __init__(self, status_code, data=None):
+            self.status_code = status_code
+            self._data = data
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP Error {self.status_code}")
+
+        def json(self):
+            return self._data
+
+    def _fake_get(_url, **kwargs):
+        calls.append(kwargs)
+        if len(calls) < 3:
+            return _Resp(403)
+        return _Resp(200, {
+            "plan_type": "free",
+            "eligible_promo_campaigns": {"plus": True},
+        })
+
+    monkeypatch.setattr(subscription.requests, "get", _fake_get)
+    account = type(
+        "AccountStub",
+        (),
+        {"access_token": "token", "cookies": "oai-did=device; foo=bar"},
+    )()
+
+    result = subscription.fetch_plus_trial_eligibility(account)
+
+    assert result["plus_trial_eligible"] is True
+    assert len(calls) == 3
+    assert calls[0]["params"]["timezone_offset_min"].lstrip("-").isdigit()
+    assert calls[1]["params"] == {}
+    assert calls[2]["cookies"]["oai-did"] == "device"
+
+
+def test_chatgpt_plus_trial_eligibility_is_false_for_paid_account(monkeypatch):
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "plan_type": "plus",
+                "subscription_plan": "chatgptplusplan",
+                "eligible_promo_campaigns": {"plus": True},
+            }
+
+    monkeypatch.setattr(subscription.requests, "get", lambda *_args, **_kwargs: _Resp())
+    account = type("AccountStub", (), {"access_token": "token"})()
+
+    result = subscription.fetch_plus_trial_eligibility(account)
+
+    assert result["plus_trial_eligible"] is False
+
+
+def test_chatgpt_plus_trial_failure_does_not_fail_subscription_status(monkeypatch):
+    class _Resp:
+        status_code = 200
+
+        def __init__(self, data):
+            self._data = data
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._data
+
+    def _fake_get(url, **_kwargs):
+        if url.endswith("/backend-api/me"):
+            return _Resp({"plan_type": "free"})
+        if url.endswith("/backend-api/wham/usage"):
+            return _Resp({"plan_type": "free"})
+        raise RuntimeError("promotion endpoint unavailable")
+
+    monkeypatch.setattr(subscription.requests, "get", _fake_get)
+    account = type("AccountStub", (), {"access_token": "token", "extra": {}})()
+
+    details = subscription.fetch_subscription_status_details(account, proxy="http://proxy:8080")
+
+    assert details["status"] == "free"
+    assert details["plus_trial_eligible"] is None
+    assert details["plus_trial_check_state"] == "unavailable"
+    assert "promotion endpoint unavailable" in details["plus_trial_error"]
+
+
 def test_chatgpt_check_valid_uses_proxy_pool_before_direct(monkeypatch):
     calls: list[str | None] = []
     proxy_events: list[tuple[str, str]] = []
@@ -219,3 +346,31 @@ def test_chatgpt_check_valid_uses_proxy_pool_before_direct(monkeypatch):
     assert calls == ["http://127.0.0.1:7890"]
     assert proxy_events == [("success", "http://127.0.0.1:7890")]
     assert plugin.get_last_check_overview()["chatgpt_usage"] == {"plan_type": "free"}
+
+
+def test_chatgpt_check_valid_surfaces_plus_trial_eligibility(monkeypatch):
+    monkeypatch.setattr(
+        subscription,
+        "fetch_subscription_status_details",
+        lambda account, proxy=None: {
+            "status": "free",
+            "source": "backend-api/me",
+            "plus_trial_eligible": True,
+            "plus_trial_check_state": "available",
+        },
+    )
+    monkeypatch.setattr(proxy_pool, "get_next", lambda region="": None)
+
+    plugin = ChatGPTPlatform.__new__(ChatGPTPlatform)
+    plugin.config = RegisterConfig()
+    plugin.mailbox = None
+    account = type(
+        "AccountStub",
+        (),
+        {"token": "token", "region": "", "extra": {"access_token": "token"}},
+    )()
+
+    assert plugin.check_valid(account) is True
+    overview = plugin.get_last_check_overview()
+    assert overview["plus_trial_eligible"] is True
+    assert "带Plus试用" in overview["chips"]
