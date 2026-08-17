@@ -23,6 +23,13 @@ from core.platform_accounts import build_platform_account
 from core.registry import get
 from infrastructure.platform_runtime import PlatformRuntime
 
+
+def create_mailbox(*args, **kwargs):
+    """Delegate mailbox creation while keeping the task-level test seam."""
+    from core.base_mailbox import create_mailbox as mailbox_factory
+
+    return mailbox_factory(*args, **kwargs)
+
 TASK_TYPE_REGISTER = "register"
 TASK_TYPE_ACCOUNT_CHECK_ALL = "account_check_all"
 TASK_TYPE_PLATFORM_ACTION = "platform_action"
@@ -494,7 +501,6 @@ class TaskLogger:
 
 def _build_platform_instance(platform_name: str, payload: dict[str, Any], logger: TaskLogger, resolved_proxy: str | None = None, shared_mailbox=None):
     from core.base_identity import normalize_identity_provider
-    from core.base_mailbox import create_mailbox
 
     executor_type = str(payload.get("executor_type", "headless") or "headless")
     captcha_solver = str(payload.get("captcha_solver", "auto") or "auto")
@@ -524,6 +530,12 @@ def _build_platform_instance(platform_name: str, payload: dict[str, Any], logger
         platform.set_logger(logger.log)
     else:
         platform._log_fn = logger.log
+    # Browser registration can block while waiting for an OTP. Wire the task
+    # cancellation checker into headed/headless platform instances so mailbox
+    # polling and the browser state machine can stop without changing the
+    # protocol registration path.
+    if executor_type in {"headless", "headed"} and hasattr(platform, "set_cancel_checker"):
+        platform.set_cancel_checker(logger.is_cancel_requested)
     return platform
 
 
@@ -694,7 +706,6 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     shared_mailbox = None
     try:
         from core.base_identity import normalize_identity_provider
-        from core.base_mailbox import create_mailbox
 
         identity_provider = normalize_identity_provider(extra.get("identity_provider", "mailbox"))
         if identity_provider == "mailbox":

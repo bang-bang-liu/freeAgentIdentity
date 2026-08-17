@@ -176,6 +176,38 @@ def test_chatgpt_register_task_succeeds_after_successful_registration(monkeypatc
     )
 
 
+def test_browser_registration_platform_receives_task_cancel_checker(monkeypatch):
+    seen = {}
+
+    class FakePlatform:
+        def __init__(self, config=None, mailbox=None):
+            self.config = config
+
+        def set_logger(self, logger):
+            pass
+
+        def set_cancel_checker(self, checker):
+            seen["checker"] = checker
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: FakePlatform)
+    monkeypatch.setattr(tasks_module, "create_mailbox", lambda **kwargs: object())
+
+    logger = _FakeLogger()
+    platform = tasks_module._build_platform_instance(
+        "chatgpt",
+        {
+            "executor_type": "headless",
+            "extra": {"identity_provider": "mailbox", "mail_provider": "fake"},
+        },
+        logger,
+    )
+
+    assert platform.config.executor_type == "headless"
+    assert getattr(seen["checker"], "__self__", None) is logger
+    assert getattr(seen["checker"], "__name__", "") == "is_cancel_requested"
+    assert seen["checker"]() is False
+
+
 def test_register_task_honors_twenty_worker_concurrency_limit():
     assert tasks_module._registration_concurrency(20, 50) == 20
     assert tasks_module._registration_concurrency(99, 50) == 20

@@ -12,7 +12,8 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { getTaskStatusText, TASK_STATUS_VARIANTS } from '@/lib/tasks'
-import { RefreshCw, Copy, ExternalLink, Download, Upload, Plus, X, Mail, Trash2, Zap } from 'lucide-react'
+import { RefreshCw, Copy, ExternalLink, Download, Upload, Plus, X, Mail, Trash2, Zap, UserCheck, FlaskConical, Crown, Clock, CircleX, Sparkles, BadgeCheck, Gift, Circle } from 'lucide-react'
+import type { LucideIcon } from 'lucide-react'
 
 const STATUS_VARIANT: Record<string, any> = {
   registered: 'default', trial: 'success', subscribed: 'success',
@@ -24,6 +25,10 @@ const platformActionsCache = new Map<string, any[]>()
 const platformActionsPromiseCache = new Map<string, Promise<any[]>>()
 
 const ACCOUNT_TOOL_BUTTON_CLASS = 'h-8 shrink-0 whitespace-nowrap bg-transparent'
+const QUERY_PROXY_PRESETS = [
+  'http://127.0.0.1:7897',
+  'http://127.0.0.1:7890',
+]
 
 function getAccountOverview(acc: any) {
   return acc?.overview || {}
@@ -62,27 +67,90 @@ function getValidityStatus(acc: any) {
   return getDisplaySummary(acc)?.status?.validity || acc?.validity_status || acc?.overview?.validity_status || 'unknown'
 }
 
-function getCompactStatusMeta(acc: any) {
-  const summary = getDisplaySummary(acc)
-  const primaryMetrics = Array.isArray(summary?.primary_metrics) ? summary.primary_metrics : []
-  if (primaryMetrics.length > 0) {
-    return primaryMetrics.slice(0, 2).map((item: any) => {
-      const sub = item?.sub ? ` · ${item.sub}` : ''
-      return `${item?.label || ''}:${item?.value || '-'}${sub}`
-    }).join(' / ')
-  }
+const LIFECYCLE_ICONS: Record<string, LucideIcon> = {
+  registered: UserCheck,
+  trial: FlaskConical,
+  subscribed: Crown,
+  expired: Clock,
+  invalid: CircleX,
+  free: Sparkles,
+  eligible: Gift,
+  valid: BadgeCheck,
+}
+
+function getStatusIcon(status: string): LucideIcon {
+  return LIFECYCLE_ICONS[status] || Circle
+}
+
+function getStatusIconColor(variant: string): string {
+  if (variant === 'success') return 'text-emerald-500'
+  if (variant === 'warning') return 'text-amber-500'
+  if (variant === 'danger') return 'text-red-500'
+  if (variant === 'default') return 'text-blue-500'
+  return 'text-gray-400'
+}
+
+function getPlanChip(acc: any): { label: string; tone: 'sky' | 'violet'; title: string } | null {
   const overview = getAccountOverview(acc)
-  const parts = [
-    `生命周期:${getLifecycleStatus(acc)}`,
-    `套餐:${getPlanState(acc)}`,
-    `有效:${getValidityStatus(acc)}`,
-  ]
-  const remainingCredits = overview?.remaining_credits
-  const usageTotal = overview?.usage_total
-  if (remainingCredits || usageTotal) {
-    parts.push(`额度:${remainingCredits || '-'} / 已用:${usageTotal || '-'}`)
+  const summaryStatus = getDisplaySummary(acc)?.status || {}
+  const raw = [
+    acc?.plan_name,
+    summaryStatus?.plan_name,
+    overview?.plan_name,
+    overview?.plan,
+    overview?.membership_type,
+    overview?.individual_membership_type,
+  ].map(value => String(value || '').trim().toLowerCase()).find(Boolean) || ''
+  const planState = getPlanState(acc)
+  if (raw && (raw.includes('plus') || raw.includes('team') || raw.includes('pro') || raw.includes('premium'))) {
+    return { label: 'Plus', tone: 'violet', title: 'Plus' }
   }
-  return parts.join(' / ')
+  if (raw && (raw.includes('free') || raw.includes('basic'))) {
+    return { label: 'Free', tone: 'sky', title: 'Free' }
+  }
+  if (planState === 'free') return { label: 'Free', tone: 'sky', title: 'Free' }
+  if (planState === 'subscribed') return { label: 'Plus', tone: 'violet', title: 'Plus' }
+  return null
+}
+
+function getValidityChip(acc: any): { label: string; tone: 'emerald' | 'red' | 'gray' } | null {
+  const validity = getValidityStatus(acc)
+  if (!validity || validity === 'unknown') return null
+  if (validity === 'valid') return { label: 'valid', tone: 'emerald' }
+  if (validity === 'invalid') return { label: 'invalid', tone: 'red' }
+  return { label: validity, tone: 'gray' }
+}
+
+function isTrialAccount(acc: any): boolean {
+  const overview = getAccountOverview(acc)
+  return (
+    getPlanState(acc) === 'trial' ||
+    getPlanState(acc) === 'eligible' ||
+    getLifecycleStatus(acc) === 'trial' ||
+    overview?.plus_trial_eligible === true ||
+    Boolean(overview?.trial_end_time)
+  )
+}
+
+const STATUS_CHIP_TONES: Record<string, string> = {
+  emerald: 'bg-emerald-500/10 text-emerald-500 ring-emerald-500/20',
+  violet: 'bg-violet-500/10 text-violet-500 ring-violet-500/20',
+  sky: 'bg-sky-500/10 text-sky-500 ring-sky-500/20',
+  amber: 'bg-amber-500/10 text-amber-500 ring-amber-500/20',
+  red: 'bg-red-500/10 text-red-500 ring-red-500/20',
+  gray: 'bg-[var(--text-primary)]/5 text-[var(--text-secondary)] ring-[var(--border)]',
+}
+
+function StatusIconChip({ label, tone, title }: { label: string; tone: string; title?: string }) {
+  return (
+    <span
+      aria-label={title || label}
+      title={title || label}
+      className={`inline-flex items-center gap-1 whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${STATUS_CHIP_TONES[tone] || STATUS_CHIP_TONES.gray}`}
+    >
+      <span>{label}</span>
+    </span>
+  )
 }
 
 function getPrimaryMetrics(acc: any) {
@@ -203,8 +271,13 @@ function buildActionParamDraft(action: any, acc: any) {
       draft[param.key] = `${emailPrefix}Development`
       return
     }
-    if (Array.isArray(param?.options) && param.options.length > 0) {
-      draft[param?.key || ''] = String(param.options[0] ?? '')
+    const options = Array.isArray(param?.options) && param.options.length > 0
+      ? param.options
+      : param?.key === 'proxy'
+        ? QUERY_PROXY_PRESETS
+        : []
+    if (options.length > 0) {
+      draft[param?.key || ''] = String(options[0] ?? '')
       return
     }
     draft[param?.key || ''] = ''
@@ -950,6 +1023,41 @@ function ActionParamsModal({
         <div className="px-6 py-4 space-y-4">
           {params.map((param: any) => {
             const value = form[param.key] ?? ''
+            const isProxyParam = param.key === 'proxy' || param.type === 'proxy'
+            if (isProxyParam) {
+              const proxyOptions = (Array.isArray(param.options) && param.options.length > 0
+                ? param.options
+                : QUERY_PROXY_PRESETS
+              ).map((option: unknown) => String(option))
+              const selectedProxy = proxyOptions.includes(String(value)) ? String(value) : '__manual__'
+              return (
+                <label key={param.key} className="block">
+                  <div className="mb-1 text-xs text-[var(--text-muted)]">{param.label || param.key}</div>
+                  <div className="flex gap-2">
+                    <select
+                      value={selectedProxy}
+                      onChange={e => {
+                        const nextValue = e.target.value === '__manual__' ? '' : e.target.value
+                        setForm(current => ({ ...current, [param.key]: nextValue }))
+                      }}
+                      className="w-[190px] shrink-0 rounded-xl border border-[var(--border)] bg-[var(--bg-hover)] px-3 py-2 text-sm outline-none focus:border-[var(--text-accent)]"
+                    >
+                      {proxyOptions.map((option: string) => (
+                        <option key={option} value={option}>{option}</option>
+                      ))}
+                      <option value="__manual__">手动填写</option>
+                    </select>
+                    <input
+                      type="text"
+                      value={value}
+                      placeholder={param.placeholder || undefined}
+                      onChange={e => setForm(current => ({ ...current, [param.key]: e.target.value }))}
+                      className="min-w-0 flex-1 rounded-xl border border-[var(--border)] bg-[var(--bg-hover)] px-3 py-2 text-sm outline-none focus:border-[var(--text-accent)]"
+                    />
+                  </div>
+                </label>
+              )
+            }
             if (Array.isArray(param.options) && param.options.length > 0) {
               return (
                 <label key={param.key} className="block">
@@ -2024,10 +2132,11 @@ export default function Accounts() {
                   </div>
                 </td>
                 <td className="px-3 py-2.5 align-top">
-                  <div className="min-w-0 flex flex-col items-start gap-1.5">
+                  <div className="min-w-0 flex flex-wrap items-center gap-1.5">
                     {(() => {
                       const status = getDisplayStatus(acc);
                       const variant = String(STATUS_VARIANT[status] || 'secondary');
+                      const StatusIcon = getStatusIcon(status);
                       const styles = (({
                         success: "bg-emerald-500/10 text-emerald-500 ring-emerald-500/20",
                         warning: "bg-amber-500/10 text-amber-500 ring-amber-500/20",
@@ -2038,18 +2147,36 @@ export default function Accounts() {
                       
                       return (
                         <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${styles}`}>
-                          <span className={`mr-1 h-1 w-1 rounded-full ${variant === 'success' ? 'bg-emerald-500 shadow-[0_0_4px_rgba(16,185,129,0.6)]' : variant === 'warning' ? 'bg-amber-500 shadow-[0_0_4px_rgba(245,158,11,0.6)]' : variant === 'danger' ? 'bg-red-500 shadow-[0_0_4px_rgba(239,68,68,0.6)]' : variant === 'default' ? 'bg-blue-500' : 'bg-gray-400'}`}></span>
+                          <StatusIcon className={`mr-1 h-3 w-3 ${getStatusIconColor(variant)}`} />
                           {translateAccountStatus(status, language)}
                         </span>
                       );
                     })()}
-                    {overview?.plus_trial_eligible === true && (
-                      <span className="inline-flex items-center rounded-full bg-violet-500/10 px-2 py-0.5 text-xs font-medium text-violet-500 ring-1 ring-inset ring-violet-500/20">
-                        {t('accounts.plusTrialEligible')}
-                      </span>
-                    )}
-                    {primaryMetrics.length > 0 ? (
-                      <div className="flex max-w-full flex-col gap-1">
+                    {(() => {
+                      const planChip = getPlanChip(acc)
+                      const validityChip = getValidityChip(acc)
+                      const trialActive = isTrialAccount(acc) && getDisplayStatus(acc) !== 'trial'
+                      if (!planChip && !validityChip && !trialActive) return null
+                      return (
+                        <div className="flex max-w-full flex-wrap items-center gap-1">
+                          {planChip && <StatusIconChip {...planChip} />}
+                          {validityChip && (
+                            <StatusIconChip
+                              tone={validityChip.tone}
+                              label={translateAccountStatus(validityChip.label, language)}
+                            />
+                          )}
+                          {trialActive && (
+                            <StatusIconChip
+                              label={translateAccountStatus('trial', language)}
+                              tone="amber"
+                            />
+                          )}
+                        </div>
+                      )
+                    })()}
+                    {primaryMetrics.length > 0 && (
+                      <div className="basis-full flex max-w-full flex-col gap-1">
                         {primaryMetrics.slice(0, 2).map((metric: any) => (
                           <div key={metric.key || metric.label} className="flex items-center gap-1.5">
                             <span className="h-1 w-1 rounded-full bg-[var(--text-muted)] opacity-50"></span>
@@ -2059,13 +2186,6 @@ export default function Accounts() {
                             </span>
                           </div>
                         ))}
-                      </div>
-                    ) : (
-                      <div
-                        className="truncate text-xs text-[var(--text-muted)]"
-                        title={getCompactStatusMeta(acc)}
-                      >
-                        {getCompactStatusMeta(acc)}
                       </div>
                     )}
                   </div>

@@ -6,6 +6,8 @@ official Sentinel JavaScript required for the create-account security token.
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import random
 import threading
@@ -13,7 +15,7 @@ import time
 import uuid
 from datetime import datetime, timedelta
 from typing import Callable
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import quote, urlencode, urljoin, urlparse
 
 from curl_cffi import requests
 
@@ -80,6 +82,55 @@ def _response_error(response, payload: dict | None = None) -> str:
         return error
     text = str(getattr(response, "text", "") or "").strip()
     return text[:300] or f"HTTP {getattr(response, 'status_code', 0)}"
+
+
+def _decode_totp_secret(secret: str) -> bytes:
+    cleaned = str(secret or "").replace(" ", "").upper().rstrip("=")
+    if not cleaned or any(char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567" for char in cleaned):
+        raise ValueError("TOTP secret 不是有效的 Base32 字符串")
+    padded = cleaned + "=" * (-len(cleaned) % 8)
+    try:
+        return base64.b32decode(padded, casefold=True)
+    except Exception as exc:
+        raise ValueError("TOTP secret Base32 解码失败") from exc
+
+
+def _generate_totp_code(secret: str, *, timestamp: float | None = None) -> str:
+    key = _decode_totp_secret(secret)
+    counter = int((time.time() if timestamp is None else timestamp) // 30)
+    digest = hmac.new(key, counter.to_bytes(8, "big"), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    value = (
+        ((digest[offset] & 0x7F) << 24)
+        | ((digest[offset + 1] & 0xFF) << 16)
+        | ((digest[offset + 2] & 0xFF) << 8)
+        | (digest[offset + 3] & 0xFF)
+    )
+    return str(value % 1_000_000).zfill(6)
+
+
+def _build_totp_otpauth(email: str, secret: str) -> str:
+    label = quote(str(email or "chatgpt"), safe="")
+    return (
+        f"otpauth://totp/OpenAI:{label}?secret={secret}"
+        "&issuer=OpenAI&algorithm=SHA1&digits=6&period=30"
+    )
+
+
+def _continue_url(payload: dict | None) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    direct = str(payload.get("continue_url") or "").strip()
+    if direct:
+        return direct
+    nested = payload.get("data")
+    if isinstance(nested, dict) and nested is not payload:
+        nested_url = _continue_url(nested)
+        if nested_url:
+            return nested_url
+    page = payload.get("page")
+    page_payload = page.get("payload") if isinstance(page, dict) else None
+    return str(page_payload.get("url") or "").strip() if isinstance(page_payload, dict) else ""
 
 
 class _SentinelTokenGenerator:
@@ -628,6 +679,512 @@ class ChatGPTProtocolRegister:
             raise RuntimeError(f"邮箱验证码校验失败: {_response_error(response, payload)}")
         return payload
 
+    def _session_payload(self) -> dict:
+        response = self.session.get(f"{CHATGPT_APP}/api/auth/session")
+        payload = _response_json(response)
+        access_token = str(payload.get("accessToken") or "").strip()
+        if getattr(response, "status_code", 0) != 200 or not access_token:
+            raise RuntimeError(
+                f"获取 ChatGPT session/accessToken 失败: {_response_error(response, payload)}"
+            )
+        return payload
+
+    def _chatgpt_security_headers(self, access_token: str, target_path: str) -> dict:
+        return {
+            "accept": "application/json",
+            "content-type": "application/json",
+            "authorization": f"Bearer {access_token}",
+            "oai-device-id": self.device_id,
+            "oai-session-id": str(uuid.uuid4()),
+            "oai-language": "en-US",
+            "x-openai-target-path": target_path,
+            "x-openai-target-route": target_path,
+            "origin": CHATGPT_APP,
+            "referer": f"{CHATGPT_APP}/",
+            "user-agent": self.user_agent,
+        }
+
+    @staticmethod
+    def _auth_url(value: str) -> str:
+        target = str(value or "").strip()
+        return urljoin(OPENAI_AUTH, target) if target else ""
+
+    def _follow_security_url(self, value: str, *, referer: str = "") -> str:
+        target = str(value or "").strip()
+        if not target:
+            return ""
+        target = self._auth_url(target)
+        response = self.session.get(
+            target,
+            headers={
+                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "referer": referer or f"{CHATGPT_APP}/",
+                "user-agent": self.user_agent,
+            },
+            allow_redirects=True,
+        )
+        if getattr(response, "status_code", 0) >= 400:
+            raise RuntimeError(f"安全设置页面访问失败: {_response_error(response)}")
+        final_url = str(getattr(response, "url", "") or "").strip()
+        if not final_url:
+            final_url = str(response.headers.get("location") or target).strip()
+        return final_url
+
+    def _start_security_reauth_protocol(
+        self,
+        *,
+        email: str,
+        params: dict,
+        callback_url: str,
+    ) -> str:
+        csrf_response = self.session.get(f"{CHATGPT_APP}/api/auth/csrf")
+        csrf_payload = _response_json(csrf_response)
+        csrf_token = str(csrf_payload.get("csrfToken") or "").strip()
+        if getattr(csrf_response, "status_code", 0) != 200 or not csrf_token:
+            raise RuntimeError(
+                f"安全设置 re-auth 获取 CSRF token 失败: "
+                f"{_response_error(csrf_response, csrf_payload)}"
+            )
+
+        query = {
+            "login_hint": email,
+            "ext-oai-did": self.device_id,
+        }
+        query.update(
+            {
+                str(key): str(value)
+                for key, value in (params or {}).items()
+                if value not in (None, "")
+            }
+        )
+        response = self.session.post(
+            f"{CHATGPT_APP}/api/auth/signin/openai?{urlencode(query)}",
+            data=urlencode(
+                {
+                    "callbackUrl": callback_url,
+                    "csrfToken": csrf_token,
+                    "json": "true",
+                }
+            ),
+            headers={
+                "accept": "application/json",
+                "content-type": "application/x-www-form-urlencoded",
+                "origin": CHATGPT_APP,
+                "referer": f"{CHATGPT_APP}/",
+                "user-agent": self.user_agent,
+            },
+            allow_redirects=False,
+        )
+        payload = _response_json(response)
+        auth_url = str(
+            payload.get("url") or response.headers.get("location") or ""
+        ).strip()
+        if getattr(response, "status_code", 0) >= 400 or not auth_url:
+            raise RuntimeError(
+                f"安全设置 re-auth 启动失败: {_response_error(response, payload)}"
+            )
+        self.log("安全设置 re-auth 已启动")
+        return self._follow_security_url(auth_url, referer=f"{CHATGPT_APP}/")
+
+    def _resend_email_otp_protocol(self, *, referer: str) -> None:
+        response = self.session.post(
+            f"{OPENAI_AUTH}/api/accounts/email-otp/resend",
+            json={},
+            headers={
+                "accept": "application/json, text/plain, */*",
+                "content-type": "application/json",
+                "origin": OPENAI_AUTH,
+                "referer": referer or f"{OPENAI_AUTH}/email-verification",
+                "user-agent": self.user_agent,
+                "x-access-flow-invocation-id": str(uuid.uuid4()),
+            },
+        )
+        if getattr(response, "status_code", 0) == 429:
+            raise RuntimeError("安全设置 re-auth 邮箱验证码重发过于频繁，请稍后再试")
+        if getattr(response, "status_code", 0) >= 400:
+            raise RuntimeError(
+                f"安全设置 re-auth 邮箱验证码重发失败: {_response_error(response)}"
+            )
+        self.log("安全设置 re-auth 已通过 API 请求重发邮箱验证码")
+
+    def _validate_email_otp_protocol(self, code: str, *, referer: str):
+        headers = self._common_headers(referer or f"{OPENAI_AUTH}/email-verification")
+        headers.update(self.sentinel.build_headers(self.device_id, "email_otp_validate"))
+        response = self.session.post(
+            f"{OPENAI_AUTH}/api/accounts/email-otp/validate",
+            json={"code": str(code or "").strip()},
+            headers=headers,
+        )
+        return response, _response_json(response)
+
+    def _get_new_email_code_protocol(
+        self,
+        excluded_codes: set[str],
+        *,
+        deadline: float,
+    ) -> str:
+        if not callable(self.otp_callback):
+            return ""
+        while time.time() < deadline:
+            remaining = max(1, int(deadline - time.time()))
+            if getattr(self.otp_callback, "supports_timeout_override", False):
+                code = self.otp_callback(timeout_override=remaining)
+            else:
+                code = self.otp_callback()
+            code = str(code or "").strip()
+            if not code:
+                return ""
+            if code not in excluded_codes:
+                return code
+            self.log(f"忽略注册阶段已使用的邮箱验证码: {code}，继续等待 re-auth 新验证码")
+            time.sleep(0.5)
+        return ""
+
+    def _verify_password_reauth_protocol(self, password: str, *, referer: str) -> dict:
+        response = self.session.post(
+            f"{OPENAI_AUTH}/api/accounts/password/verify",
+            json={"password": password},
+            headers=self._common_headers(referer),
+        )
+        payload = _response_json(response)
+        if getattr(response, "status_code", 0) >= 400 or payload.get("error"):
+            raise RuntimeError(
+                f"安全设置 re-auth 登录密码校验失败: {_response_error(response, payload)}"
+            )
+        return payload
+
+    def _complete_security_reauth_protocol(
+        self,
+        *,
+        start_url: str,
+        password: str,
+        secret: str,
+        excluded_codes: set[str],
+        expect_password_page: bool,
+        timeout: int = 120,
+    ) -> str:
+        deadline = time.time() + timeout
+        current_url = str(start_url or "").strip()
+        email_resend_requested = False
+
+        while time.time() < deadline:
+            self._check_cancelled()
+            path = urlparse(current_url).path.lower()
+            if path == "/email-verification":
+                if not callable(self.otp_callback):
+                    raise RuntimeError("安全设置 re-auth 需要邮箱验证码，但未提供 otp_callback")
+                if not email_resend_requested:
+                    self._resend_email_otp_protocol(referer=current_url)
+                    email_resend_requested = True
+                code = self._get_new_email_code_protocol(
+                    excluded_codes,
+                    deadline=deadline,
+                )
+                if not code:
+                    raise RuntimeError("安全设置 re-auth 未获取到新的邮箱验证码")
+                response, payload = self._validate_email_otp_protocol(
+                    code,
+                    referer=current_url,
+                )
+                if getattr(response, "status_code", 0) >= 400 or payload.get("error"):
+                    excluded_codes.add(code)
+                    self.log(
+                        "安全设置 re-auth 邮箱验证码校验失败: "
+                        f"{_response_error(response, payload)}，准备重新请求新验证码"
+                    )
+                    email_resend_requested = False
+                    continue
+                continue_url = _continue_url(payload)
+                if not continue_url:
+                    raise RuntimeError(
+                        "安全设置 re-auth 邮箱验证码验证成功但未返回密码页面 URL"
+                    )
+                excluded_codes.add(code)
+                current_url = self._follow_security_url(
+                    continue_url,
+                    referer=current_url,
+                )
+                self.log("安全设置 re-auth 邮箱验证码验证通过，已进入密码页面")
+                continue
+
+            if path == "/log-in/password":
+                verified = self._verify_password_reauth_protocol(
+                    password,
+                    referer=current_url,
+                )
+                continue_url = _continue_url(verified)
+                if not continue_url:
+                    raise RuntimeError("安全设置 re-auth 密码校验成功但未返回后续页面 URL")
+                current_url = self._follow_security_url(
+                    continue_url,
+                    referer=current_url,
+                )
+                continue
+
+            if "/mfa-challenge/" in path:
+                if not secret:
+                    raise RuntimeError("安全设置 re-auth 需要 TOTP，但当前没有可用的 secret")
+                factor_id = path.rstrip("/").rsplit("/", 1)[-1]
+                issue_response = self.session.post(
+                    f"{OPENAI_AUTH}/api/accounts/mfa/issue_challenge",
+                    json={
+                        "type": "totp",
+                        "id": factor_id,
+                        "force_fresh_challenge": False,
+                    },
+                    headers=self._common_headers(current_url),
+                )
+                issue_payload = _response_json(issue_response)
+                if getattr(issue_response, "status_code", 0) >= 400 or issue_payload.get("error"):
+                    raise RuntimeError(
+                        f"安全设置 re-auth TOTP challenge 启动失败: "
+                        f"{_response_error(issue_response, issue_payload)}"
+                    )
+                verify_response = self.session.post(
+                    f"{OPENAI_AUTH}/api/accounts/mfa/verify",
+                    json={
+                        "type": "totp",
+                        "id": factor_id,
+                        "code": _generate_totp_code(secret),
+                    },
+                    headers=self._common_headers(current_url),
+                )
+                verify_payload = _response_json(verify_response)
+                if getattr(verify_response, "status_code", 0) >= 400 or verify_payload.get("error"):
+                    raise RuntimeError(
+                        f"安全设置 re-auth TOTP 校验失败: "
+                        f"{_response_error(verify_response, verify_payload)}"
+                    )
+                continue_url = _continue_url(verify_payload)
+                if not continue_url:
+                    raise RuntimeError("安全设置 re-auth TOTP 校验成功但未返回后续页面 URL")
+                current_url = self._follow_security_url(
+                    continue_url,
+                    referer=current_url,
+                )
+                continue
+
+            if path == "/reset-password/new-password":
+                return current_url
+
+            parsed = urlparse(current_url)
+            if parsed.netloc.lower().endswith("chatgpt.com"):
+                if expect_password_page:
+                    raise RuntimeError("安全设置 re-auth 未进入设置密码页面")
+                return current_url
+
+            if "error=" in parsed.query.lower():
+                raise RuntimeError(f"安全设置 re-auth 失败: {parsed.query[:300]}")
+            raise RuntimeError(
+                f"安全设置 re-auth 出现未支持的页面: {parsed.path or current_url}"
+            )
+
+        raise RuntimeError("安全设置 re-auth 超时")
+
+    def _setup_totp_protocol(
+        self,
+        *,
+        email: str,
+        password: str,
+        session_payload: dict,
+        excluded_codes: set[str],
+    ) -> dict:
+        access_token = str(session_payload.get("accessToken") or "").strip()
+        if not access_token:
+            raise RuntimeError("TOTP 设置前缺少 ChatGPT accessToken")
+        info_path = "/backend-api/accounts/mfa_info"
+        info_response = self.session.get(
+            f"{CHATGPT_APP}{info_path}",
+            headers=self._chatgpt_security_headers(access_token, info_path),
+        )
+        info_payload = _response_json(info_response)
+        if getattr(info_response, "status_code", 0) >= 400 or info_payload.get("error"):
+            raise RuntimeError(
+                f"读取 ChatGPT 2FA 状态失败: {_response_error(info_response, info_payload)}"
+            )
+        info_data = info_payload.get("data") if isinstance(info_payload.get("data"), dict) else info_payload
+        if bool(info_data.get("mfa_enabled_v2")):
+            self.log("2FA 已启用，跳过重复 enrollment")
+            return {
+                "totp_set": True,
+                "totp_already_enabled": True,
+                "totp_secret": "",
+                "otpauth": "",
+            }
+
+        def enroll():
+            path = "/backend-api/accounts/mfa/enroll"
+            response = self.session.post(
+                f"{CHATGPT_APP}{path}",
+                json={"factor_type": "totp"},
+                headers=self._chatgpt_security_headers(access_token, path),
+            )
+            return response, _response_json(response)
+
+        enroll_response, enroll_payload = enroll()
+        if getattr(enroll_response, "status_code", 0) >= 400 or enroll_payload.get("error"):
+            self.log(
+                "TOTP enrollment 需要 re-auth: "
+                f"{_response_error(enroll_response, enroll_payload)}"
+            )
+            start_url = self._start_security_reauth_protocol(
+                email=email,
+                params={
+                    "connection": "password",
+                    "reauth": "password",
+                    "max_age": "0",
+                },
+                callback_url=f"{CHATGPT_APP}/?security_setup=totp_continue",
+            )
+            self._complete_security_reauth_protocol(
+                start_url=start_url,
+                password=password,
+                secret="",
+                excluded_codes=excluded_codes,
+                expect_password_page=False,
+            )
+            session_payload = self._session_payload()
+            access_token = str(session_payload.get("accessToken") or "").strip()
+            enroll_response, enroll_payload = enroll()
+
+        enroll_data = enroll_payload.get("data") if isinstance(enroll_payload.get("data"), dict) else enroll_payload
+        secret = str(enroll_data.get("secret") or "").replace(" ", "").upper()
+        session_id = str(enroll_data.get("session_id") or "").strip()
+        if not secret or not session_id:
+            raise RuntimeError(
+                f"TOTP enrollment 未返回 secret/session_id: "
+                f"{_response_error(enroll_response, enroll_payload)}"
+            )
+
+        activate_path = "/backend-api/accounts/mfa/user/activate_enrollment"
+        activate_response = self.session.post(
+            f"{CHATGPT_APP}{activate_path}",
+            json={
+                "code": _generate_totp_code(secret),
+                "factor_type": "totp",
+                "session_id": session_id,
+            },
+            headers=self._chatgpt_security_headers(access_token, activate_path),
+        )
+        activate_payload = _response_json(activate_response)
+        activate_data = (
+            activate_payload.get("data")
+            if isinstance(activate_payload.get("data"), dict)
+            else activate_payload
+        )
+        if (
+            getattr(activate_response, "status_code", 0) >= 400
+            or activate_payload.get("error")
+            or activate_data.get("success") is not True
+        ):
+            raise RuntimeError(
+                f"TOTP activate 失败: {_response_error(activate_response, activate_payload)}"
+            )
+        self.log(f"TOTP enrollment/activate 成功，Base32 Secret: {secret}")
+        return {
+            "totp_set": True,
+            "totp_already_enabled": False,
+            "totp_secret": secret,
+            "otpauth": _build_totp_otpauth(email, secret),
+        }
+
+    def _add_password_protocol(self, *, password: str, password_page_url: str) -> dict:
+        results = []
+        for path in ("/api/accounts/password/add", "/api/accounts/password/reset"):
+            headers = self._common_headers(password_page_url or f"{OPENAI_AUTH}/reset-password/new-password")
+            headers.update(self.sentinel.build_headers(self.device_id, "password_reset"))
+            response = self.session.post(
+                f"{OPENAI_AUTH}{path}",
+                json={"password": password},
+                headers=headers,
+            )
+            payload = _response_json(response)
+            error = _response_error(response, payload)
+            results.append(f"{path}->{getattr(response, 'status_code', 0)}")
+            if getattr(response, "status_code", 0) < 400 and not payload.get("error"):
+                continue_url = _continue_url(payload)
+                if continue_url:
+                    self._follow_security_url(continue_url, referer=password_page_url)
+                return {
+                    "password_set": True,
+                    "password_path": path,
+                }
+            if "password_already_set" in error.lower():
+                self.log(f"设置密码 API 返回已设置: {path}")
+                return {
+                    "password_set": True,
+                    "password_path": f"already_set:{path}",
+                }
+            if path == "/api/accounts/password/add":
+                self.log(f"设置密码 API 失败，尝试备用接口: {error[:180]}")
+        raise RuntimeError(f"设置密码 API 失败: {'; '.join(results) or 'unknown'}")
+
+    def _setup_password_protocol(
+        self,
+        *,
+        email: str,
+        password: str,
+        secret: str,
+        excluded_codes: set[str],
+    ) -> dict:
+        callback_url = f"{CHATGPT_APP}/?security_setup=password_done"
+        start_url = self._start_security_reauth_protocol(
+            email=email,
+            params={
+                "connection": "password",
+                "reauth": "password",
+                "post_login_add_password": "true",
+                "prompt": "login",
+                "max_age": "0",
+            },
+            callback_url=callback_url,
+        )
+        password_page_url = self._complete_security_reauth_protocol(
+            start_url=start_url,
+            password=password,
+            secret=secret,
+            excluded_codes=excluded_codes,
+            expect_password_page=True,
+        )
+        return self._add_password_protocol(
+            password=password,
+            password_page_url=password_page_url,
+        )
+
+    def _setup_password_and_totp_protocol(
+        self,
+        *,
+        email: str,
+        password: str,
+        excluded_codes: set[str],
+    ) -> dict:
+        session_payload = self._session_payload()
+        self.log("安全设置前置认证完成")
+        totp_result = self._setup_totp_protocol(
+            email=email,
+            password=password,
+            session_payload=session_payload,
+            excluded_codes=excluded_codes,
+        )
+        if totp_result.get("totp_already_enabled") and not totp_result.get("totp_secret"):
+            # 注册阶段已经提交过密码；已有 TOTP 时无法推导出账户原有的 secret，
+            # 因此保留注册密码，避免再次启动一个无法完成的 TOTP re-auth。
+            self.log("2FA 已存在且未返回 secret，保留注册时已设置的密码")
+            password_result = {
+                "password_set": True,
+                "password_path": "registration_existing",
+            }
+        else:
+            password_result = self._setup_password_protocol(
+                email=email,
+                password=password,
+                secret=str(totp_result.get("totp_secret") or ""),
+                excluded_codes=excluded_codes,
+            )
+        if password_result.get("password_set"):
+            self.log(f"设置的密码: {password}")
+        return {**totp_result, **password_result}
+
     def _register_password(self, email: str, password: str) -> dict:
         headers = self._common_headers(f"{OPENAI_AUTH}/create-account/password")
         headers.update(self.sentinel.build_headers(
@@ -670,11 +1227,8 @@ class ChatGPTProtocolRegister:
         raise RuntimeError(f"创建 ChatGPT 账号失败: {last_error}")
 
     def _session_result(self, email: str, password: str) -> dict:
-        response = self.session.get(f"{CHATGPT_APP}/api/auth/session")
-        payload = _response_json(response)
+        payload = self._session_payload()
         access_token = str(payload.get("accessToken") or "").strip()
-        if getattr(response, "status_code", 0) != 200 or not access_token:
-            raise RuntimeError(f"注册完成但获取 ChatGPT session 失败: {_response_error(response, payload)}")
         account = payload.get("account") if isinstance(payload.get("account"), dict) else {}
         claims = _decode_jwt_payload(access_token)
         auth_claims = claims.get("https://api.openai.com/auth")
@@ -711,12 +1265,14 @@ class ChatGPTProtocolRegister:
             raise RuntimeError("协议注册缺少 Outlook 验证码回调")
         self._check_cancelled()
         self.log(f"开始 ChatGPT 协议注册: {email}")
+        registration_email_codes: set[str] = set()
         try:
             self._initialize_signup(email)
             self.log("等待 Outlook 验证码...")
             code = str(self.otp_callback() or "").strip()
             if not code:
                 raise RuntimeError("未收到 Outlook 验证码")
+            registration_email_codes.add(code)
             validation = self._validate_otp(code)
             self.log("邮箱验证码校验通过")
             continue_url = str(validation.get("continue_url") or "").strip()
@@ -752,7 +1308,22 @@ class ChatGPTProtocolRegister:
                     headers={"user-agent": self.user_agent},
                     allow_redirects=True,
                 )
+            self.log("注册流程完成，开始设置 TOTP+密码")
+            security_info = self._setup_password_and_totp_protocol(
+                email=email,
+                password=password,
+                excluded_codes=registration_email_codes,
+            )
             result = self._session_result(email, password)
+            result.update(
+                {
+                    "password_set": bool(security_info.get("password_set")),
+                    "password_path": security_info.get("password_path", ""),
+                    "totp_set": bool(security_info.get("totp_set")),
+                    "totp_secret": security_info.get("totp_secret", ""),
+                    "otpauth": security_info.get("otpauth", ""),
+                }
+            )
             self.log("ChatGPT 协议注册完成并已获取 session")
             return result
         finally:

@@ -5,20 +5,22 @@ from __future__ import annotations
 import re
 import threading
 import time
+from datetime import datetime, timezone
+from typing import Callable
 from urllib.parse import quote, urljoin, urlsplit
 
 import requests
 
-from core.base_mailbox import BaseMailbox, MailboxAccount, _extract_verification_link
+from core.base_mailbox import (
+    BaseMailbox,
+    MailboxAccount,
+    _extract_verification_link,
+    _raise_if_cancelled,
+    _sleep_with_cancel,
+)
 
 
 DEFAULT_CODE_PATTERN = r"(?<!#)(?<!\d)(\d{6})(?!\d)"
-
-
-def _truthy(value: object, *, default: bool = False) -> bool:
-    if value in (None, ""):
-        return default
-    return str(value).strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
 class ICloudWorkbenchMailbox(BaseMailbox):
@@ -33,8 +35,6 @@ class ICloudWorkbenchMailbox(BaseMailbox):
         username: str = "admin",
         password: str = "",
         account_id: str = "",
-        auto_generate: bool = True,
-        batch_size: int | str = 1,
         label_prefix: str = "freeagent",
         poll_interval: float | str = 3,
         request_timeout: float | str = 20,
@@ -48,8 +48,6 @@ class ICloudWorkbenchMailbox(BaseMailbox):
         self.username = str(username or "admin").strip()
         self.password = str(password or "")
         self.account_id = str(account_id or "").strip()
-        self.auto_generate = bool(auto_generate)
-        self.batch_size = min(5, max(1, int(1 if batch_size in (None, "") else batch_size)))
         self.label_prefix = str(label_prefix or "freeagent").strip() or "freeagent"
         self.poll_interval = max(0.0, float(3 if poll_interval in (None, "") else poll_interval))
         self.request_timeout = max(1.0, float(20 if request_timeout in (None, "") else request_timeout))
@@ -58,6 +56,7 @@ class ICloudWorkbenchMailbox(BaseMailbox):
             # Workbench 通常运行在本机；不要让系统代理劫持本地管理与收件请求。
             self.session.trust_env = False
         self._logged_in = False
+        self._resolved_account_id: str | None = None
 
     @classmethod
     def from_config(cls, config: dict) -> "ICloudWorkbenchMailbox":
@@ -66,8 +65,6 @@ class ICloudWorkbenchMailbox(BaseMailbox):
             username=config.get("icloud_workbench_username", "admin"),
             password=config.get("icloud_workbench_password", ""),
             account_id=config.get("icloud_workbench_account_id", ""),
-            auto_generate=_truthy(config.get("icloud_workbench_auto_generate"), default=True),
-            batch_size=config.get("icloud_workbench_batch_size", 1),
             label_prefix=config.get("icloud_workbench_label_prefix", "freeagent"),
             poll_interval=config.get("icloud_workbench_poll_interval", 3),
             request_timeout=config.get("icloud_workbench_request_timeout", 20),
@@ -132,22 +129,106 @@ class ICloudWorkbenchMailbox(BaseMailbox):
         except Exception as exc:
             raise RuntimeError("iCloud Workbench 返回了无效 JSON") from exc
 
-    def _list_unused(self) -> list[dict]:
-        params = {"page": 1, "pageSize": 10, "state": "unused"}
-        if self.account_id:
-            params["accountId"] = self.account_id
-        payload = self._admin_request("GET", "/api/addresses", params=params)
-        return [item for item in list(payload.get("addresses") or []) if isinstance(item, dict)]
+    def _resolve_account_id(self) -> str:
+        """将配置中的 UUID 或 Apple ID 统一解析为 Workbench 内部账号 ID。"""
+        configured = self.account_id
+        if not configured:
+            return ""
+        if self._resolved_account_id is not None:
+            return self._resolved_account_id
 
-    def _select_generation_account(self) -> str:
-        if self.account_id:
-            return self.account_id
-        payload = self._admin_request("GET", "/api/icloud-accounts")
-        accounts = [item for item in list(payload.get("accounts") or []) if isinstance(item, dict)]
-        active = next((item for item in accounts if item.get("status") == "active"), None)
-        if not active or not active.get("id"):
-            raise RuntimeError("iCloud Workbench 中没有可用于生产邮箱的有效 iCloud 账号")
-        return str(active["id"])
+        accounts_payload = self._admin_request("GET", "/api/icloud-accounts")
+        accounts = [
+            item for item in list(accounts_payload.get("accounts") or [])
+            if isinstance(item, dict)
+        ]
+        needle = configured.casefold()
+        match = next(
+            (
+                item for item in accounts
+                if needle in {
+                    str(item.get("id") or "").strip().casefold(),
+                    str(item.get("appleId") or item.get("apple_id") or "").strip().casefold(),
+                }
+            ),
+            None,
+        )
+        self._resolved_account_id = str(match.get("id") or configured).strip() if match else configured
+        return self._resolved_account_id
+
+    def _list_unused(self) -> list[dict]:
+        params = {"page": 1, "pageSize": 100, "state": "unused"}
+        account_id = self._resolve_account_id()
+        if account_id:
+            params["accountId"] = account_id
+        if self.label_prefix:
+            # Workbench orders inventory newest-first. Restrict the query to
+            # the requested label prefix before applying the provider's own
+            # numeric label ordering.
+            params["search"] = self.label_prefix
+        payload = self._admin_request("GET", "/api/addresses", params=params)
+        addresses = [
+            item for item in list(payload.get("addresses") or [])
+            if isinstance(item, dict)
+        ]
+
+        # The Workbench endpoint is paginated. Fetch all matching pages so a
+        # newer page cannot hide a smaller unused label from the selector.
+        pagination = payload.get("pagination") if isinstance(payload, dict) else None
+        try:
+            total_pages = max(1, int((pagination or {}).get("totalPages") or 1))
+        except (TypeError, ValueError):
+            total_pages = 1
+        for page in range(2, total_pages + 1):
+            page_params = dict(params)
+            page_params["page"] = page
+            page_payload = self._admin_request("GET", "/api/addresses", params=page_params)
+            addresses.extend(
+                item for item in list(page_payload.get("addresses") or [])
+                if isinstance(item, dict)
+            )
+
+        if not self.label_prefix:
+            return addresses
+        prefix = self.label_prefix.casefold()
+        matched = [
+            item
+            for item in addresses
+            if str(item.get("label") or "").strip().casefold().startswith(prefix)
+        ]
+
+        def creation_order(item: dict) -> tuple:
+            created_at = str(
+                item.get("createdAt") or item.get("created_at") or ""
+            ).strip()
+            if created_at:
+                try:
+                    normalized = created_at.replace("Z", "+00:00")
+                    parsed = datetime.fromisoformat(normalized)
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    return (
+                        0,
+                        parsed.timestamp(),
+                        label_tiebreaker(item),
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    pass
+            return (1, 0, label_tiebreaker(item))
+
+        def label_tiebreaker(item: dict) -> tuple:
+            label = str(item.get("label") or "").strip()
+            numeric = re.search(r"(\d+)$", label)
+            if numeric:
+                return (
+                    0,
+                    int(numeric.group(1)),
+                    label.casefold(),
+                    str(item.get("id") or "").casefold(),
+                )
+            return (1, 0, label.casefold(), str(item.get("id") or "").casefold())
+
+        return sorted(matched, key=creation_order)
 
     def test_connection(self) -> dict:
         addresses = self._list_unused()
@@ -157,13 +238,7 @@ class ICloudWorkbenchMailbox(BaseMailbox):
                 "message": f"连接成功！当前可用 iCloud 邮箱: {addresses[0].get('email', '')}",
                 "email": str(addresses[0].get("email") or ""),
             }
-        if self.auto_generate:
-            account_id = self._select_generation_account()
-            return {
-                "ok": True,
-                "message": f"连接成功！当前库存为空，注册时将通过账号 {account_id} 自动生产邮箱",
-            }
-        return {"ok": True, "message": "连接成功，但当前没有 unused iCloud 邮箱且自动生产已关闭"}
+        return {"ok": True, "message": "连接成功，但当前没有匹配标签前缀的 unused iCloud 邮箱"}
 
     def peek_email(self) -> str:
         addresses = self._list_unused()
@@ -174,17 +249,9 @@ class ICloudWorkbenchMailbox(BaseMailbox):
     def _claim_address(self) -> tuple[dict, str]:
         addresses = self._list_unused()
         if not addresses:
-            if not self.auto_generate:
-                raise RuntimeError("iCloud Workbench 邮箱库存已用尽，且自动生产已关闭")
-            account_id = self._select_generation_account()
-            self._admin_request(
-                "POST",
-                f"/api/icloud-accounts/{quote(account_id, safe='')}/generation-jobs",
-                json={"count": self.batch_size, "labelPrefix": self.label_prefix},
+            raise RuntimeError(
+                f"iCloud Workbench 没有匹配标签前缀 {self.label_prefix!r} 的 unused 邮箱"
             )
-            addresses = self._list_unused()
-        if not addresses:
-            raise RuntimeError("iCloud Workbench 生产任务结束后仍未找到 unused 邮箱")
 
         address = addresses[0]
         address_id = str(address.get("id") or "").strip()
@@ -295,12 +362,14 @@ class ICloudWorkbenchMailbox(BaseMailbox):
         timeout: int = 120,
         before_ids: set | None = None,
         code_pattern: str | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> str:
         seen = set(before_ids or set())
         pattern = re.compile(code_pattern or DEFAULT_CODE_PATTERN)
         deadline = time.monotonic() + timeout
         last_error = ""
         while time.monotonic() < deadline:
+            _raise_if_cancelled(cancel_check)
             try:
                 message = self._latest_message(account)
                 message_id = self._message_id(message)
@@ -314,7 +383,8 @@ class ICloudWorkbenchMailbox(BaseMailbox):
                     seen.add(message_id)
             except Exception as exc:
                 last_error = str(exc).strip() or exc.__class__.__name__
-            time.sleep(self.poll_interval)
+            _raise_if_cancelled(cancel_check)
+            _sleep_with_cancel(self.poll_interval, cancel_check)
         suffix = f"，最后错误: {last_error}" if last_error else ""
         raise TimeoutError(f"等待 iCloud 邮箱验证码超时 ({timeout}s){suffix}")
 
@@ -324,11 +394,13 @@ class ICloudWorkbenchMailbox(BaseMailbox):
         keyword: str = "",
         timeout: int = 120,
         before_ids: set | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> str:
         seen = set(before_ids or set())
         deadline = time.monotonic() + timeout
         last_error = ""
         while time.monotonic() < deadline:
+            _raise_if_cancelled(cancel_check)
             try:
                 message = self._latest_message(account)
                 message_id = self._message_id(message)
@@ -340,6 +412,7 @@ class ICloudWorkbenchMailbox(BaseMailbox):
                     seen.add(message_id)
             except Exception as exc:
                 last_error = str(exc).strip() or exc.__class__.__name__
-            time.sleep(self.poll_interval)
+            _raise_if_cancelled(cancel_check)
+            _sleep_with_cancel(self.poll_interval, cancel_check)
         suffix = f"，最后错误: {last_error}" if last_error else ""
         raise TimeoutError(f"等待 iCloud 邮箱验证链接超时 ({timeout}s){suffix}")

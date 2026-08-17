@@ -18,6 +18,7 @@ import re
 import ssl
 import threading
 import time
+from typing import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.header import decode_header
@@ -26,7 +27,13 @@ from pathlib import Path
 
 import requests
 
-from core.base_mailbox import BaseMailbox, MailboxAccount, _extract_verification_link
+from core.base_mailbox import (
+    BaseMailbox,
+    MailboxAccount,
+    _extract_verification_link,
+    _raise_if_cancelled,
+    _sleep_with_cancel,
+)
 
 
 GRAPH_TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
@@ -627,12 +634,15 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         timeout: int = 120,
         before_ids: set = None,
         code_pattern: str = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> str:
         seen = set(before_ids or [])
         pattern = re.compile(code_pattern or r"(?<!#)(?<!\d)(\d{6})(?!\d)")
         start = time.time()
         while time.time() - start < timeout:
+            _raise_if_cancelled(cancel_check)
             for mail in self._messages(account):
+                _raise_if_cancelled(cancel_check)
                 if not self._message_is_for_account(mail, account):
                     continue
                 mid = self._message_id(mail)
@@ -646,7 +656,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 match = pattern.search(text)
                 if match:
                     return match.group(1) if match.groups() else match.group(0)
-            time.sleep(5)
+            _sleep_with_cancel(5, cancel_check)
         raise TimeoutError(f"等待验证码超时 ({timeout}s)")
 
     def wait_for_link(
@@ -655,11 +665,14 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         keyword: str = "",
         timeout: int = 120,
         before_ids: set = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> str:
         seen = set(before_ids or [])
         start = time.time()
         while time.time() - start < timeout:
+            _raise_if_cancelled(cancel_check)
             for mail in self._messages(account):
+                _raise_if_cancelled(cancel_check)
                 if not self._message_is_for_account(mail, account):
                     continue
                 mid = self._message_id(mail)
@@ -670,5 +683,5 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 link = _extract_verification_link(self._message_text(mail), keyword)
                 if link:
                     return link
-            time.sleep(5)
+            _sleep_with_cancel(5, cancel_check)
         raise TimeoutError(f"等待验证链接超时 ({timeout}s)")

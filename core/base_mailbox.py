@@ -6,8 +6,26 @@ from dataclasses import dataclass
 import html
 import logging
 import re
+import time
+from typing import Callable
 
 logger = logging.getLogger(__name__)
+
+
+def _raise_if_cancelled(cancel_check: Callable[[], bool] | None) -> None:
+    if callable(cancel_check) and cancel_check():
+        raise RuntimeError("任务已取消")
+
+
+def _sleep_with_cancel(seconds: float, cancel_check: Callable[[], bool] | None) -> None:
+    """Sleep in short slices so a task cancellation is observed promptly."""
+    deadline = time.monotonic() + max(float(seconds or 0), 0.0)
+    while True:
+        _raise_if_cancelled(cancel_check)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.25, remaining))
 
 
 @dataclass
@@ -30,6 +48,7 @@ class BaseMailbox(ABC):
         timeout: int = 120,
         before_ids: set | None = None,
         code_pattern: str | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> str:
         """等待并返回验证码。"""
 
@@ -43,6 +62,7 @@ class BaseMailbox(ABC):
         keyword: str = "",
         timeout: int = 120,
         before_ids: set | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> str:
         raise NotImplementedError(f"{self.__class__.__name__} 暂不支持 wait_for_link()")
 
@@ -87,6 +107,7 @@ class FallbackMailbox(BaseMailbox):
         timeout: int = 120,
         before_ids: set | None = None,
         code_pattern: str | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> str:
         return self._resolve(account).wait_for_code(
             account,
@@ -94,6 +115,7 @@ class FallbackMailbox(BaseMailbox):
             timeout=timeout,
             before_ids=before_ids,
             code_pattern=code_pattern,
+            cancel_check=cancel_check,
         )
 
     def wait_for_link(
@@ -102,12 +124,14 @@ class FallbackMailbox(BaseMailbox):
         keyword: str = "",
         timeout: int = 120,
         before_ids: set | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> str:
         return self._resolve(account).wait_for_link(
             account,
             keyword=keyword,
             timeout=timeout,
             before_ids=before_ids,
+            cancel_check=cancel_check,
         )
 
 
@@ -160,9 +184,6 @@ def _create_icloud_workbench(extra: dict, proxy: str | None) -> BaseMailbox:
         username=extra.get("icloud_workbench_username", "admin"),
         password=extra.get("icloud_workbench_password", ""),
         account_id=extra.get("icloud_workbench_account_id", ""),
-        auto_generate=str(extra.get("icloud_workbench_auto_generate", "true")).strip().lower()
-        in {"1", "true", "yes", "on"},
-        batch_size=extra.get("icloud_workbench_batch_size", 1),
         label_prefix=extra.get("icloud_workbench_label_prefix", "freeagent"),
         poll_interval=extra.get("icloud_workbench_poll_interval", 3),
         request_timeout=extra.get("icloud_workbench_request_timeout", 20),

@@ -51,7 +51,9 @@ def create_mailbox(responses, **overrides):
 def test_connection_reports_inventory_without_consuming_address():
     mailbox = create_mailbox([
         FakeResponse(200, {"username": "admin"}),
-        FakeResponse(200, {"addresses": [{"id": "address-1", "email": "one@icloud.com"}]}),
+        FakeResponse(200, {"addresses": [{
+            "id": "address-1", "email": "one@icloud.com", "label": "freeagent-1",
+        }]}),
     ])
 
     result = mailbox.test_connection()
@@ -85,24 +87,62 @@ def test_get_email_claims_unused_address_and_persists_public_api_url():
     assert mailbox.session.calls[-1][2]["headers"]["Origin"] == "http://127.0.0.1:4173"
 
 
-def test_get_email_generates_when_inventory_is_empty():
+def test_get_email_does_not_start_generation_when_inventory_is_empty():
     mailbox = create_mailbox([
         FakeResponse(200, {"username": "admin"}),
         FakeResponse(200, {"addresses": []}),
-        FakeResponse(200, {"accounts": [{"id": "icloud-1", "status": "active"}]}),
-        FakeResponse(201, {"jobId": "job-1", "generated": [{"email": "new@icloud.com"}]}),
-        FakeResponse(200, {"addresses": [{
-            "id": "address-2", "accountId": "icloud-1", "email": "new@icloud.com", "label": "freeagent-1",
+    ])
+
+    try:
+        mailbox.get_email()
+    except RuntimeError as exc:
+        assert "没有匹配标签前缀" in str(exc)
+    else:
+        raise AssertionError("iCloud Provider 不应在库存为空时启动生产")
+
+    assert not any(call[1].endswith("/generation-jobs") for call in mailbox.session.calls)
+
+
+def test_account_email_is_resolved_to_workbench_internal_id_before_inventory_filter():
+    mailbox = create_mailbox([
+        FakeResponse(200, {"username": "admin"}),
+        FakeResponse(200, {"accounts": [{
+            "id": "icloud-1", "appleId": "owner@example.com", "status": "active",
         }]}),
-        FakeResponse(201, {"apiUrl": "http://127.0.0.1:4173/openapi/mail/new%40icloud.com/token/latest"}),
-        FakeResponse(200, {"ok": True}),
-    ], batch_size=2)
+        FakeResponse(200, {"addresses": [{
+            "id": "address-1", "email": "one@icloud.com", "label": "freeagent-1",
+        }]}),
+    ], account_id="owner@example.com")
 
-    account = mailbox.get_email()
+    result = mailbox.test_connection()
 
-    generation_call = next(call for call in mailbox.session.calls if call[1].endswith("/generation-jobs"))
-    assert generation_call[2]["json"] == {"count": 2, "labelPrefix": "freeagent"}
-    assert account.email == "new@icloud.com"
+    assert result["ok"] is True
+    assert mailbox.session.calls[-1][2]["params"]["accountId"] == "icloud-1"
+
+
+def test_inventory_is_filtered_and_sorted_by_creation_time():
+    mailbox = create_mailbox([
+        FakeResponse(200, {"username": "admin"}),
+        FakeResponse(200, {"addresses": [
+            {
+                "id": "newest",
+                "email": "newest@icloud.com",
+                "label": "eronicaawayn-101",
+                "createdAt": "2026-08-17T12:00:00.000Z",
+            },
+            {
+                "id": "oldest",
+                "email": "oldest@icloud.com",
+                "label": "eronicaawayn-102",
+                "createdAt": "2026-08-17T10:00:00.000Z",
+            },
+        ]}),
+    ], label_prefix="eronicaawayn-1")
+
+    result = mailbox.test_connection()
+
+    assert result["email"] == "oldest@icloud.com"
+    assert mailbox.session.calls[-1][2]["params"]["search"] == "eronicaawayn-1"
 
 
 def test_wait_for_code_ignores_baseline_message_and_returns_new_message_code():
@@ -125,6 +165,25 @@ def test_wait_for_code_ignores_baseline_message_and_returns_new_message_code():
 
     assert before_ids == {"old"}
     assert code == "654321"
+
+
+def test_wait_for_code_stops_immediately_when_task_is_cancelled():
+    mailbox = create_mailbox([])
+    account = type("Account", (), {
+        "email": "one@icloud.com",
+        "extra": {"provider_account": {"credentials": {
+            "api_url": "http://127.0.0.1:4173/openapi/mail/one%40icloud.com/token/latest",
+        }}},
+    })()
+
+    try:
+        mailbox.wait_for_code(account, timeout=120, cancel_check=lambda: True)
+    except RuntimeError as exc:
+        assert str(exc) == "任务已取消"
+    else:
+        raise AssertionError("验证码等待应在取消后立即结束")
+
+    assert mailbox.session.calls == []
 
 
 def test_wait_for_link_extracts_link_from_new_message_html():

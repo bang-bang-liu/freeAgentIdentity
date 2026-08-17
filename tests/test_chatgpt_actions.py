@@ -15,7 +15,11 @@ def test_chatgpt_actions_use_capability_ids():
     assert query_action["params"] == [{
         "key": "proxy",
         "label": "查询代理",
-        "type": "text",
+        "type": "proxy",
+        "options": [
+            "http://127.0.0.1:7897",
+            "http://127.0.0.1:7890",
+        ],
         "placeholder": "http://user:pass@host:port",
         "required": True,
     }]

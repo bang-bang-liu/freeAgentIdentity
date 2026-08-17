@@ -238,7 +238,11 @@ class ChatGPTPlatform(BasePlatform):
                 {
                     "key": "proxy",
                     "label": "查询代理",
-                    "type": "text",
+                    "type": "proxy",
+                    "options": [
+                        "http://127.0.0.1:7897",
+                        "http://127.0.0.1:7890",
+                    ],
                     "placeholder": "http://user:pass@host:port",
                     "required": True,
                 },

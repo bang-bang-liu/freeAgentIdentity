@@ -1374,6 +1374,7 @@ def _browser_fetch(page, url: str, *, method: str = "GET", headers: dict | None 
               headers: headers || {},
               body: body === null ? undefined : body,
               redirect,
+              credentials: 'include',
               signal: controller.signal,
             });
             const respHeaders = {};
@@ -1622,6 +1623,10 @@ def _build_browser_sentinel_headers(page, flow: str, log) -> dict:
         sdk_result = page.evaluate(
             """
             async ({ flow, sdkUrls }) => {
+              const withTimeout = (value, timeoutMs, fallback) => Promise.race([
+                Promise.resolve(value),
+                new Promise((resolve) => setTimeout(() => resolve(fallback), timeoutMs)),
+              ]);
               const waitForSdk = () => {
                 const current = window.SentinelSDK;
                 return current && typeof current.token === 'function' ? current : null;
@@ -1630,13 +1635,14 @@ def _build_browser_sentinel_headers(page, flow: str, log) -> dict:
               if (!sdk) {
                 for (const src of sdkUrls) {
                   try {
-                    await new Promise((resolve, reject) => {
+                    const loaded = await withTimeout(new Promise((resolve, reject) => {
                       const script = document.createElement('script');
                       script.src = src;
                       script.onload = resolve;
                       script.onerror = reject;
                       (document.head || document.documentElement).appendChild(script);
-                    });
+                    }), 4000, false);
+                    if (!loaded) continue;
                     sdk = waitForSdk();
                     if (sdk) break;
                   } catch (_) {}
@@ -1644,13 +1650,13 @@ def _build_browser_sentinel_headers(page, flow: str, log) -> dict:
               }
               if (!sdk) return { token: '', so: '' };
               if (typeof sdk.init === 'function') {
-                try { await sdk.init(flow); } catch (_) {}
+                try { await withTimeout(sdk.init(flow), 3000, null); } catch (_) {}
               }
               let token = '';
-              try { token = await sdk.token(flow); } catch (_) {}
+              try { token = await withTimeout(sdk.token(flow), 5000, ''); } catch (_) {}
               let so = '';
               if (typeof sdk.sessionObserverToken === 'function') {
-                try { so = await sdk.sessionObserverToken(flow); } catch (_) {}
+                try { so = await withTimeout(sdk.sessionObserverToken(flow), 3000, ''); } catch (_) {}
               }
               return {
                 token: typeof token === 'string' ? token : JSON.stringify(token || ''),
@@ -1767,6 +1773,74 @@ def _start_chatgpt_security_reauth(page, email: str, params: dict, callback_url:
     log("安全设置 re-auth 已启动")
     _goto_with_retry(page, auth_url, wait_until="domcontentloaded", timeout=30000, log=log)
     return auth_url
+
+
+def _security_auth_referer(page, fallback: str) -> str:
+    current_url = str(getattr(page, "url", "") or "").strip()
+    return current_url if current_url.startswith(("http://", "https://")) else fallback
+
+
+def _resend_security_email_otp(page, log) -> dict:
+    """Request a new re-auth email OTP through the auth API."""
+    referer = _security_auth_referer(page, f"{OPENAI_AUTH}/email-verification")
+    result = _browser_fetch(
+        page,
+        f"{OPENAI_AUTH}/api/accounts/email-otp/resend",
+        method="POST",
+        headers={
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json",
+            "origin": OPENAI_AUTH,
+            "referer": referer,
+            "x-access-flow-invocation-id": str(uuid.uuid4()),
+            "sec-fetch-site": "same-origin",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-dest": "empty",
+            "priority": "u=1, i",
+        },
+        body="{}",
+        redirect="manual",
+        timeout_ms=30000,
+    )
+    if int(result.get("status") or 0) == 429:
+        raise RuntimeError("安全设置 re-auth 邮箱验证码重发过于频繁，请稍后再试")
+    if not bool(result.get("ok")):
+        raise RuntimeError(f"安全设置 re-auth 邮箱验证码重发失败: {_security_result_error(result)}")
+    log("安全设置 re-auth 已通过 API 请求重发邮箱验证码")
+    return result
+
+
+def _validate_security_email_otp(page, code: str, log) -> dict:
+    """Validate a re-auth email OTP using the dedicated auth endpoint."""
+    referer = _security_auth_referer(page, f"{OPENAI_AUTH}/email-verification")
+    headers = _build_browser_sentinel_headers(page, "email_otp_validate", log)
+    headers.update(
+        {
+            "origin": OPENAI_AUTH,
+            "referer": referer,
+            "sec-fetch-site": "same-origin",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-dest": "empty",
+            "priority": "u=1, i",
+        }
+    )
+    return _browser_fetch(
+        page,
+        f"{OPENAI_AUTH}/api/accounts/email-otp/validate",
+        method="POST",
+        headers=headers,
+        body=json.dumps({"code": str(code or "").strip()}, separators=(",", ":")),
+        redirect="manual",
+        timeout_ms=30000,
+    )
+
+
+def _security_continue_url(data: Any) -> str:
+    if not isinstance(data, dict):
+        return ""
+    page_data = data.get("page")
+    payload = page_data.get("payload") if isinstance(page_data, dict) else None
+    return str(data.get("continue_url") or (payload or {}).get("url") or "").strip() if isinstance(payload, dict) else str(data.get("continue_url") or "").strip()
 
 
 def _click_totp_method(page, log) -> bool:
@@ -1934,19 +2008,51 @@ def _fill_security_password_form(page, password: str) -> bool:
         return False
 
 
+def _get_security_email_code(
+    otp_callback: Callable[[], str] | None,
+    *,
+    excluded_codes: set[str],
+    deadline: float,
+    log,
+) -> str:
+    """Return a re-auth email code that was not consumed by registration."""
+    if not callable(otp_callback):
+        return ""
+    while time.time() < deadline:
+        remaining = max(1, int(deadline - time.time()))
+        if getattr(otp_callback, "supports_timeout_override", False):
+            code = otp_callback(timeout_override=remaining)
+        else:
+            code = otp_callback()
+        code = str(code or "").strip()
+        if not code:
+            return ""
+        if code not in excluded_codes:
+            return code
+        log(f"忽略注册阶段已使用的邮箱验证码: {code}，继续等待 re-auth 新验证码")
+        time.sleep(0.5)
+    return ""
+
+
 def _complete_security_reauth(
     page,
     *,
     password: str,
     secret: str,
     otp_callback: Callable[[], str] | None,
+    excluded_email_codes: set[str] | None = None,
     log,
     expect_password_page: bool,
     timeout: int = 120,
 ) -> bool:
     deadline = time.time() + timeout
+    excluded_codes = {
+        str(code or "").strip()
+        for code in (excluded_email_codes or set())
+        if str(code or "").strip()
+    }
     password_submitted = False
-    email_submitted = False
+    email_resend_requested = False
     while time.time() < deadline:
         if _security_is_mfa_selection_page(page):
             if not _click_totp_method(page, log):
@@ -1962,13 +2068,34 @@ def _complete_security_reauth(
         if _security_is_email_otp_page(page):
             if not callable(otp_callback):
                 raise RuntimeError("安全设置 re-auth 需要邮箱验证码，但未提供 otp_callback")
-            if email_submitted:
-                time.sleep(0.5)
+            if not email_resend_requested:
+                _resend_security_email_otp(page, log)
+                email_resend_requested = True
+            code = _get_security_email_code(
+                otp_callback,
+                excluded_codes=excluded_codes,
+                deadline=deadline,
+                log=log,
+            )
+            if not code:
+                raise RuntimeError("安全设置 re-auth 未获取到新的邮箱验证码")
+            validation = _validate_security_email_otp(page, code, log)
+            if not validation.get("ok"):
+                excluded_codes.add(code)
+                log(f"安全设置 re-auth 邮箱验证码校验失败: {_security_result_error(validation)}，准备重新请求新验证码")
+                email_resend_requested = False
                 continue
-            code = str(otp_callback() or "").strip()
-            if not code or not _submit_security_code(page, code, log):
-                raise RuntimeError("安全设置 re-auth 邮箱验证码验证失败")
-            email_submitted = True
+            continue_url = _security_continue_url(validation.get("data"))
+            if not continue_url:
+                raise RuntimeError("安全设置 re-auth 邮箱验证码验证成功但未返回密码页面 URL")
+            _goto_with_retry(
+                page,
+                _normalize_url(continue_url, OPENAI_AUTH),
+                wait_until="domcontentloaded",
+                timeout=30000,
+                log=log,
+            )
+            log("安全设置 re-auth 邮箱验证码验证通过，已进入密码页面")
             continue
         if _security_is_password_page(page):
             return True
@@ -2017,6 +2144,7 @@ def _submit_security_password_dom(
     password: str,
     secret: str,
     otp_callback: Callable[[], str] | None,
+    excluded_email_codes: set[str] | None = None,
     log,
     timeout: int = 90,
 ) -> bool:
@@ -2043,6 +2171,12 @@ def _submit_security_password_dom(
         return False
     log("设置密码页面已提交")
     deadline = time.time() + timeout
+    excluded_codes = {
+        str(code or "").strip()
+        for code in (excluded_email_codes or set())
+        if str(code or "").strip()
+    }
+    email_resend_requested = False
     while time.time() < deadline:
         if _security_is_mfa_selection_page(page):
             if not _click_totp_method(page, log):
@@ -2057,9 +2191,33 @@ def _submit_security_password_dom(
         if _security_is_email_otp_page(page):
             if not callable(otp_callback):
                 return False
-            code = str(otp_callback() or "").strip()
-            if not code or not _submit_security_code(page, code, log):
+            if not email_resend_requested:
+                _resend_security_email_otp(page, log)
+                email_resend_requested = True
+            code = _get_security_email_code(
+                otp_callback,
+                excluded_codes=excluded_codes,
+                deadline=deadline,
+                log=log,
+            )
+            if not code:
                 return False
+            validation = _validate_security_email_otp(page, code, log)
+            if not validation.get("ok"):
+                excluded_codes.add(code)
+                log(f"设置密码后邮箱验证码校验失败: {_security_result_error(validation)}，准备重新请求新验证码")
+                email_resend_requested = False
+                continue
+            continue_url = _security_continue_url(validation.get("data"))
+            if not continue_url:
+                return False
+            _goto_with_retry(
+                page,
+                _normalize_url(continue_url, OPENAI_AUTH),
+                wait_until="domcontentloaded",
+                timeout=30000,
+                log=log,
+            )
             continue
         text = _security_page_text(page)
         if any(
@@ -2087,7 +2245,18 @@ def _submit_security_password_api(page, password: str, mode: str, log) -> dict:
     )
     results = []
     for path in endpoints:
+        log(f"设置密码 API 开始: {path}")
         headers = _build_browser_sentinel_headers(page, "password_reset", log)
+        headers.update(
+            {
+                "origin": OPENAI_AUTH,
+                "referer": _security_auth_referer(page, f"{OPENAI_AUTH}/reset-password/new-password"),
+                "sec-fetch-site": "same-origin",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-dest": "empty",
+            }
+        )
+        log(f"设置密码 API 发送: {path}")
         response = _browser_fetch(
             page,
             f"{OPENAI_AUTH}{path}",
@@ -2125,6 +2294,7 @@ def _setup_chatgpt_totp(
     email: str,
     password: str,
     otp_callback: Callable[[], str] | None,
+    excluded_email_codes: set[str] | None = None,
     log,
     session_data: dict,
 ) -> dict:
@@ -2158,6 +2328,7 @@ def _setup_chatgpt_totp(
             password=password,
             secret="",
             otp_callback=otp_callback,
+            excluded_email_codes=excluded_email_codes,
             log=log,
             expect_password_page=False,
         )
@@ -2189,7 +2360,7 @@ def _setup_chatgpt_totp(
     activate_data = activate.get("data") if isinstance(activate, dict) else None
     if not bool(activate.get("ok")) or not isinstance(activate_data, dict) or activate_data.get("success") is not True:
         raise RuntimeError(f"TOTP activate 失败: {_security_result_error(activate)}")
-    log("TOTP enrollment/activate 成功")
+    log(f"TOTP enrollment/activate 成功，Base32 Secret: {secret}")
     return {
         "totp_set": True,
         "totp_already_enabled": False,
@@ -2199,48 +2370,20 @@ def _setup_chatgpt_totp(
     }
 
 
-def _setup_chatgpt_password(
+def _finish_security_password_api(
     page,
     *,
-    email: str,
-    password: str,
-    secret: str,
-    otp_callback: Callable[[], str] | None,
+    api_result: dict,
+    callback_url: str,
     log,
 ) -> dict:
-    callback_url = f"{CHATGPT_APP}/?security_setup=password_done"
-    _start_chatgpt_security_reauth(
-        page,
-        email,
-        {"post_login_add_password": "true", "prompt": "login", "max_age": "0"},
-        callback_url,
-        log,
-    )
-    _complete_security_reauth(
-        page,
-        password=password,
-        secret=secret,
-        otp_callback=otp_callback,
-        log=log,
-        expect_password_page=True,
-    )
-    mode = "reset" if "reset-password" in str(getattr(page, "url", "") or "").lower() else "add"
-    if _submit_security_password_dom(
-        page,
-        password=password,
-        secret=secret,
-        otp_callback=otp_callback,
-        log=log,
-    ):
-        return {"password_set": True, "password_path": "dom"}
-
-    api_result = _submit_security_password_api(page, password, mode, log)
     if not api_result.get("ok"):
         summary = "; ".join(
             f"{item.get('path', '?')}->{item.get('status', '?')}"
             for item in api_result.get("results") or []
         )
         raise RuntimeError(f"设置密码 API 失败: {summary or 'unknown'}")
+
     continue_url = str(api_result.get("continue_url") or "").strip()
     if continue_url:
         _goto_with_retry(
@@ -2264,12 +2407,77 @@ def _setup_chatgpt_password(
     }
 
 
+def _setup_chatgpt_password(
+    page,
+    *,
+    email: str,
+    password: str,
+    secret: str,
+    otp_callback: Callable[[], str] | None,
+    excluded_email_codes: set[str] | None = None,
+    log,
+) -> dict:
+    callback_url = f"{CHATGPT_APP}/?security_setup=password_done"
+    log("设置密码前启动安全设置 re-auth")
+    _start_chatgpt_security_reauth(
+        page,
+        email,
+        {
+            "connection": "password",
+            "reauth": "password",
+            "post_login_add_password": "true",
+            "prompt": "login",
+            "max_age": "0",
+        },
+        callback_url,
+        log,
+    )
+    _complete_security_reauth(
+        page,
+        password=password,
+        secret=secret,
+        otp_callback=otp_callback,
+        excluded_email_codes=excluded_email_codes,
+        log=log,
+        expect_password_page=True,
+    )
+
+    mode = "reset" if "reset-password" in str(getattr(page, "url", "") or "").lower() else "add"
+    if _submit_security_password_dom(
+        page,
+        password=password,
+        secret=secret,
+        otp_callback=otp_callback,
+        excluded_email_codes=excluded_email_codes,
+        log=log,
+    ):
+        if "auth.openai.com" in str(getattr(page, "url", "") or "").lower():
+            _goto_with_retry(
+                page,
+                callback_url,
+                wait_until="domcontentloaded",
+                timeout=30000,
+                log=log,
+            )
+        return {"password_set": True, "password_path": "dom"}
+
+    log("设置密码页面提交未完成，改用 Sentinel API")
+    api_result = _submit_security_password_api(page, password, mode, log)
+    return _finish_security_password_api(
+        page,
+        api_result=api_result,
+        callback_url=callback_url,
+        log=log,
+    )
+
+
 def _setup_chatgpt_password_and_totp(
     page,
     *,
     email: str,
     password: str,
     otp_callback: Callable[[], str] | None,
+    excluded_email_codes: set[str] | None = None,
     log,
 ) -> dict:
     """Run the user-script security flow before the final session request."""
@@ -2280,6 +2488,7 @@ def _setup_chatgpt_password_and_totp(
         email=session_email,
         password=password,
         otp_callback=otp_callback,
+        excluded_email_codes=excluded_email_codes,
         log=log,
         session_data=session_data,
     )
@@ -2295,8 +2504,11 @@ def _setup_chatgpt_password_and_totp(
             password=password,
             secret=str(totp_result.get("totp_secret") or ""),
             otp_callback=otp_callback,
+            excluded_email_codes=excluded_email_codes,
             log=log,
         )
+    if password_result.get("password_set"):
+        log(f"设置的密码: {password}")
     return {**totp_result, **password_result}
 
 
@@ -3529,14 +3741,29 @@ class ChatGPTBrowserRegister:
         with self._open_browser(launch_opts) as browser:
             page = browser.new_page()
             self.log("启动浏览器上下文注册状态机")
+            registration_email_codes: set[str] = set()
+
+            registration_otp_callback = self.otp_callback
+            if callable(registration_otp_callback):
+                def capture_registration_otp(*args, **kwargs):
+                    code = registration_otp_callback(*args, **kwargs)
+                    normalized = str(code or "").strip()
+                    if normalized:
+                        registration_email_codes.add(normalized)
+                    return code
+            else:
+                capture_registration_otp = None
+
             final_state = _browser_registration_flow(
                 page,
                 email,
                 password,
-                self.otp_callback,
+                capture_registration_otp,
                 self.log,
             )
             self.log(f"注册流程完成: page={final_state.get('page_type') or '-'}")
+            if registration_email_codes:
+                self.log("已记录注册阶段邮箱验证码，re-auth 将强制等待新的邮箱验证码")
 
             # 原步骤 7、8 完成后，先执行用户脚本中的 TOTP -> 密码安全设置。
             self.log("步骤 9: 设置密码+2FA")
@@ -3545,6 +3772,7 @@ class ChatGPTBrowserRegister:
                 email=email,
                 password=password,
                 otp_callback=self.otp_callback,
+                excluded_email_codes=registration_email_codes,
                 log=self.log,
             )
             self.log(

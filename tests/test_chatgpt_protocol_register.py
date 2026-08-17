@@ -22,11 +22,12 @@ class _FakeCookies:
 
 
 class _FakeResponse:
-    def __init__(self, status_code=200, payload=None, *, headers=None, text=""):
+    def __init__(self, status_code=200, payload=None, *, headers=None, text="", url=""):
         self.status_code = status_code
         self._payload = payload if payload is not None else {}
         self.headers = headers or {}
         self.text = text
+        self.url = url
 
     def json(self):
         return self._payload
@@ -38,6 +39,9 @@ class _FakeSession:
         self.calls = []
         self.create_headers = {}
         self.password_body = {}
+        self.password_add_body = {}
+        self.mfa_enroll_body = {}
+        self.mfa_activate_body = {}
         self.closed = False
 
     def get(self, url, **kwargs):
@@ -46,6 +50,12 @@ class _FakeSession:
             return _FakeResponse(payload={"csrfToken": "csrf-token"})
         if url == "https://auth.openai.com/authorize-start":
             return _FakeResponse(headers={"location": "/email-verification"})
+        if url == "https://auth.openai.com/security-authorize-start":
+            return _FakeResponse(url="https://auth.openai.com/email-verification?reauth=password")
+        if url == f"{CHATGPT_APP}/backend-api/accounts/mfa_info":
+            return _FakeResponse(payload={"mfa_enabled_v2": False})
+        if url == "https://auth.openai.com/reset-password/new-password":
+            return _FakeResponse(url=url)
         if url == f"{CHATGPT_APP}/api/auth/session":
             return _FakeResponse(
                 payload={
@@ -60,10 +70,17 @@ class _FakeSession:
     def post(self, url, **kwargs):
         self.calls.append(("POST", url, kwargs))
         if url.startswith(f"{CHATGPT_APP}/api/auth/signin/openai?"):
+            if "post_login_add_password=true" in url:
+                return _FakeResponse(payload={"url": "https://auth.openai.com/security-authorize-start"})
             return _FakeResponse(payload={"url": "https://auth.openai.com/authorize-start"})
         if url == OPENAI_API_ENDPOINTS["validate_otp"]:
-            assert kwargs["json"] == {"code": "123456"}
-            return _FakeResponse(payload={"continue_url": "/create-account/password"})
+            code = kwargs["json"]["code"]
+            if code == "123456":
+                return _FakeResponse(payload={"continue_url": "/create-account/password"})
+            assert code == "654321"
+            return _FakeResponse(payload={"continue_url": "/reset-password/new-password"})
+        if url == "https://auth.openai.com/api/accounts/email-otp/resend":
+            return _FakeResponse(payload={})
         if url == SENTINEL_REQ_URL:
             request_payload = json.loads(kwargs["data"])
             return _FakeResponse(
@@ -83,6 +100,15 @@ class _FakeSession:
         if url == OPENAI_API_ENDPOINTS["register"]:
             self.password_body = kwargs["json"]
             return _FakeResponse(payload={"continue_url": "/about-you"})
+        if url == f"{CHATGPT_APP}/backend-api/accounts/mfa/enroll":
+            self.mfa_enroll_body = kwargs["json"]
+            return _FakeResponse(payload={"secret": "JBSWY3DPEHPK3PXP", "session_id": "mfa-session"})
+        if url == f"{CHATGPT_APP}/backend-api/accounts/mfa/user/activate_enrollment":
+            self.mfa_activate_body = kwargs["json"]
+            return _FakeResponse(payload={"success": True})
+        if url == "https://auth.openai.com/api/accounts/password/add":
+            self.password_add_body = kwargs["json"]
+            return _FakeResponse(payload={"continue_url": f"{CHATGPT_APP}/?security_setup=password_done"})
         raise AssertionError(f"unexpected POST {url}")
 
     def close(self):
@@ -92,9 +118,16 @@ class _FakeSession:
 def test_protocol_register_completes_email_flow_without_browser():
     session = _FakeSession()
     logs = []
+
+    codes = iter(["123456", "654321"])
+
+    def otp_callback(**_kwargs):
+        return next(codes)
+
+    otp_callback.supports_timeout_override = True
     worker = ChatGPTProtocolRegister(
         session=session,
-        otp_callback=lambda: "123456",
+        otp_callback=otp_callback,
         log_fn=logs.append,
         sentinel_runtime=False,
     )
@@ -106,15 +139,25 @@ def test_protocol_register_completes_email_flow_without_browser():
     assert result["access_token"] == "header.payload.signature"
     assert result["session_token"] == "session-token"
     assert result["account_id"] == "account-123"
+    assert result["totp_set"] is True
+    assert result["totp_secret"] == "JBSWY3DPEHPK3PXP"
+    assert result["password_set"] is True
+    assert result["password_path"] == "/api/accounts/password/add"
     assert session.password_body == {
         "username": "user@outlook.com",
         "password": "StrongPass123!",
     }
+    assert session.password_add_body == {"password": "StrongPass123!"}
+    assert session.mfa_enroll_body == {"factor_type": "totp"}
+    assert session.mfa_activate_body["factor_type"] == "totp"
+    assert len(session.mfa_activate_body["code"]) == 6
     assert session.closed is True
     sentinel = json.loads(session.create_headers["openai-sentinel-token"])
     assert sentinel["flow"] == "oauth_create_account"
     assert sentinel["c"] == "challenge-token"
     assert any("协议注册完成" in line for line in logs)
+    assert any("TOTP enrollment/activate 成功，Base32 Secret: JBSWY3DPEHPK3PXP" in line for line in logs)
+    assert any("设置的密码: StrongPass123!" in line for line in logs)
 
 
 def test_protocol_registration_accepts_current_chatgpt_otp_subjects():

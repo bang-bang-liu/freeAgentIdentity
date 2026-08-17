@@ -12,6 +12,7 @@ import json
 import re
 import threading
 import time
+from typing import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,7 +20,13 @@ from urllib.parse import urlparse
 
 import requests
 
-from core.base_mailbox import BaseMailbox, MailboxAccount, _extract_verification_link
+from core.base_mailbox import (
+    BaseMailbox,
+    MailboxAccount,
+    _extract_verification_link,
+    _raise_if_cancelled,
+    _sleep_with_cancel,
+)
 
 
 DEFAULT_STATE_FILE = Path(__file__).resolve().parent.parent / "data" / ".api_mailbox_pool_state.json"
@@ -311,6 +318,7 @@ class ApiMailboxPool(BaseMailbox):
         timeout: int = 120,
         before_ids: set | None = None,
         code_pattern: str | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> str:
         del keyword  # This API exposes the requested mailbox's code directly.
         entry = self._entry_for_account(account)
@@ -318,6 +326,7 @@ class ApiMailboxPool(BaseMailbox):
         deadline = time.monotonic() + timeout
         last_error = ""
         while time.monotonic() < deadline:
+            _raise_if_cancelled(cancel_check)
             try:
                 payload, raw = self._request(entry)
                 code = self._extract_code(payload, raw, code_pattern=code_pattern)
@@ -328,7 +337,8 @@ class ApiMailboxPool(BaseMailbox):
                 seen.update(signatures)
             except Exception as exc:
                 last_error = str(exc).strip() or exc.__class__.__name__
-            time.sleep(self.poll_interval)
+            _raise_if_cancelled(cancel_check)
+            _sleep_with_cancel(self.poll_interval, cancel_check)
         suffix = f"，最后错误: {last_error}" if last_error else ""
         raise TimeoutError(f"等待 API 邮箱验证码超时 ({timeout}s){suffix}")
 
@@ -338,12 +348,14 @@ class ApiMailboxPool(BaseMailbox):
         keyword: str = "",
         timeout: int = 120,
         before_ids: set | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> str:
         entry = self._entry_for_account(account)
         seen = set(before_ids or set())
         deadline = time.monotonic() + timeout
         last_error = ""
         while time.monotonic() < deadline:
+            _raise_if_cancelled(cancel_check)
             try:
                 payload, raw = self._request(entry)
                 link = _extract_verification_link(raw, keyword)
@@ -353,6 +365,7 @@ class ApiMailboxPool(BaseMailbox):
                 seen.update(self._signatures(payload, raw))
             except Exception as exc:
                 last_error = str(exc).strip() or exc.__class__.__name__
-            time.sleep(self.poll_interval)
+            _raise_if_cancelled(cancel_check)
+            _sleep_with_cancel(self.poll_interval, cancel_check)
         suffix = f"，最后错误: {last_error}" if last_error else ""
         raise TimeoutError(f"等待 API 邮箱验证链接超时 ({timeout}s){suffix}")

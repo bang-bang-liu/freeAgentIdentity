@@ -55,18 +55,31 @@ def build_otp_callback(
     if not mailbox or not mail_acct:
         return None
 
-    def otp_cb():
+    def otp_cb(*, timeout_override: int | None = None):
         ctx.log(wait_message)
-        kwargs = {"keyword": keyword, "before_ids": getattr(ctx.identity, "before_ids", set())}
-        if timeout is not None:
-            kwargs["timeout"] = timeout
+        kwargs = {
+            "keyword": keyword,
+            "before_ids": getattr(ctx.identity, "before_ids", set()),
+            "cancel_check": getattr(ctx.platform, "is_cancel_requested", None),
+        }
+        effective_timeout = timeout if timeout_override is None else max(int(timeout_override), 1)
+        if effective_timeout is not None:
+            kwargs["timeout"] = effective_timeout
         if code_pattern:
             kwargs["code_pattern"] = code_pattern
         code = mailbox.wait_for_code(mail_acct, **kwargs)
         if code:
+            # A later security re-auth must wait for a genuinely new email.
+            # Advance the identity baseline after this code has been consumed
+            # so the same message cannot be returned a second time.
+            try:
+                ctx.identity.before_ids = mailbox.get_current_ids(mail_acct)
+            except Exception:
+                pass
             ctx.log(f"{success_label}: {code}")
         return code
 
+    otp_cb.supports_timeout_override = True
     return otp_cb
 
 
@@ -87,7 +100,11 @@ def build_link_callback(
     def link_cb():
         ctx.log(wait_message)
         before_ids = mailbox.get_current_ids(mail_acct)
-        kwargs = {"keyword": keyword, "before_ids": before_ids}
+        kwargs = {
+            "keyword": keyword,
+            "before_ids": before_ids,
+            "cancel_check": getattr(ctx.platform, "is_cancel_requested", None),
+        }
         if timeout is not None:
             kwargs["timeout"] = timeout
         link = mailbox.wait_for_link(mail_acct, **kwargs)
