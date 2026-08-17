@@ -16,8 +16,6 @@ from datetime import datetime, timezone, timedelta
 import cbor2
 from curl_cffi import requests as cffi_requests
 
-from core.desktop_apps import build_desktop_app_state
-
 logger = logging.getLogger(__name__)
 
 OIDC_ENDPOINT = "https://oidc.us-east-1.amazonaws.com"
@@ -34,32 +32,6 @@ def _calculate_client_id_hash(start_url: str) -> str:
 def _get_cache_dir() -> str:
     home = os.environ.get("USERPROFILE") or os.environ.get("HOME", "")
     return os.path.join(home, ".aws", "sso", "cache")
-
-
-def _kiro_install_paths() -> list[str]:
-    system = platform.system()
-    if system == "Windows":
-        localappdata = os.environ.get("LOCALAPPDATA", "")
-        return [os.path.join(localappdata, "Programs", "Kiro", "Kiro.exe")]
-    if system == "Darwin":
-        home = os.path.expanduser("~")
-        return [
-            "/Applications/Kiro.app",
-            os.path.join(home, "Applications", "Kiro.app"),
-        ]
-    return ["/usr/bin/kiro", os.path.expanduser("~/.local/bin/kiro")]
-
-
-def _kiro_process_patterns() -> list[str]:
-    system = platform.system()
-    if system == "Darwin":
-        return [
-            "/Applications/Kiro.app/Contents/MacOS/Kiro",
-            os.path.join(os.path.expanduser("~"), "Applications", "Kiro.app", "Contents", "MacOS", "Kiro"),
-        ]
-    if system == "Windows":
-        return ["Kiro.exe"]
-    return ["kiro"]
 
 
 def _atomic_write(filepath: str, content: str):
@@ -451,22 +423,3 @@ def read_current_kiro_account() -> dict | None:
             return json.load(f)
     except Exception:
         return None
-
-
-def get_kiro_desktop_state() -> dict:
-    token_path = os.path.join(_get_cache_dir(), "kiro-auth-token.json")
-    current = read_current_kiro_account() or {}
-    state = build_desktop_app_state(
-        app_id="kiro",
-        app_name="Kiro",
-        process_patterns=_kiro_process_patterns(),
-        install_paths=_kiro_install_paths(),
-        binary_names=["kiro"],
-        config_paths=[_get_cache_dir(), token_path],
-        current_account_present=bool(current.get("accessToken") or current.get("refreshToken")),
-        extra={
-            "token_path": token_path,
-        },
-    )
-    state["available"] = True
-    return state

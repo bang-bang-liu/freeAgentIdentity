@@ -153,11 +153,6 @@ class KiroPlatform(BasePlatform):
             {"id": "get_account_state", "label": "查询账号状态/额度提示", "params": []},
         ]
 
-    def get_desktop_state(self) -> dict:
-        from platforms.kiro.switch import get_kiro_desktop_state
-
-        return get_kiro_desktop_state()
-
     def execute_action(self, action_id: str, account: Account, params: dict) -> dict:
         extra = account.extra or {}
 
@@ -169,7 +164,6 @@ class KiroPlatform(BasePlatform):
                 restart_kiro_ide,
                 summarize_kiro_usage,
                 switch_kiro_account,
-                get_kiro_desktop_state,
             )
 
             access_token = extra.get("accessToken", "") or account.token
@@ -236,7 +230,6 @@ class KiroPlatform(BasePlatform):
                     "accessTokenPreview": _mask_secret(current.get("accessToken", "")),
                     "matches_target": _kiro_local_matches_target(current, access_token, refresh_token),
                 },
-                "desktop_app_state": get_kiro_desktop_state(),
                 "restart": {"ok": restart_ok, "message": restart_msg},
                 "quota_note": "Kiro 可通过 Web Portal 查询订阅、试用与 credits 用量，但依赖 sessionToken 浏览器会话；若缺少会话则只能返回 token 刷新校验结果。",
             }}
@@ -265,10 +258,8 @@ class KiroPlatform(BasePlatform):
         elif action_id == "get_account_state":
             from platforms.kiro.switch import (
                 get_kiro_portal_state,
-                read_current_kiro_account,
                 refresh_kiro_token,
                 summarize_kiro_usage,
-                get_kiro_desktop_state,
             )
 
             refresh_token = extra.get("refreshToken", "")
@@ -276,7 +267,6 @@ class KiroPlatform(BasePlatform):
             client_secret = extra.get("clientSecret", "")
             session_token = extra.get("sessionToken", "")
             profile_arn = extra.get("profileArn", "")
-            current = read_current_kiro_account() or {}
             refresh_state = {"ok": False, "message": "当前账号未提供 refreshToken/clientId/clientSecret，无法执行远端刷新校验"}
             access_token = extra.get("accessToken", "") or account.token
             if refresh_token and client_id and client_secret:
@@ -305,13 +295,6 @@ class KiroPlatform(BasePlatform):
                         "available": portal_state.get("available", False),
                         "error": portal_state.get("error", ""),
                     },
-                    "local_app_account": {
-                        "provider": current.get("provider", ""),
-                        "authMethod": current.get("authMethod", ""),
-                        "accessTokenPreview": _mask_secret(current.get("accessToken", "")),
-                        "matches_target": _kiro_local_matches_target(current, access_token, refresh_token),
-                    },
-                    "desktop_app_state": get_kiro_desktop_state(),
                     "quota_note": "Kiro 可通过 Web Portal 查询订阅、试用与 credits 用量，但依赖 sessionToken 浏览器会话；若缺少会话则只能返回 token 刷新校验结果。",
                 },
             }

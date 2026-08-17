@@ -73,8 +73,6 @@ def test_chatgpt_query_state_uses_project_proxy_before_direct(monkeypatch):
         return {"valid": kwargs["proxy"] == "http://127.0.0.1:7890"}
 
     monkeypatch.setattr(switch, "fetch_chatgpt_account_state", fake_state)
-    monkeypatch.setattr(switch, "read_current_codex_account", lambda: {})
-    monkeypatch.setattr(switch, "get_codex_desktop_state", lambda: {})
     monkeypatch.setattr(proxy_pool, "get_next", lambda region="": "http://127.0.0.1:7890")
     monkeypatch.setattr(proxy_pool, "report_success", lambda url: proxy_events.append(("success", url)))
     monkeypatch.setattr(proxy_pool, "report_fail", lambda url: proxy_events.append(("fail", url)))
@@ -85,6 +83,8 @@ def test_chatgpt_query_state_uses_project_proxy_before_direct(monkeypatch):
     assert proxy_events == [("success", "http://127.0.0.1:7890")]
     assert result["data"]["network_path"] == "project_proxy"
     assert result["data"]["check_state"] == "valid"
+    assert "local_app_account" not in result["data"]
+    assert "desktop_app_state" not in result["data"]
 
 
 def test_chatgpt_query_state_uses_manual_proxy_without_fallback(monkeypatch):
@@ -101,8 +101,6 @@ def test_chatgpt_query_state_uses_manual_proxy_without_fallback(monkeypatch):
         return {"valid": True}
 
     monkeypatch.setattr(switch, "fetch_chatgpt_account_state", fake_state)
-    monkeypatch.setattr(switch, "read_current_codex_account", lambda: {})
-    monkeypatch.setattr(switch, "get_codex_desktop_state", lambda: {})
     monkeypatch.setattr(proxy_pool, "get_next", lambda region="": (_ for _ in ()).throw(AssertionError("pool should not be used")))
     monkeypatch.setattr(proxy_pool, "report_success", lambda url: proxy_events.append(("success", url)))
     monkeypatch.setattr(proxy_pool, "report_fail", lambda url: proxy_events.append(("fail", url)))
@@ -127,8 +125,6 @@ def test_chatgpt_query_state_network_failure_is_not_invalid(monkeypatch):
         "fetch_chatgpt_account_state",
         lambda **kwargs: {"valid": False, "profile_error": {"error": "timeout"}},
     )
-    monkeypatch.setattr(switch, "read_current_codex_account", lambda: {})
-    monkeypatch.setattr(switch, "get_codex_desktop_state", lambda: {})
     monkeypatch.setattr(proxy_pool, "get_next", lambda region="": None)
 
     result = platform.execute_action("query_state", account, {})
@@ -153,8 +149,6 @@ def test_chatgpt_query_state_rejected_token_is_not_an_account_invalid(monkeypatc
             "profile_error": {"status_code": 401, "body": "token rejected"},
         },
     )
-    monkeypatch.setattr(switch, "read_current_codex_account", lambda: {})
-    monkeypatch.setattr(switch, "get_codex_desktop_state", lambda: {})
     monkeypatch.setattr(proxy_pool, "get_next", lambda region="": None)
 
     result = platform.execute_action("query_state", account, {})
@@ -178,8 +172,6 @@ def test_chatgpt_query_state_forbidden_is_retryable_not_a_credential_failure(mon
             "profile_error": {"status_code": 403, "body": "access denied"},
         },
     )
-    monkeypatch.setattr(switch, "read_current_codex_account", lambda: {})
-    monkeypatch.setattr(switch, "get_codex_desktop_state", lambda: {})
     monkeypatch.setattr(proxy_pool, "get_next", lambda region="": None)
 
     result = platform.execute_action("query_state", account, {})

@@ -279,9 +279,6 @@ def _normalize_overview_summary(
     display_status = _derive_display_status(lifecycle_status, validity_status, plan_state)
 
     payload["chips"] = _dedupe_chips(payload.get("chips") or [])
-    if bool(payload.get("local_matches_target")) and "当前" not in payload["chips"]:
-        payload["chips"].append("当前")
-
     payload.update(
         {
             "lifecycle_status": lifecycle_status,

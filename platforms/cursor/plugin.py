@@ -133,11 +133,6 @@ class CursorPlatform(BasePlatform):
             {"id": "generate_trial_link", "label": "生成 7 天 Pro 链接", "params": []},
         ]
 
-    def get_desktop_state(self) -> dict:
-        from platforms.cursor.switch import get_cursor_desktop_state
-
-        return get_cursor_desktop_state()
-
     def execute_action(self, action_id: str, account: Account, params: dict) -> dict:
         """执行平台操作"""
         if action_id == "switch_account":
@@ -150,7 +145,6 @@ class CursorPlatform(BasePlatform):
                 restart_cursor_ide,
                 summarize_cursor_usage,
                 switch_cursor_account,
-                get_cursor_desktop_state,
             )
             
             token = account.token
@@ -182,7 +176,6 @@ class CursorPlatform(BasePlatform):
                         "token_preview": _mask_secret(current.get("token", "")),
                         "matches_target": current.get("token") == token if current.get("token") else False,
                     },
-                    "desktop_app_state": get_cursor_desktop_state(),
                     "restart": {"ok": restart_ok, "message": restart_msg},
                     "quota_note": "Cursor 可查询 usage，但部分账号只返回已用量；maxRequestUsage/maxTokenUsage 可能为空，无法保证总能计算剩余额度。",
                 }
@@ -194,9 +187,7 @@ class CursorPlatform(BasePlatform):
                 get_cursor_usage,
                 get_cursor_user_info,
                 has_cursor_valid_payment_method,
-                read_current_cursor_account,
                 summarize_cursor_usage,
-                get_cursor_desktop_state,
             )
             
             token = account.token
@@ -209,7 +200,6 @@ class CursorPlatform(BasePlatform):
                 has_payment_method = has_cursor_valid_payment_method(token)
                 usage_info = get_cursor_usage(token, user_info.get("sub", "")) or {}
                 usage_summary = summarize_cursor_usage(usage_info)
-                current = read_current_cursor_account() or {}
                 return {
                     "ok": True,
                     "data": {
@@ -222,11 +212,6 @@ class CursorPlatform(BasePlatform):
                         "membership_type": billing_info.get("membershipType") or billing_info.get("individualMembershipType", ""),
                         "usage_info": usage_info,
                         "usage_summary": usage_summary,
-                        "local_app_account": {
-                            "token_preview": _mask_secret(current.get("token", "")),
-                            "matches_target": current.get("token") == token if current.get("token") else False,
-                        },
-                        "desktop_app_state": get_cursor_desktop_state(),
                         "quota_note": "Cursor 可查询 usage，但部分账号只返回已用量；maxRequestUsage/maxTokenUsage 可能为空，无法保证总能计算剩余额度。",
                     },
                 }

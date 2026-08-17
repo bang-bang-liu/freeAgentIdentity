@@ -197,12 +197,6 @@ class BasePlatform(ABC):
         # Fallback to empty list for platforms that haven't migrated yet
         return []
 
-    def get_desktop_state(self) -> dict:
-        return {
-            "available": False,
-            "message": f"{self.display_name or self.name} 暂未提供桌面应用状态探测",
-        }
-
     def execute_action(self, action_id: str, account: Account, params: dict) -> dict:
         """
         Execute platform-specific action, return {"ok": bool, "data": any, "error": str}

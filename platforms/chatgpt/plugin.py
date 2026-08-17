@@ -267,11 +267,6 @@ class ChatGPTPlatform(BasePlatform):
         }
         return super().execute_action(aliases.get(action_id, action_id), account, params)
 
-    def get_desktop_state(self) -> dict:
-        from platforms.chatgpt.switch import get_codex_desktop_state
-
-        return get_codex_desktop_state()
-
     def _execute_platform_action(self, action_id: str, account: Account, params: dict) -> dict:
         """Handle ChatGPT-specific actions."""
         proxy = self.config.proxy if self.config else None
@@ -295,7 +290,6 @@ class ChatGPTPlatform(BasePlatform):
                 close_codex_app,
                 extract_session_token,
                 fetch_chatgpt_account_state,
-                get_codex_desktop_state,
                 read_current_codex_account,
                 restart_codex_app,
                 switch_codex_account,
@@ -328,7 +322,6 @@ class ChatGPTPlatform(BasePlatform):
                 "close": {"ok": close_ok, "message": close_msg},
                 "restart": {"ok": restart_ok, "message": restart_msg},
                 "local_app_account": local_state,
-                "desktop_app_state": get_codex_desktop_state(),
                 "remote_state": remote_state,
                 "switch_details": switch_data,
             }
@@ -365,7 +358,7 @@ class ChatGPTPlatform(BasePlatform):
         a.cookies = extra.get("cookies", "")
 
         from core.proxy_pool import proxy_pool
-        from platforms.chatgpt.switch import fetch_chatgpt_account_state, get_codex_desktop_state, read_current_codex_account
+        from platforms.chatgpt.switch import fetch_chatgpt_account_state
 
         # The proxy entered in the action dialog applies only to this query.
         # Keep the configured/project-pool behavior as a fallback when the
@@ -421,8 +414,6 @@ class ChatGPTPlatform(BasePlatform):
         else:
             data["check_state"] = "valid"
 
-        data["local_app_account"] = read_current_codex_account()
-        data["desktop_app_state"] = get_codex_desktop_state()
         return {"ok": True, "data": data}
 
     @staticmethod

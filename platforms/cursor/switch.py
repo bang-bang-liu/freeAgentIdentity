@@ -12,8 +12,6 @@ import subprocess
 import time
 from typing import Tuple
 
-from core.desktop_apps import build_desktop_app_state
-
 logger = logging.getLogger(__name__)
 
 
@@ -48,32 +46,6 @@ def _get_cursor_storage_path() -> str:
     """获取 Cursor storage.json 路径"""
     config_dir = _get_cursor_config_dir()
     return os.path.join(config_dir, "globalStorage", "storage.json")
-
-
-def _cursor_install_paths() -> list[str]:
-    system = platform.system()
-    if system == "Darwin":
-        home = os.path.expanduser("~")
-        return [
-            "/Applications/Cursor.app",
-            os.path.join(home, "Applications", "Cursor.app"),
-        ]
-    if system == "Windows":
-        localappdata = os.environ.get("LOCALAPPDATA", "")
-        return [os.path.join(localappdata, "Programs", "Cursor", "Cursor.exe")]
-    return ["/usr/bin/cursor", os.path.expanduser("~/.local/bin/cursor")]
-
-
-def _cursor_process_patterns() -> list[str]:
-    system = platform.system()
-    if system == "Darwin":
-        return [
-            "/Applications/Cursor.app/Contents/MacOS/Cursor",
-            os.path.join(os.path.expanduser("~"), "Applications", "Cursor.app", "Contents", "MacOS", "Cursor"),
-        ]
-    if system == "Windows":
-        return ["Cursor.exe"]
-    return ["cursor"]
 
 
 def _atomic_write(filepath: str, content: str):
@@ -212,26 +184,6 @@ def read_current_cursor_account() -> dict | None:
     except Exception as e:
         logger.error(f"读取 Cursor 配置失败: {e}")
         return None
-
-
-def get_cursor_desktop_state() -> dict:
-    current = read_current_cursor_account() or {}
-    storage_path = _get_cursor_storage_path()
-    config_dir = _get_cursor_config_dir()
-    state = build_desktop_app_state(
-        app_id="cursor",
-        app_name="Cursor",
-        process_patterns=_cursor_process_patterns(),
-        install_paths=_cursor_install_paths(),
-        binary_names=["cursor"],
-        config_paths=[config_dir, storage_path],
-        current_account_present=bool(current.get("token")),
-        extra={
-            "storage_path": storage_path,
-        },
-    )
-    state["available"] = True
-    return state
 
 
 def get_cursor_user_info(token: str) -> dict | None:

@@ -18,8 +18,6 @@ from typing import Optional
 
 from curl_cffi import requests as curl_requests
 
-from core.desktop_apps import build_desktop_app_state
-
 logger = logging.getLogger(__name__)
 
 
@@ -107,36 +105,6 @@ def _get_codex_support_dir() -> str:
 
 def _get_codex_cookies_path() -> str:
     return os.path.join(_get_codex_support_dir(), "Cookies")
-
-
-def _codex_install_paths() -> list[str]:
-    system = platform.system()
-    home = os.path.expanduser("~")
-    if system == "Darwin":
-        return [
-            "/Applications/Codex.app",
-            os.path.join(home, "Applications", "Codex.app"),
-        ]
-    if system == "Windows":
-        localappdata = os.environ.get("LOCALAPPDATA", "")
-        return [
-            os.path.join(localappdata, "Programs", "Codex", "Codex.exe"),
-            os.path.join(localappdata, "Codex", "Codex.exe"),
-        ]
-    return ["/usr/bin/codex", os.path.join(home, ".local", "bin", "codex")]
-
-
-def _codex_process_patterns() -> list[str]:
-    system = platform.system()
-    home = os.path.expanduser("~")
-    if system == "Darwin":
-        return [
-            "/Applications/Codex.app/Contents/MacOS/Codex",
-            os.path.join(home, "Applications", "Codex.app", "Contents", "MacOS", "Codex"),
-        ]
-    if system == "Windows":
-        return ["Codex.exe"]
-    return ["codex"]
 
 
 def close_codex_app() -> tuple[bool, str]:
@@ -303,25 +271,6 @@ def read_current_codex_account() -> dict:
         "session_token_preview": _mask_secret(session_token),
         "cookies": cookies_found,
     }
-
-
-def get_codex_desktop_state() -> dict:
-    cookies_path = _get_codex_cookies_path()
-    current = read_current_codex_account()
-    state = build_desktop_app_state(
-        app_id="codex",
-        app_name="Codex",
-        process_patterns=_codex_process_patterns(),
-        install_paths=_codex_install_paths(),
-        binary_names=["codex"],
-        config_paths=[_get_codex_support_dir(), cookies_path],
-        current_account_present=bool((current or {}).get("session_token_present")),
-        extra={
-            "cookies_path": cookies_path,
-        },
-    )
-    state["available"] = True
-    return state
 
 
 def _fetch_profile(

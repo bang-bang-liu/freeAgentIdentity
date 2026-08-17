@@ -231,6 +231,34 @@ function getPrimaryToken(acc: any) {
   return credential?.value || ''
 }
 
+function getAccessToken(acc: any) {
+  return String(
+    getPlatformCredentialValue(acc, 'access_token')
+      || getPlatformCredentialValue(acc, 'accessToken')
+      || acc?.primary_token
+      || '',
+  )
+}
+
+async function copyToClipboard(text: string) {
+  const value = String(text || '')
+  if (!value) throw new Error('没有可复制的内容')
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value)
+    return
+  }
+  const element = document.createElement('textarea')
+  element.value = value
+  element.setAttribute('readonly', '')
+  element.style.position = 'fixed'
+  element.style.opacity = '0'
+  document.body.appendChild(element)
+  element.select()
+  const copied = document.execCommand('copy')
+  document.body.removeChild(element)
+  if (!copied) throw new Error('剪贴板不可用')
+}
+
 function escapeCsvField(value: unknown) {
   const text = value == null ? '' : String(value)
   if (!/[",\n\r]/.test(text)) return text
@@ -871,9 +899,6 @@ function ActionResultHighlights({ payload }: { payload: any }) {
   if (payload.remaining_credits) stats.push({ label: '剩余额度', value: payload.remaining_credits })
   if (payload.usage_total) stats.push({ label: '已用额度', value: payload.usage_total })
   if (payload.plan_credits) stats.push({ label: '总额度', value: payload.plan_credits })
-  if (payload.desktop_app_state?.app_name) stats.push({ label: '桌面应用', value: payload.desktop_app_state.app_name })
-  if ('running' in (payload.desktop_app_state || {})) stats.push({ label: '桌面已打开', value: payload.desktop_app_state.running })
-  if ('ready' in (payload.desktop_app_state || {})) stats.push({ label: '桌面就绪', value: payload.desktop_app_state.ready })
 
   if (stats.length === 0) return null
   return (
@@ -1286,6 +1311,20 @@ function ActionMenu({
     }
   }
 
+  const copyAccessToken = async () => {
+    const accessToken = getAccessToken(acc)
+    if (!accessToken) {
+      setToast({ type: 'error', text: '该账号没有 access_token' })
+      return
+    }
+    try {
+      await copyToClipboard(accessToken)
+      setToast({ type: 'success', text: 'access_token 已复制' })
+    } catch (error: any) {
+      setToast({ type: 'error', text: error?.message || '复制 access_token 失败' })
+    }
+  }
+
   return (
     <div className="relative flex min-w-[136px] items-center justify-end gap-1.5 whitespace-nowrap">
       {toast && (
@@ -1329,6 +1368,15 @@ function ActionMenu({
           }}
         />
       )}
+      <button
+        type="button"
+        onClick={() => { void copyAccessToken() }}
+        className="table-action-btn"
+        title="复制 access_token"
+        aria-label={`复制 ${acc.email} 的 access_token`}
+      >
+        AT
+      </button>
       <button onClick={onDetail} className="table-action-btn">详情</button>
       {actions.length > 0 && (
         <div className="relative">

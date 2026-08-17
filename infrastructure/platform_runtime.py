@@ -195,23 +195,6 @@ def _build_account_overview(platform: str, data: dict[str, Any]) -> dict[str, An
         if breakdowns:
             overview["usage_breakdowns"] = breakdowns
 
-    if isinstance(data.get("local_app_account"), dict):
-        overview["local_matches_target"] = bool(data["local_app_account"].get("matches_target"))
-        if data["local_app_account"].get("matches_target"):
-            overview["chips"].append("当前")
-
-    if isinstance(data.get("desktop_app_state"), dict):
-        desktop_state = data["desktop_app_state"]
-        overview["desktop_app_state"] = {
-            "app_name": desktop_state.get("app_name"),
-            "running": bool(desktop_state.get("running")),
-            "ready": bool(desktop_state.get("ready")),
-            "configured": bool(desktop_state.get("configured")),
-            "installed": bool(desktop_state.get("installed")),
-            "status_label": desktop_state.get("status_label", ""),
-            "ready_label": desktop_state.get("ready_label", ""),
-        }
-
     if data.get("quota_note"):
         overview["quota_note"] = data.get("quota_note")
 
@@ -265,12 +248,6 @@ class PlatformRuntime:
             )
         return actions
     
-    def get_desktop_state(self, platform: str) -> dict[str, Any]:
-        load_all()
-        platform_cls = get(platform)
-        instance = platform_cls(config=RegisterConfig())
-        return instance.get_desktop_state() or {"available": False}
-
     def execute_action(
         self,
         command: ActionExecutionCommand,
