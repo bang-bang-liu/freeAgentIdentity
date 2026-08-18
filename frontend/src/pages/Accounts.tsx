@@ -12,7 +12,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { getTaskStatusText, TASK_STATUS_VARIANTS } from '@/lib/tasks'
-import { RefreshCw, Copy, ExternalLink, Download, Upload, Plus, X, Mail, Trash2, Zap, UserCheck, FlaskConical, Crown, Clock, CircleX, Sparkles, BadgeCheck, Gift, Circle } from 'lucide-react'
+import { RefreshCw, Copy, Download, Upload, Plus, X, Mail, Trash2, Zap, UserCheck, FlaskConical, Crown, Clock, CircleX, Sparkles, BadgeCheck, Gift, Circle } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 
 const STATUS_VARIANT: Record<string, any> = {
@@ -223,6 +223,30 @@ function getSecuritySettings(acc: any) {
 function getCashierUrl(acc: any) {
   const overview = getAccountOverview(acc)
   return overview?.cashier_url || acc?.cashier_url || ''
+}
+
+function formatSurvivalDuration(acc: any, now: number, language: string) {
+  const createdAt = new Date(acc?.created_at || '').getTime()
+  if (!Number.isFinite(createdAt) || createdAt > now) return '-'
+
+  const lifecycle = getLifecycleStatus(acc)
+  const validity = getValidityStatus(acc)
+  if (lifecycle === 'invalid' || lifecycle === 'expired' || validity === 'invalid') {
+    return language.startsWith('zh') ? '已失效' : 'Expired'
+  }
+
+  const totalMinutes = Math.max(0, Math.floor((now - createdAt) / 60000))
+  const days = Math.floor(totalMinutes / (24 * 60))
+  const hours = Math.floor((totalMinutes % (24 * 60)) / 60)
+  const minutes = totalMinutes % 60
+  if (language.startsWith('zh')) {
+    if (days > 0) return `${days}天${hours}小时`
+    if (hours > 0) return `${hours}小时${minutes}分`
+    return `${minutes}分钟`
+  }
+  if (days > 0) return `${days}d ${hours}h`
+  if (hours > 0) return `${hours}h ${minutes}m`
+  return `${minutes}m`
 }
 
 function getPrimaryToken(acc: any) {
@@ -1823,6 +1847,7 @@ export default function Accounts() {
 
   const [accounts, setAccounts] = useState<any[]>([])
   const [total, setTotal] = useState(0)
+  const [now, setNow] = useState(() => Date.now())
   const [loading, setLoading] = useState(false)
   const [search, setSearch] = useState('')
   const [debouncedSearch, setDebouncedSearch] = useState('')
@@ -1850,6 +1875,11 @@ export default function Accounts() {
     const timer = setTimeout(() => setDebouncedSearch(search), 400)
     return () => clearTimeout(timer)
   }, [search])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 60_000)
+    return () => window.clearInterval(timer)
+  }, [])
 
   useEffect(() => {
     setSelectedIds(new Set())
@@ -2108,7 +2138,7 @@ export default function Accounts() {
               <th className="px-3 py-2 text-left">{t('common.email')}</th>
               <th className="px-3 py-2 text-left">{t('common.password')}</th>
               <th className="px-3 py-2 text-left">{t('common.status')}</th>
-              <th className="px-3 py-2 text-left">{t('accounts.link')}</th>
+              <th className="px-3 py-2 text-left">{t('accounts.survivalTime')}</th>
               <th className="px-3 py-2 text-left">{t('accounts.registeredAt')}</th>
               <th className="px-3 py-2 text-right">{t('common.actions')}</th>
             </tr>
@@ -2133,6 +2163,7 @@ export default function Accounts() {
                 const verificationMailbox = getVerificationMailbox(acc)
                 const primaryMetrics = getPrimaryMetrics(acc)
                 const displayBadges = getDisplayBadges(acc)
+                const survivalTime = formatSurvivalDuration(acc, now, language)
                 return (
               <tr key={acc.id} className="group border-b border-[var(--border)]/30 hover:bg-[var(--text-primary)]/[0.02] transition-colors cursor-pointer"
                   onClick={() => setDetail(acc)}>
@@ -2239,12 +2270,12 @@ export default function Accounts() {
                   </div>
                 </td>
                 <td className="px-3 py-2.5 align-top">
-                  {getCashierUrl(acc) ? (
-                    <div className="flex items-center gap-1.5 whitespace-nowrap opacity-70 group-hover:opacity-100 transition-opacity">
-                      <button onClick={e => { e.stopPropagation(); copy(getCashierUrl(acc)) }} className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors p-0.5 rounded hover:bg-[var(--bg-pane)]" title="复制链接"><Copy className="h-3 w-3" /></button>
-                      <a href={getCashierUrl(acc)} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors p-0.5 rounded hover:bg-[var(--bg-pane)]" title="打开收银台"><ExternalLink className="h-3 w-3" /></a>
-                    </div>
-                  ) : <span className="text-[var(--text-muted)]/50 text-xs">-</span>}
+                  <span
+                    className={`whitespace-nowrap font-mono text-xs ${survivalTime === '已失效' || survivalTime === 'Expired' ? 'text-red-400' : 'text-[var(--text-secondary)]'}`}
+                    title={acc.created_at ? formatDateTime(acc.created_at, language) : undefined}
+                  >
+                    {survivalTime}
+                  </span>
                 </td>
                 <td className="px-3 py-2.5 font-mono text-xs text-[var(--text-muted)] whitespace-nowrap align-top">
                   {acc.created_at ? formatDateTime(acc.created_at, language, { 

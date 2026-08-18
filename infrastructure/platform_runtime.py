@@ -43,21 +43,7 @@ PERSISTED_ACTION_DATA_KEYS = {
     "authToken",
 }
 
-STATEFUL_ACTION_IDS = {"get_account_state", "switch_account", "query_state", "switch_desktop"}
-DESKTOP_STATE_OUTPUT_KEYS = frozenset({"desktop_app_state", "local_app_account"})
-
-
-def _strip_desktop_state_fields(value: Any) -> Any:
-    """Remove local desktop-app details from account state query results."""
-    if isinstance(value, dict):
-        return {
-            key: _strip_desktop_state_fields(item)
-            for key, item in value.items()
-            if key not in DESKTOP_STATE_OUTPUT_KEYS
-        }
-    if isinstance(value, list):
-        return [_strip_desktop_state_fields(item) for item in value]
-    return value
+STATEFUL_ACTION_IDS = {"get_account_state", "query_state"}
 
 
 def _utcnow_iso() -> str:
@@ -299,8 +285,6 @@ class PlatformRuntime:
                 return ActionExecutionResult(ok=False, error=str(exc))
 
             result_data = result.get("data")
-            if command.action_id in {"query_state", "get_account_state"}:
-                result_data = _strip_desktop_state_fields(result_data)
             if isinstance(result_data, dict):
                 data = result_data
                 needs_save = False

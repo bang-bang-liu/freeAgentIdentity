@@ -40,9 +40,7 @@ class ChatGPTPlatform(BasePlatform):
     # Declarative capabilities
     capabilities = [
         "query_state",      # Query account state/quota
-        "switch_desktop",   # Switch to Codex desktop
         "upload_cpa",       # Upload to CPA system
-        "upload_tm",        # Upload to Team Manager
     ]
 
     def __init__(self, config: RegisterConfig = None, mailbox: BaseMailbox = None):
@@ -233,7 +231,6 @@ class ChatGPTPlatform(BasePlatform):
 
     def get_platform_actions(self) -> list:
         return [
-            {"id": "switch_desktop", "label": "切换到 Codex 桌面端", "params": []},
             {"id": "query_state", "label": "查询账号状态/订阅", "params": [
                 {
                     "key": "proxy",
@@ -252,18 +249,12 @@ class ChatGPTPlatform(BasePlatform):
                  {"key": "api_url", "label": "CPA API URL", "type": "text"},
                  {"key": "api_key", "label": "CPA API Key", "type": "text"},
              ]},
-            {"id": "upload_tm", "label": "上传 Team Manager",
-             "params": [
-                 {"key": "api_url", "label": "TM API URL", "type": "text"},
-                 {"key": "api_key", "label": "TM API Key", "type": "text"},
-            ]},
         ]
 
     def execute_action(self, action_id: str, account: Account, params: dict) -> dict:
-        # Keep tasks created by older frontends compatible with the capability IDs.
+        # Keep tasks created by older frontends compatible with the query action ID.
         aliases = {
             "get_account_state": "query_state",
-            "switch_account": "switch_desktop",
         }
         return super().execute_action(aliases.get(action_id, action_id), account, params)
 
@@ -285,63 +276,11 @@ class ChatGPTPlatform(BasePlatform):
         a.user_id = account.user_id or ""
         a.account_id = account.user_id or ""
 
-        if action_id == "switch_desktop":
-            from platforms.chatgpt.switch import (
-                close_codex_app,
-                extract_session_token,
-                fetch_chatgpt_account_state,
-                read_current_codex_account,
-                restart_codex_app,
-                switch_codex_account,
-            )
-
-            session_token = extract_session_token(a.session_token, a.cookies)
-            if not session_token:
-                return {"ok": False, "error": "Switch to Codex desktop requires session_token"}
-
-            close_ok, close_msg = close_codex_app()
-            switch_ok, switch_data = switch_codex_account(session_token=session_token, cookies=a.cookies)
-            if not switch_ok:
-                return {"ok": False, "error": switch_data.get("error", "Switch failed")}
-
-            remote_state = fetch_chatgpt_account_state(
-                access_token=a.access_token,
-                session_token=session_token,
-                cookies=a.cookies,
-                proxy=proxy,
-            )
-            local_state = read_current_codex_account()
-            restart_ok, restart_msg = restart_codex_app()
-            message_parts = [switch_data.get("message", "Codex credentials written")]
-            if close_msg:
-                message_parts.append(close_msg)
-            if restart_msg:
-                message_parts.append(restart_msg)
-            data = {
-                "message": ".".join(part for part in message_parts if part),
-                "close": {"ok": close_ok, "message": close_msg},
-                "restart": {"ok": restart_ok, "message": restart_msg},
-                "local_app_account": local_state,
-                "remote_state": remote_state,
-                "switch_details": switch_data,
-            }
-            if remote_state.get("access_token"):
-                data["access_token"] = remote_state["access_token"]
-            if remote_state.get("refresh_token"):
-                data["refresh_token"] = remote_state["refresh_token"]
-            return {"ok": True, "data": data}
-
         if action_id == "upload_cpa":
             from platforms.chatgpt.cpa_upload import upload_to_cpa, generate_token_json
             token_data = generate_token_json(a)
             ok, msg = upload_to_cpa(token_data, api_url=params.get("api_url"),
                                     api_key=params.get("api_key"))
-            return {"ok": ok, "data": msg}
-
-        if action_id == "upload_tm":
-            from platforms.chatgpt.cpa_upload import upload_to_team_manager
-            ok, msg = upload_to_team_manager(a, api_url=params.get("api_url"),
-                                             api_key=params.get("api_key"))
             return {"ok": ok, "data": msg}
 
         raise NotImplementedError(f"Unknown action: {action_id}")
@@ -432,11 +371,5 @@ class ChatGPTPlatform(BasePlatform):
             return False
         return int(profile_error.get("status_code") or 0) == 401
 
-    def _handle_switch_desktop(self, account: Account, params: dict) -> dict:
-        return self._execute_platform_action("switch_desktop", account, params)
-
     def _handle_upload_cpa(self, account: Account, params: dict) -> dict:
         return self._execute_platform_action("upload_cpa", account, params)
-
-    def _handle_upload_tm(self, account: Account, params: dict) -> dict:
-        return self._execute_platform_action("upload_tm", account, params)

@@ -7,14 +7,6 @@ from core.registry import register
 from platforms.cursor.core import UA, CURSOR
 
 
-def _mask_secret(value: str) -> str:
-    if not value:
-        return ""
-    if len(value) <= 12:
-        return value
-    return f"{value[:6]}...{value[-4:]}"
-
-
 @register
 class CursorPlatform(BasePlatform):
     name = "cursor"
@@ -26,7 +18,6 @@ class CursorPlatform(BasePlatform):
 
     # Declarative capabilities
     capabilities = [
-        "switch_desktop",   # Switch to desktop app
         "query_state",      # Query account state/quota
         "generate_link",    # Generate trial link
     ]
@@ -128,60 +119,13 @@ class CursorPlatform(BasePlatform):
     def get_platform_actions(self) -> list:
         """返回平台支持的操作列表"""
         return [
-            {"id": "switch_account", "label": "切换到桌面应用", "params": []},
             {"id": "get_account_state", "label": "查询账号状态/额度提示", "params": []},
             {"id": "generate_trial_link", "label": "生成 7 天 Pro 链接", "params": []},
         ]
 
     def execute_action(self, action_id: str, account: Account, params: dict) -> dict:
         """执行平台操作"""
-        if action_id == "switch_account":
-            from platforms.cursor.switch import (
-                get_cursor_billing_info,
-                get_cursor_usage,
-                get_cursor_user_info,
-                has_cursor_valid_payment_method,
-                read_current_cursor_account,
-                restart_cursor_ide,
-                summarize_cursor_usage,
-                switch_cursor_account,
-            )
-            
-            token = account.token
-            if not token:
-                return {"ok": False, "error": "账号缺少 token"}
-            
-            ok, msg = switch_cursor_account(token)
-            if not ok:
-                return {"ok": False, "error": msg}
-            
-            user_info = get_cursor_user_info(token) or {}
-            billing_info = get_cursor_billing_info(token) or {}
-            has_payment_method = has_cursor_valid_payment_method(token)
-            usage_info = get_cursor_usage(token, user_info.get("sub", "")) or {}
-            usage_summary = summarize_cursor_usage(usage_info)
-            current = read_current_cursor_account() or {}
-            restart_ok, restart_msg = restart_cursor_ide()
-            return {
-                "ok": True,
-                "data": {
-                    "message": f"{msg}。{restart_msg}" if restart_ok else msg,
-                    "valid": bool(user_info),
-                    "remote_user": user_info,
-                    "billing_info": billing_info,
-                    "has_valid_payment_method": has_payment_method,
-                    "usage_info": usage_info,
-                    "usage_summary": usage_summary,
-                    "local_app_account": {
-                        "token_preview": _mask_secret(current.get("token", "")),
-                        "matches_target": current.get("token") == token if current.get("token") else False,
-                    },
-                    "restart": {"ok": restart_ok, "message": restart_msg},
-                    "quota_note": "Cursor 可查询 usage，但部分账号只返回已用量；maxRequestUsage/maxTokenUsage 可能为空，无法保证总能计算剩余额度。",
-                }
-            }
-        
-        elif action_id in {"get_user_info", "get_account_state"}:
+        if action_id in {"get_user_info", "get_account_state"}:
             from platforms.cursor.switch import (
                 get_cursor_billing_info,
                 get_cursor_usage,

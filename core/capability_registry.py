@@ -71,15 +71,6 @@ STANDARD_CAPABILITIES: Dict[str, CapabilityDefinition] = {
         ui_hints={"inline": False, "priority": 4}
     ),
     
-    "switch_desktop": CapabilityDefinition(
-        id="switch_desktop",
-        label="切换到桌面应用",
-        description="Switch to desktop application",
-        category="auth",
-        icon="monitor",
-        ui_hints={"inline": True, "priority": 5}
-    ),
-    
     "upload_cpa": CapabilityDefinition(
         id="upload_cpa",
         label="上传至 CPA",
@@ -92,20 +83,6 @@ STANDARD_CAPABILITIES: Dict[str, CapabilityDefinition] = {
             {"key": "api_key", "label": "CPA API Key", "type": "text"},
         ],
         ui_hints={"inline": False, "priority": 6}
-    ),
-    
-    "upload_tm": CapabilityDefinition(
-        id="upload_tm",
-        label="上传至 Team Manager",
-        description="Upload account to Team Manager",
-        category="integration",
-        icon="users",
-        requires_params=True,
-        param_schema=[
-            {"key": "api_url", "label": "TM API URL", "type": "text"},
-            {"key": "api_key", "label": "TM API Key", "type": "text"},
-        ],
-        ui_hints={"inline": False, "priority": 7}
     ),
     
     "check_trial": CapabilityDefinition(

@@ -8,7 +8,9 @@ def test_chatgpt_actions_use_capability_ids():
     action_ids = {item["id"] for item in actions}
 
     assert "query_state" in action_ids
-    assert "switch_desktop" in action_ids
+    assert "upload_cpa" in action_ids
+    assert "switch_desktop" not in action_ids
+    assert "upload_tm" not in action_ids
     assert "get_account_state" not in action_ids
     assert "switch_account" not in action_ids
     query_action = next(item for item in actions if item["id"] == "query_state")
@@ -53,10 +55,8 @@ def test_chatgpt_capability_handlers_delegate_to_existing_actions(monkeypatch):
 
     monkeypatch.setattr(platform, "_execute_platform_action", fake_platform_action)
 
-    assert platform.execute_action("switch_account", account, {})["data"] == "switch_desktop"
     assert platform.execute_action("upload_cpa", account, {"api_url": "https://example.com"})["data"] == "upload_cpa"
-    assert platform.execute_action("upload_tm", account, {"api_url": "https://example.com"})["data"] == "upload_tm"
-    assert [call[0] for call in calls] == ["switch_desktop", "upload_cpa", "upload_tm"]
+    assert [call[0] for call in calls] == ["upload_cpa"]
 
 
 def test_chatgpt_query_state_uses_project_proxy_before_direct(monkeypatch):

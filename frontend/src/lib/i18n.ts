@@ -127,7 +127,6 @@ const ZH_MESSAGES = {
   "settings.provider.captchaUsage":
     "协议模式会按已启用顺序自动选择远程打码服务；浏览器模式使用当前默认的验证码 provider。列表行内可以直接查看详情、编辑、设默认、删除。",
   "settings.chatgpt.cpaDesc": "注册完成后自动上传到 CPA 管理平台",
-  "settings.chatgpt.teamManagerDesc": "上传到自建 Team Manager 系统",
   "settings.chatgpt.any2apiDesc": "同步账号到 Any2Api 服务，用于导出和对接",
 
   "dashboard.totalAccounts": "总账号数",
@@ -242,7 +241,7 @@ const ZH_MESSAGES = {
   "accounts.refreshAllCreditsTask": "刷新全部 {platform} 账号额度",
   "accounts.deleteSelectedConfirm":
     "确认删除选中的 {count} 个账号？此操作不可撤销。",
-  "accounts.link": "试用链接",
+  "accounts.survivalTime": "存活时间",
   "accounts.registeredAt": "注册时间",
   "accounts.emptyTitle": "暂无数据",
   "accounts.emptyDesc":
@@ -510,8 +509,6 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
     "Protocol mode selects remote captcha services in enabled order; browser mode uses the current default captcha provider. Rows support details, editing, default selection, and deletion.",
   "settings.chatgpt.cpaDesc":
     "Automatically upload accounts to the CPA management platform after registration",
-  "settings.chatgpt.teamManagerDesc":
-    "Upload accounts to a self-hosted Team Manager system",
   "settings.chatgpt.any2apiDesc":
     "Sync accounts to Any2Api for export and integrations",
 
@@ -632,7 +629,7 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
   "accounts.refreshAllCreditsTask": "Refresh all {platform} account credits",
   "accounts.deleteSelectedConfirm":
     "Delete {count} selected accounts? This cannot be undone.",
-  "accounts.link": "Trial Link",
+  "accounts.survivalTime": "Survival Time",
   "accounts.registeredAt": "Registered At",
   "accounts.emptyTitle": "No Data",
   "accounts.emptyDesc":

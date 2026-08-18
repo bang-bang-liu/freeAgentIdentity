@@ -1,7 +1,7 @@
 """ChatGPT email registration through the OpenAI web protocol.
 
-Signup remains direct HTTP; a hidden Chromium page is used only to execute the
-official Sentinel JavaScript required for the create-account security token.
+Signup remains direct HTTP; a hidden Camoufox/Firefox page is used only to
+execute the official Sentinel JavaScript required for the create-account token.
 """
 from __future__ import annotations
 
@@ -27,6 +27,33 @@ from .constants import (
     SENTINEL_FRAME_URL,
     SENTINEL_REQ_URL,
     SENTINEL_SDK_URL,
+)
+from .fingerprint import (
+    FIREFOX_ACCEPT_LANGUAGE,
+    FIREFOX_IMPERSONATE,
+    FIREFOX_LANGUAGE,
+    FIREFOX_LINUX_PLATFORM,
+    FIREFOX_LINUX_NAVIGATOR_PLATFORM,
+    FIREFOX_LINUX_OSCPU,
+    FIREFOX_LINUX_UA,
+    FIREFOX_LOCALES,
+    FIREFOX_MAJOR,
+    FIREFOX_NAVIGATOR_PLATFORM,
+    FIREFOX_OS,
+    FIREFOX_OSCPU,
+    FIREFOX_PLATFORM,
+    FIREFOX_SCREEN_HEIGHT,
+    FIREFOX_SCREEN_WIDTH,
+    FIREFOX_UA,
+    SENTINEL_ACCEPT_LANGUAGE,
+    SENTINEL_LANGUAGE,
+    SENTINEL_LOCATION_TYPE,
+    SENTINEL_OBJECT_PROTO,
+    SENTINEL_PLATFORM,
+    SENTINEL_SCREEN,
+    SENTINEL_SCROLL,
+    check_alignment as check_fingerprint_alignment,
+    matches_ua_layer,
 )
 
 
@@ -136,8 +163,12 @@ def _continue_url(payload: dict | None) -> str:
 class _SentinelTokenGenerator:
     """Generate the requirements/enforcement PoW used by OpenAI Sentinel."""
 
-    def __init__(self, user_agent: str):
-        self.user_agent = user_agent
+    def __init__(self, user_agent: str = FIREFOX_UA):
+        self.user_agent = str(user_agent or FIREFOX_UA)
+        self.screen = SENTINEL_SCREEN
+        self.language = SENTINEL_LANGUAGE
+        self.accept_language = SENTINEL_ACCEPT_LANGUAGE
+        self.platform = SENTINEL_PLATFORM
         self.sid = str(uuid.uuid4())
 
     @staticmethod
@@ -161,7 +192,7 @@ class _SentinelTokenGenerator:
     def _fingerprint(self) -> list:
         perf_now = 1000 + random.random() * 49000
         return [
-            "1920x1080",
+            self.screen,
             time.strftime(
                 "%a, %d %b %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)",
                 time.gmtime(),
@@ -172,12 +203,12 @@ class _SentinelTokenGenerator:
             SENTINEL_SDK_URL,
             None,
             None,
-            "en-US",
-            "en-US,en",
+            self.language,
+            self.accept_language,
             random.random(),
-            "webkitTemporaryStorage−undefined",
-            "location",
-            "Object",
+            SENTINEL_SCROLL,
+            SENTINEL_LOCATION_TYPE,
+            SENTINEL_OBJECT_PROTO,
             perf_now,
             self.sid,
             "",
@@ -200,12 +231,12 @@ class _SentinelTokenGenerator:
             self.user_agent,
             SENTINEL_SDK_URL,
             None,
-            "en-US",
-            "en-US,en",
+            self.language,
+            self.accept_language,
             0,
-            "webkitTemporaryStorage\u2212undefined",
-            "location",
-            "Object",
+            SENTINEL_SCROLL,
+            SENTINEL_LOCATION_TYPE,
+            SENTINEL_OBJECT_PROTO,
             perf_now,
             self.sid,
             "",
@@ -260,15 +291,45 @@ class _SentinelBrowserRuntime:
     def __init__(self, session, *, user_agent: str, proxy: str | None):
         from camoufox.sync_api import Camoufox
 
-        del user_agent  # Camoufox supplies a coherent browser fingerprint.
+        runtime_user_agent = str(user_agent or FIREFOX_UA)
+        runtime_os = FIREFOX_OS
+        runtime_navigator_platform = FIREFOX_NAVIGATOR_PLATFORM
+        runtime_oscpu = FIREFOX_OSCPU
+        if runtime_user_agent == FIREFOX_LINUX_UA:
+            runtime_os = "linux"
+            runtime_navigator_platform = FIREFOX_LINUX_NAVIGATOR_PLATFORM
+            runtime_oscpu = FIREFOX_LINUX_OSCPU
         self._camoufox = None
         self._browser = None
         self._page = None
         launch_options = {
             "headless": True,
-            "locale": "en-US",
+            "locale": list(FIREFOX_LOCALES),
+            "os": runtime_os,
+            "ff_version": FIREFOX_MAJOR,
             "block_webrtc": True,
         }
+        # Camoufox applies these values to both navigator.* and request
+        # headers.  Supplying the same values as the protocol profile keeps
+        # the browser used by Sentinel on the same Firefox line.  Non-profile
+        # callers retain Camoufox's generated Firefox fingerprint.
+        if matches_ua_layer(runtime_user_agent):
+            launch_options.update(
+                {
+                    "i_know_what_im_doing": True,
+                    "config": {
+                        "navigator.userAgent": runtime_user_agent,
+                        "navigator.platform": runtime_navigator_platform,
+                        "navigator.oscpu": runtime_oscpu,
+                        "navigator.language": FIREFOX_LANGUAGE,
+                        "navigator.languages": list(FIREFOX_LOCALES),
+                        "headers.User-Agent": runtime_user_agent,
+                        "headers.Accept-Language": FIREFOX_ACCEPT_LANGUAGE,
+                        "screen.width": FIREFOX_SCREEN_WIDTH,
+                        "screen.height": FIREFOX_SCREEN_HEIGHT,
+                    },
+                }
+            )
         if proxy:
             parsed_proxy = urlparse(proxy)
             if parsed_proxy.scheme and parsed_proxy.hostname and parsed_proxy.port:
@@ -302,7 +363,15 @@ class _SentinelBrowserRuntime:
 
         with self._sdk_lock:
             if self._sdk_code is None:
-                response = session.get(SENTINEL_SDK_URL, timeout=30)
+                response = session.get(
+                    SENTINEL_SDK_URL,
+                    headers={
+                        "accept": "*/*",
+                        "accept-language": FIREFOX_ACCEPT_LANGUAGE,
+                        "user-agent": runtime_user_agent,
+                    },
+                    timeout=30,
+                )
                 if getattr(response, "status_code", 0) >= 400:
                     raise RuntimeError(
                         f"Sentinel SDK 获取失败: HTTP {response.status_code}"
@@ -441,12 +510,12 @@ class OpenAISentinelClient:
         self,
         session,
         *,
-        user_agent: str,
+        user_agent: str = FIREFOX_UA,
         proxy: str | None = None,
         use_browser_runtime: bool = True,
     ):
         self.session = session
-        self.user_agent = user_agent
+        self.user_agent = str(user_agent or FIREFOX_UA)
         self.proxy = proxy
         self.use_browser_runtime = use_browser_runtime
         self._browser_runtime: _SentinelBrowserRuntime | None = None
@@ -460,9 +529,11 @@ class OpenAISentinelClient:
                 data=json.dumps({"p": proof, "id": device_id, "flow": flow}),
                 headers={
                     "accept": "*/*",
+                    "accept-language": FIREFOX_ACCEPT_LANGUAGE,
                     "content-type": "text/plain;charset=UTF-8",
                     "origin": SENTINEL_BASE,
                     "referer": SENTINEL_FRAME_URL,
+                    "user-agent": self.user_agent,
                 },
             )
             chat_req = _response_json(response)
@@ -520,9 +591,11 @@ class OpenAISentinelClient:
             data=json.dumps({"p": proof, "id": device_id, "flow": flow}),
             headers={
                 "accept": "*/*",
+                "accept-language": FIREFOX_ACCEPT_LANGUAGE,
                 "content-type": "text/plain;charset=UTF-8",
                 "origin": SENTINEL_BASE,
                 "referer": SENTINEL_FRAME_URL,
+                "user-agent": self.user_agent,
             },
         )
         payload = _response_json(response)
@@ -557,10 +630,58 @@ class OpenAISentinelClient:
 class ChatGPTProtocolRegister:
     """Synchronous worker compatible with ``ProtocolMailboxAdapter``."""
 
-    user_agent = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
-    )
+    # 三层指纹统一到 Firefox 线：TLS(firefox144) / headers(UA) / Sentinel 同源。
+    user_agent = FIREFOX_UA
+    impersonate = FIREFOX_IMPERSONATE
+    accept_language = FIREFOX_ACCEPT_LANGUAGE
+    platform = FIREFOX_PLATFORM
+
+    @classmethod
+    def check_fingerprint_alignment(
+        cls,
+        *,
+        impersonate: str | None = None,
+        user_agent: str | None = None,
+        sentinel_user_agent: str | None = None,
+    ) -> dict:
+        """Return the three-layer TLS/headers/Sentinel alignment report."""
+        effective_user_agent = user_agent or cls.user_agent
+        report = check_fingerprint_alignment(
+            impersonate=impersonate or cls.impersonate,
+            user_agent=effective_user_agent,
+            sentinel_user_agent=(
+                effective_user_agent
+                if sentinel_user_agent is None
+                else sentinel_user_agent
+            ),
+        )
+        if report["sentinel"]:
+            # Validate the actual arrays emitted by the PoW generator as well
+            # as the UA string passed into it.  This catches accidental drift
+            # in the Sentinel environment constants.
+            random_state = random.getstate()
+            try:
+                generator = _SentinelTokenGenerator(effective_user_agent)
+                fingerprint = generator._fingerprint()
+                reference = generator._reference_fingerprint()
+            finally:
+                random.setstate(random_state)
+            report["sentinel"] = (
+                fingerprint[0] == SENTINEL_SCREEN
+                and fingerprint[4] == effective_user_agent
+                and fingerprint[8] == SENTINEL_LANGUAGE
+                and fingerprint[9] == SENTINEL_ACCEPT_LANGUAGE
+                and reference[4] == effective_user_agent
+                and reference[7] == SENTINEL_LANGUAGE
+                and reference[8] == SENTINEL_ACCEPT_LANGUAGE
+            )
+            report["aligned"] = (
+                report["tls"] and report["headers"] and report["sentinel"]
+            )
+        return report
+
+    # Short alias for callers that want a class-level diagnostic tool.
+    check_alignment = check_fingerprint_alignment
 
     def __init__(
         self,
@@ -569,7 +690,8 @@ class ChatGPTProtocolRegister:
         otp_callback: Callable[[], str] | None = None,
         log_fn: Callable[[str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
-        impersonate: str = "firefox144",
+        impersonate: str = FIREFOX_IMPERSONATE,
+        user_agent: str | None = None,
         session=None,
         sentinel_runtime: bool = True,
     ):
@@ -577,8 +699,15 @@ class ChatGPTProtocolRegister:
         self.otp_callback = otp_callback
         self.log = log_fn or (lambda _message: None)
         self.cancel_check = cancel_check or (lambda: False)
+        self.user_agent = str(user_agent or type(self).user_agent)
+        self.platform = (
+            FIREFOX_LINUX_PLATFORM
+            if self.user_agent == FIREFOX_LINUX_UA
+            else type(self).platform
+        )
+        self.impersonate = str(impersonate or FIREFOX_IMPERSONATE).strip().lower()
         if session is None:
-            kwargs = {"impersonate": impersonate, "timeout": 60}
+            kwargs = {"impersonate": self.impersonate, "timeout": 60}
             if self.proxy:
                 kwargs["proxies"] = {"http": self.proxy, "https": self.proxy}
             session = requests.Session(**kwargs)
@@ -590,6 +719,26 @@ class ChatGPTProtocolRegister:
             use_browser_runtime=sentinel_runtime,
         )
         self.device_id = str(uuid.uuid4())
+        alignment = self.check_fingerprint_alignment(
+            impersonate=self.impersonate,
+            user_agent=self.user_agent,
+            sentinel_user_agent=self.sentinel.user_agent,
+        )
+        self.fingerprint_diagnostics = alignment
+        status = "三层指纹已对齐" if alignment["aligned"] else "三层指纹未对齐"
+        self.log(
+            f"{status} (TLS={alignment['tls']}, "
+            f"headers={alignment['headers']}, sentinel={alignment['sentinel']})"
+        )
+
+    def _navigation_headers(self, referer: str = "", *, accept: str | None = None) -> dict:
+        """Build browser-like headers for HTML/redirect GET requests."""
+        return {
+            "accept": accept or "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "accept-language": self.accept_language,
+            "referer": referer or f"{CHATGPT_APP}/",
+            "user-agent": self.user_agent,
+        }
 
     def _check_cancelled(self) -> None:
         if self.cancel_check():
@@ -598,6 +747,7 @@ class ChatGPTProtocolRegister:
     def _common_headers(self, referer: str) -> dict:
         return {
             "accept": "application/json",
+            "accept-language": self.accept_language,
             "content-type": "application/json",
             "origin": OPENAI_AUTH,
             "referer": referer,
@@ -610,16 +760,27 @@ class ChatGPTProtocolRegister:
             if not current:
                 return
             self._check_cancelled()
-            response = self.session.get(urljoin(OPENAI_AUTH, current), allow_redirects=False)
+            response = self.session.get(
+                urljoin(OPENAI_AUTH, current),
+                headers=self._navigation_headers(),
+                allow_redirects=False,
+            )
             current = str(response.headers.get("location") or "").strip()
         raise RuntimeError("OpenAI 授权重定向次数过多")
 
     def _initialize_signup(self, email: str) -> None:
         self.log("初始化 ChatGPT 协议注册会话...")
-        response = self.session.get(CHATGPT_APP, allow_redirects=True)
+        response = self.session.get(
+            CHATGPT_APP,
+            headers=self._navigation_headers(),
+            allow_redirects=True,
+        )
         if getattr(response, "status_code", 0) >= 400:
             raise RuntimeError(f"ChatGPT 首页访问失败: {_response_error(response)}")
-        csrf_response = self.session.get(f"{CHATGPT_APP}/api/auth/csrf")
+        csrf_response = self.session.get(
+            f"{CHATGPT_APP}/api/auth/csrf",
+            headers=self._navigation_headers(f"{CHATGPT_APP}/", accept="application/json"),
+        )
         csrf_payload = _response_json(csrf_response)
         csrf_token = str(csrf_payload.get("csrfToken") or "").strip()
         if getattr(csrf_response, "status_code", 0) != 200 or not csrf_token:
@@ -645,6 +806,7 @@ class ChatGPTProtocolRegister:
             ),
             headers={
                 "accept": "application/json",
+                "accept-language": self.accept_language,
                 "content-type": "application/x-www-form-urlencoded",
                 "origin": CHATGPT_APP,
                 "referer": f"{CHATGPT_APP}/",
@@ -680,7 +842,10 @@ class ChatGPTProtocolRegister:
         return payload
 
     def _session_payload(self) -> dict:
-        response = self.session.get(f"{CHATGPT_APP}/api/auth/session")
+        response = self.session.get(
+            f"{CHATGPT_APP}/api/auth/session",
+            headers=self._navigation_headers(f"{CHATGPT_APP}/", accept="application/json"),
+        )
         payload = _response_json(response)
         access_token = str(payload.get("accessToken") or "").strip()
         if getattr(response, "status_code", 0) != 200 or not access_token:
@@ -692,11 +857,12 @@ class ChatGPTProtocolRegister:
     def _chatgpt_security_headers(self, access_token: str, target_path: str) -> dict:
         return {
             "accept": "application/json",
+            "accept-language": self.accept_language,
             "content-type": "application/json",
             "authorization": f"Bearer {access_token}",
             "oai-device-id": self.device_id,
             "oai-session-id": str(uuid.uuid4()),
-            "oai-language": "en-US",
+            "oai-language": FIREFOX_LANGUAGE,
             "x-openai-target-path": target_path,
             "x-openai-target-route": target_path,
             "origin": CHATGPT_APP,
@@ -718,6 +884,7 @@ class ChatGPTProtocolRegister:
             target,
             headers={
                 "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "accept-language": self.accept_language,
                 "referer": referer or f"{CHATGPT_APP}/",
                 "user-agent": self.user_agent,
             },
@@ -737,7 +904,10 @@ class ChatGPTProtocolRegister:
         params: dict,
         callback_url: str,
     ) -> str:
-        csrf_response = self.session.get(f"{CHATGPT_APP}/api/auth/csrf")
+        csrf_response = self.session.get(
+            f"{CHATGPT_APP}/api/auth/csrf",
+            headers=self._navigation_headers(f"{CHATGPT_APP}/", accept="application/json"),
+        )
         csrf_payload = _response_json(csrf_response)
         csrf_token = str(csrf_payload.get("csrfToken") or "").strip()
         if getattr(csrf_response, "status_code", 0) != 200 or not csrf_token:
@@ -768,6 +938,7 @@ class ChatGPTProtocolRegister:
             ),
             headers={
                 "accept": "application/json",
+                "accept-language": self.accept_language,
                 "content-type": "application/x-www-form-urlencoded",
                 "origin": CHATGPT_APP,
                 "referer": f"{CHATGPT_APP}/",
@@ -792,6 +963,7 @@ class ChatGPTProtocolRegister:
             json={},
             headers={
                 "accept": "application/json, text/plain, */*",
+                "accept-language": self.accept_language,
                 "content-type": "application/json",
                 "origin": OPENAI_AUTH,
                 "referer": referer or f"{OPENAI_AUTH}/email-verification",
@@ -1279,10 +1451,9 @@ class ChatGPTProtocolRegister:
             if continue_url:
                 self.session.get(
                     urljoin(OPENAI_AUTH, continue_url),
-                    headers={
-                        "referer": f"{OPENAI_AUTH}/email-verification",
-                        "user-agent": self.user_agent,
-                    },
+                    headers=self._navigation_headers(
+                        f"{OPENAI_AUTH}/email-verification"
+                    ),
                     allow_redirects=True,
                 )
             if "password" in continue_url.lower():
@@ -1292,10 +1463,9 @@ class ChatGPTProtocolRegister:
                 if password_continue_url:
                     self.session.get(
                         urljoin(OPENAI_AUTH, password_continue_url),
-                        headers={
-                            "referer": f"{OPENAI_AUTH}/create-account/password",
-                            "user-agent": self.user_agent,
-                        },
+                        headers=self._navigation_headers(
+                            f"{OPENAI_AUTH}/create-account/password"
+                        ),
                         allow_redirects=True,
                     )
             name, birthdate = _random_profile()
@@ -1305,7 +1475,7 @@ class ChatGPTProtocolRegister:
             if callback_url:
                 self.session.get(
                     urljoin(OPENAI_AUTH, callback_url),
-                    headers={"user-agent": self.user_agent},
+                    headers=self._navigation_headers(),
                     allow_redirects=True,
                 )
             self.log("注册流程完成，开始设置 TOTP+密码")

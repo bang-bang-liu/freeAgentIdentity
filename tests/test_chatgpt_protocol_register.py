@@ -6,10 +6,21 @@ import types
 
 from platforms.chatgpt.constants import CHATGPT_APP, OPENAI_API_ENDPOINTS, SENTINEL_REQ_URL
 from platforms.chatgpt.plugin import ChatGPTPlatform
+from platforms.chatgpt.fingerprint import (
+    FIREFOX_ACCEPT_LANGUAGE,
+    FIREFOX_IMPERSONATE,
+    FIREFOX_PLATFORM,
+    FIREFOX_UA,
+    SENTINEL_ACCEPT_LANGUAGE,
+    SENTINEL_LANGUAGE,
+    SENTINEL_SCREEN,
+    check_alignment,
+)
 from platforms.chatgpt.protocol_register import (
     ChatGPTProtocolRegister,
     OpenAISentinelClient,
     _SentinelBrowserRuntime,
+    _SentinelTokenGenerator,
 )
 
 
@@ -160,6 +171,58 @@ def test_protocol_register_completes_email_flow_without_browser():
     assert any("设置的密码: StrongPass123!" in line for line in logs)
 
 
+def test_protocol_profile_is_shared_by_headers_and_sentinel_fingerprint():
+    logs = []
+    worker = ChatGPTProtocolRegister(
+        session=_FakeSession(),
+        sentinel_runtime=False,
+        log_fn=logs.append,
+    )
+
+    assert worker.user_agent == FIREFOX_UA
+    assert worker.impersonate == FIREFOX_IMPERSONATE
+    assert worker.platform == FIREFOX_PLATFORM
+    assert any("三层指纹已对齐" in line for line in logs)
+    assert worker.fingerprint_diagnostics == {
+        "aligned": True,
+        "tls": True,
+        "headers": True,
+        "sentinel": True,
+    }
+    assert worker.check_fingerprint_alignment() == worker.fingerprint_diagnostics
+
+    common = worker._common_headers("https://auth.openai.com/email-verification")
+    security = worker._chatgpt_security_headers("access-token", "/backend-api/test")
+    for headers in (common, security):
+        assert headers["user-agent"] == FIREFOX_UA
+        assert headers["accept-language"] == FIREFOX_ACCEPT_LANGUAGE
+
+    generator = _SentinelTokenGenerator(worker.user_agent)
+    fingerprint = generator._fingerprint()
+    reference = generator._reference_fingerprint()
+    assert fingerprint[0] == SENTINEL_SCREEN
+    assert fingerprint[4] == FIREFOX_UA
+    assert fingerprint[8] == SENTINEL_LANGUAGE
+    assert fingerprint[9] == SENTINEL_ACCEPT_LANGUAGE
+    assert reference[4] == FIREFOX_UA
+    assert reference[7] == SENTINEL_LANGUAGE
+    assert reference[8] == SENTINEL_ACCEPT_LANGUAGE
+
+
+def test_fingerprint_alignment_rejects_mixed_firefox_and_chrome_layers():
+    report = check_alignment(
+        impersonate=FIREFOX_IMPERSONATE,
+        user_agent=FIREFOX_UA,
+        sentinel_user_agent="Mozilla/5.0 Chrome/142.0.0.0",
+    )
+    assert report == {
+        "aligned": False,
+        "tls": True,
+        "headers": True,
+        "sentinel": False,
+    }
+
+
 def test_protocol_registration_accepts_current_chatgpt_otp_subjects():
     adapter = ChatGPTPlatform().build_protocol_mailbox_adapter()
 
@@ -250,11 +313,16 @@ def test_sentinel_runtime_uses_camoufox_and_releases_it(monkeypatch):
 
     runtime = _SentinelBrowserRuntime.create(
         _Session(),
-        user_agent="unused-by-camoufox",
+        user_agent=FIREFOX_UA,
         proxy="http://name:pass@127.0.0.1:8080",
     )
     assert _Camoufox.options["headless"] is True
     assert _Camoufox.options["block_webrtc"] is True
+    assert _Camoufox.options["os"] == "windows"
+    assert _Camoufox.options["ff_version"] == 144
+    assert _Camoufox.options["locale"] == ["en-US", "en"]
+    assert _Camoufox.options["config"]["navigator.userAgent"] == FIREFOX_UA
+    assert _Camoufox.options["config"]["headers.Accept-Language"] == FIREFOX_ACCEPT_LANGUAGE
     assert _Camoufox.options["proxy"] == {
         "server": "http://127.0.0.1:8080",
         "username": "name",

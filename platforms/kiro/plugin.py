@@ -6,24 +6,6 @@ from core.registration.helpers import resolve_timeout
 from core.registry import register
 
 
-def _mask_secret(value: str) -> str:
-    if not value:
-        return ""
-    if len(value) <= 12:
-        return value
-    return f"{value[:6]}...{value[-4:]}"
-
-
-def _kiro_local_matches_target(current: dict, access_token: str, refresh_token: str) -> bool:
-    current_refresh = current.get("refreshToken", "")
-    if current_refresh and refresh_token:
-        return current_refresh == refresh_token
-    current_access = current.get("accessToken", "")
-    if current_access and access_token:
-        return current_access == access_token
-    return False
-
-
 @register
 class KiroPlatform(BasePlatform):
     name = "kiro"
@@ -35,7 +17,6 @@ class KiroPlatform(BasePlatform):
 
     # Declarative capabilities
     capabilities = [
-        "switch_desktop",   # Switch to desktop app
         "refresh_token",    # Refresh token
         "query_state",      # Query account state/quota
     ]
@@ -148,7 +129,6 @@ class KiroPlatform(BasePlatform):
 
     def get_platform_actions(self) -> list:
         return [
-            {"id": "switch_account", "label": "切换到桌面应用", "params": []},
             {"id": "refresh_token", "label": "刷新 Token", "params": []},
             {"id": "get_account_state", "label": "查询账号状态/额度提示", "params": []},
         ]
@@ -156,85 +136,7 @@ class KiroPlatform(BasePlatform):
     def execute_action(self, action_id: str, account: Account, params: dict) -> dict:
         extra = account.extra or {}
 
-        if action_id == "switch_account":
-            from platforms.kiro.switch import (
-                get_kiro_portal_state,
-                read_current_kiro_account,
-                refresh_kiro_token,
-                restart_kiro_ide,
-                summarize_kiro_usage,
-                switch_kiro_account,
-            )
-
-            access_token = extra.get("accessToken", "") or account.token
-            refresh_token = extra.get("refreshToken", "")
-            client_id = extra.get("clientId", "")
-            client_secret = extra.get("clientSecret", "")
-            session_token = extra.get("sessionToken", "")
-            profile_arn = extra.get("profileArn", "")
-            oauth_provider = (extra.get("oauthProvider", "") or "").strip().lower()
-            refresh_result = {"ok": False, "message": "当前账号未提供 refreshToken/clientId/clientSecret，跳过远端刷新校验"}
-
-            if refresh_token and client_id and client_secret:
-                ok, result = refresh_kiro_token(refresh_token, client_id, client_secret)
-                if ok:
-                    access_token = result["accessToken"]
-                    refresh_token = result.get("refreshToken", refresh_token)
-                    refresh_result = {
-                        "ok": True,
-                        "expiresIn": result.get("expiresIn", 0),
-                        "refreshTokenUpdated": refresh_token != extra.get("refreshToken", ""),
-                    }
-                else:
-                    refresh_result = {"ok": False, "message": result.get("error", "刷新失败")}
-
-            switch_kwargs = {}
-            if oauth_provider in ("google", "github"):
-                switch_kwargs["auth_method"] = "social"
-                switch_kwargs["provider"] = "Google" if oauth_provider == "google" else "GitHub"
-
-            ok, msg = switch_kiro_account(
-                access_token=access_token,
-                refresh_token=refresh_token,
-                client_id=client_id,
-                client_secret=client_secret,
-                **switch_kwargs,
-            )
-            if not ok:
-                return {"ok": False, "error": msg}
-
-            current = read_current_kiro_account() or {}
-            portal_state = get_kiro_portal_state(access_token, session_token, profile_arn=profile_arn) or {}
-            usage_summary = summarize_kiro_usage(portal_state)
-            restart_ok, restart_msg = restart_kiro_ide()
-            return {"ok": True, "data": {
-                "message": f"{msg}。{restart_msg}" if restart_ok else msg,
-                "access_token": access_token,
-                "accessToken": access_token,
-                "refreshToken": refresh_token,
-                "remote_validation": refresh_result,
-                "portal_user": portal_state.get("user_info", {}),
-                "usage_limits": portal_state.get("usage_limits", {}),
-                "available_subscription_plans": portal_state.get("available_subscription_plans", {}),
-                "usage_summary": usage_summary,
-                "portal_session": {
-                    "has_session_token": bool(session_token),
-                    "user_id": portal_state.get("user_id", ""),
-                    "profile_arn": portal_state.get("profile_arn", profile_arn),
-                    "available": portal_state.get("available", False),
-                    "error": portal_state.get("error", ""),
-                },
-                "local_app_account": {
-                    "provider": current.get("provider", ""),
-                    "authMethod": current.get("authMethod", ""),
-                    "accessTokenPreview": _mask_secret(current.get("accessToken", "")),
-                    "matches_target": _kiro_local_matches_target(current, access_token, refresh_token),
-                },
-                "restart": {"ok": restart_ok, "message": restart_msg},
-                "quota_note": "Kiro 可通过 Web Portal 查询订阅、试用与 credits 用量，但依赖 sessionToken 浏览器会话；若缺少会话则只能返回 token 刷新校验结果。",
-            }}
-
-        elif action_id == "refresh_token":
+        if action_id == "refresh_token":
             from platforms.kiro.switch import refresh_kiro_token
 
             refresh_token = extra.get("refreshToken", "")
