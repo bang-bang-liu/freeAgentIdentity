@@ -114,6 +114,13 @@ def _build_account_overview(platform: str, data: dict[str, Any]) -> dict[str, An
             overview["plus_trial_check_state"] = data.get("plus_trial_check_state")
         if data.get("plus_trial_error"):
             overview["plus_trial_error"] = data.get("plus_trial_error")
+    for key in (
+        "plus_trial_checkout_chain",
+        "plus_trial_checkout_state",
+        "plus_trial_checkout_error",
+    ):
+        if key in data:
+            overview[key] = data.get(key)
     if data.get("trial_length_days"):
         overview["trial_length_days"] = data.get("trial_length_days")
         overview["chips"].append(f"{data['trial_length_days']}天试用")

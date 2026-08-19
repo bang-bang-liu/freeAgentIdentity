@@ -78,6 +78,39 @@ def test_list_accounts_after_create(client):
     assert data["items"][0]["email"] == "test@example.com"
 
 
+def test_import_accounts_uses_email_password_totp_format(client):
+    response = client.post(
+        "/api/accounts/import",
+        json={
+            "platform": "chatgpt",
+            "lines": [
+                "imported@example.com----Secret Password----JBSWY3DPEHPK3PXP",
+                "legacy@example.com LegacyPassword https://example.com/cashier",
+                "email,password,cashier_url",
+                "missing-totp@example.com----Password----",
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"created": 1}
+
+    accounts = client.get("/api/accounts", params={"platform": "chatgpt"}).json()["items"]
+    assert len(accounts) == 1
+    account = accounts[0]
+    assert account["email"] == "imported@example.com"
+    assert account["password"] == "Secret Password"
+    assert account["cashier_url"] == ""
+    assert account["primary_token"] == ""
+    assert "totp_secret" not in account["overview"].get("legacy_extra", {})
+    assert any(
+        credential["scope"] == "platform"
+        and credential["key"] == "totp_secret"
+        and credential["value"] == "JBSWY3DPEHPK3PXP"
+        for credential in account["credentials"]
+    )
+
+
 def test_get_account_by_id(client):
     account_id = _create_account()
     resp = client.get(f"/api/accounts/{account_id}")

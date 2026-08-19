@@ -250,6 +250,8 @@ class AccountsRepository:
                         "credentials",
                         "provider_accounts",
                         "provider_resources",
+                        "totp_secret",
+                        "otpauth",
                     }
                     and value not in (None, "", [], {})
                 }
@@ -268,6 +270,8 @@ class AccountsRepository:
                     "cookies",
                     "cookie",
                     "api_key",
+                    "totp_secret",
+                    "otpauth",
                     "wos_session",
                     "sso",
                     "sso_rw",

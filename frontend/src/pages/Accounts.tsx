@@ -121,6 +121,15 @@ function getValidityChip(acc: any): { label: string; tone: 'emerald' | 'red' | '
   return { label: validity, tone: 'gray' }
 }
 
+function getCheckoutChainChip(acc: unknown): { label: 'cs' | 'oaics'; tone: 'sky' | 'violet'; title: string } | null {
+  const overview = getAccountOverview(acc)
+  if (overview?.plus_trial_checkout_state !== 'available') return null
+  const chain = String(overview?.plus_trial_checkout_chain || '').trim().toLowerCase()
+  if (chain === 'cs') return { label: 'cs', tone: 'sky', title: 'cs_live checkout' }
+  if (chain === 'oaics') return { label: 'oaics', tone: 'violet', title: 'oaics checkout' }
+  return null
+}
+
 function isTrialAccount(acc: any): boolean {
   const overview = getAccountOverview(acc)
   return (
@@ -218,11 +227,6 @@ function getSecuritySettings(acc: any) {
     totpSecret,
     otpauth,
   }
-}
-
-function getCashierUrl(acc: any) {
-  const overview = getAccountOverview(acc)
-  return overview?.cashier_url || acc?.cashier_url || ''
 }
 
 function formatSurvivalDuration(acc: any, now: number, language: string) {
@@ -932,6 +936,16 @@ function ActionResultHighlights({ payload }: { payload: any }) {
   )
 }
 
+function hidePromotionLinks(payload: unknown): unknown {
+  if (Array.isArray(payload)) return payload.map(hidePromotionLinks)
+  if (!payload || typeof payload !== 'object') return payload
+  return Object.fromEntries(
+    Object.entries(payload)
+      .filter(([key]) => !['url', 'cashier_url', 'cashierUrl', 'checkout_url', 'checkoutUrl'].includes(key))
+      .map(([key, value]) => [key, hidePromotionLinks(value)]),
+  )
+}
+
 function ActionResultModal({
   title,
   payload,
@@ -1202,16 +1216,7 @@ function ActionMenu({
             return
           }
           onChanged()
-          if (resp.data?.url || resp.data?.checkout_url || resp.data?.cashier_url) {
-            const actionUrl = resp.data?.url || resp.data?.checkout_url || resp.data?.cashier_url
-            window.open(actionUrl, '_blank')
-            try {
-              navigator.clipboard.writeText(actionUrl)
-            } catch {
-              // Ignore clipboard errors
-            }
-          }
-          onResult(action.label, resp.data)
+          onResult(action.label, hidePromotionLinks(resp.data))
           return
         }
         setActionTask({
@@ -1308,28 +1313,22 @@ function ActionMenu({
         return
       }
       onChanged()
-      const actionUrl = data?.url || data?.checkout_url || data?.cashier_url
-      if (actionUrl) {
-        window.open(actionUrl, '_blank')
-        try {
-          await navigator.clipboard.writeText(actionUrl)
-        } catch {
-          // ignore clipboard failures
-        }
-      }
-      if (data && typeof data === 'object') {
-        if (actionUrl) {
-          setToast({ type: 'success', text: data.message || '链接已在新标签打开并复制' })
-          return
-        }
-        const detailKeys = Object.keys(data).filter(key => !['message', 'url', 'checkout_url', 'cashier_url'].includes(key))
+      const visibleData = hidePromotionLinks(data)
+      if (visibleData && typeof visibleData === 'object' && !Array.isArray(visibleData)) {
+        const visibleRecord = visibleData as Record<string, unknown>
+        const detailKeys = Object.keys(visibleRecord).filter(key => key !== 'message')
         if (detailKeys.length > 0) {
-          onResult(actionTask.title, data)
+          onResult(actionTask.title, visibleRecord)
         }
-        setToast({ type: 'success', text: data.message || '操作成功' })
+        setToast({
+          type: 'success',
+          text: typeof visibleRecord.message === 'string' && visibleRecord.message
+            ? visibleRecord.message
+            : '操作成功',
+        })
         return
       }
-      setToast({ type: 'success', text: typeof data === 'string' && data ? data : '操作成功' })
+      setToast({ type: 'success', text: typeof visibleData === 'string' && visibleData ? visibleData : '操作成功' })
     } catch (error: any) {
       setToast({ type: 'error', text: error?.message || '读取任务结果失败' })
     }
@@ -1465,7 +1464,6 @@ function DetailModal({ acc, onClose, onSave }: { acc: any; onClose: () => void; 
   const [form, setForm] = useState({
     lifecycle_status: getLifecycleStatus(acc),
     primary_token: getPrimaryToken(acc),
-    cashier_url: getCashierUrl(acc),
   })
   const [saving, setSaving] = useState(false)
   const overview = getAccountOverview(acc)
@@ -1706,11 +1704,6 @@ function DetailModal({ acc, onClose, onSave }: { acc: any; onClose: () => void; 
             <textarea value={form.primary_token} onChange={e => setForm(f => ({ ...f, primary_token: e.target.value }))}
               rows={2} className="control-surface control-surface-mono resize-none" />
           </div>
-          <div>
-            <label className="text-xs text-[var(--text-muted)] block mb-1">试用链接</label>
-            <textarea value={form.cashier_url} onChange={e => setForm(f => ({ ...f, cashier_url: e.target.value }))}
-              rows={2} className="control-surface control-surface-mono resize-none" />
-          </div>
         </div>
         {/* ── Sticky Footer ── */}
         <div className="flex gap-3 px-6 py-4 border-t border-[var(--border)] shrink-0">
@@ -1726,23 +1719,52 @@ function DetailModal({ acc, onClose, onSave }: { acc: any; onClose: () => void; 
 function ImportModal({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
   const [text, setText] = useState('')
   const [loading, setLoading] = useState(false)
-  const [result, setResult] = useState<string | null>(null)
+  const [result, setResult] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
   const submit = async () => {
+    const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean)
+    if (lines.length === 0) {
+      setResult({ type: 'error', text: '请先填写要导入的账号' })
+      return
+    }
+    const invalidLineIndex = lines.findIndex(line => {
+      const parts = line.split('----')
+      if (parts.length !== 3) return true
+      const [email, password, totpSecret] = parts.map(part => part.trim())
+      return !email || !email.includes('@') || /\s/.test(email) || !password || !totpSecret
+    })
+    if (invalidLineIndex >= 0) {
+      setResult({ type: 'error', text: `第 ${invalidLineIndex + 1} 行格式不正确，请使用 邮箱----密码----totp` })
+      return
+    }
     setLoading(true)
+    setResult(null)
     try {
-      const lines = text.trim().split('\n').filter(Boolean)
       const res = await apiFetch('/accounts/import', { method: 'POST', body: JSON.stringify({ platform: 'chatgpt', lines }) })
-      setResult(`导入成功 ${res.created} 个`); onDone()
-    } catch (e: any) { setResult(`失败: ${e.message}`) } finally { setLoading(false) }
+      const created = Number(res?.created || 0)
+      if (created <= 0) {
+        setResult({ type: 'error', text: '没有账号被导入，请确认后端已更新并检查输入格式' })
+        return
+      }
+      setResult({ type: 'success', text: `导入成功 ${created} 个` })
+      onDone()
+    } catch (e: any) {
+      setResult({ type: 'error', text: `失败: ${e.message}` })
+    } finally {
+      setLoading(false)
+    }
   }
   return (
     <div className="dialog-backdrop" onClick={onClose}>
       <div className="dialog-panel dialog-panel-sm p-6" onClick={e => e.stopPropagation()}>
         <h2 className="text-base font-semibold text-[var(--text-primary)] mb-2">批量导入</h2>
-        <p className="text-xs text-[var(--text-muted)] mb-3">每行格式: <code className="bg-[var(--bg-hover)] px-1 rounded">email password [cashier_url]</code></p>
+        <p className="text-xs text-[var(--text-muted)] mb-3">每行格式: <code className="bg-[var(--bg-hover)] px-1 rounded">邮箱----密码----totp</code></p>
         <textarea value={text} onChange={e => setText(e.target.value)} rows={8}
           className="control-surface control-surface-mono resize-none mb-3" />
-        {result && <p className="text-sm text-emerald-400 mb-3">{result}</p>}
+        {result && (
+          <p className={`mb-3 text-sm ${result.type === 'success' ? 'text-emerald-400' : 'text-red-400'}`}>
+            {result.text}
+          </p>
+        )}
         <div className="flex gap-2">
           <Button onClick={submit} disabled={loading} className="flex-1">{loading ? '导入中...' : '导入'}</Button>
           <Button variant="outline" onClick={onClose} className="flex-1">取消</Button>
@@ -1907,7 +1929,7 @@ export default function Accounts() {
 
   
   const exportCsv = () => {
-    const header = 'email,password,display_status,lifecycle_status,plan_state,validity_status,cashier_url,created_at'
+    const header = 'email,password,display_status,lifecycle_status,plan_state,validity_status,created_at'
     const rowsSource = selectedIds.size > 0 ? accounts.filter(a => selectedIds.has(a.id)) : accounts
     const rows = rowsSource.map(a => [
       a.email,
@@ -1916,7 +1938,6 @@ export default function Accounts() {
       getLifecycleStatus(a),
       getPlanState(a),
       getValidityStatus(a),
-      getCashierUrl(a),
       a.created_at,
     ].map(escapeCsvField).join(','))
     const blob = new Blob([[header, ...rows].join('\n')], { type: 'text/csv' })
@@ -1945,19 +1966,28 @@ export default function Accounts() {
     })
   }
 
-  const copy = (text: string) => {
-    if (navigator.clipboard) { navigator.clipboard.writeText(text) }
-    else { const el = document.createElement('textarea'); el.value = text; document.body.appendChild(el); el.select(); document.execCommand('copy'); document.body.removeChild(el) }
+  const copy = async (text: string) => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text)
+        return
+      }
+    } catch {
+      // Fall through for browsers that expose Clipboard API without granting it.
+    }
+    const el = document.createElement('textarea')
+    el.value = text
+    document.body.appendChild(el)
+    el.select()
+    document.execCommand('copy')
+    document.body.removeChild(el)
   }
-  const emailApiLine = (email: string) =>
-    `${email} https://hsxhome.com/api/find/openai?email=${email}&t=fzKIywnF4KEGGB_i`
 
   const currentPlatformMeta = platformsMap[tab]
   const platformLabel = currentPlatformMeta?.display_name || tab
   const visibleTrial = accounts.filter(acc => getPlanState(acc) === 'trial').length
   const visibleSubscribed = accounts.filter(acc => getPlanState(acc) === 'subscribed').length
   const visibleInvalid = accounts.filter(acc => getValidityStatus(acc) === 'invalid' || getLifecycleStatus(acc) === 'invalid').length
-  const linkedCashier = accounts.filter(acc => Boolean(getCashierUrl(acc))).length
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-4 overflow-hidden">
@@ -1994,7 +2024,6 @@ export default function Accounts() {
               <span className="shrink-0 text-[var(--text-muted)]">{t('accounts.count', { count: total })}</span>
               {visibleTrial > 0 && <span className="flex items-center rounded-full bg-emerald-500/10 px-2 py-0.5 font-medium text-emerald-500 ring-1 ring-inset ring-emerald-500/20">{t('accounts.trial', { count: visibleTrial })}</span>}
               {visibleSubscribed > 0 && <span className="flex items-center rounded-full bg-blue-500/10 px-2 py-0.5 font-medium text-blue-500 ring-1 ring-inset ring-blue-500/20">{t('accounts.subscribed', { count: visibleSubscribed })}</span>}
-              {linkedCashier > 0 && <span className="flex items-center rounded-full bg-amber-500/10 px-2 py-0.5 font-medium text-amber-500 ring-1 ring-inset ring-amber-500/20">{t('accounts.linked', { count: linkedCashier })}</span>}
               {visibleInvalid > 0 && <span className="flex items-center rounded-full bg-red-500/10 px-2 py-0.5 font-medium text-red-500 ring-1 ring-inset ring-red-500/20">{t('accounts.invalid', { count: visibleInvalid })}</span>}
               {selectedCount > 0 && <span className="flex items-center rounded-full bg-[var(--text-primary)]/10 px-2 py-0.5 font-medium text-[var(--text-primary)] ring-1 ring-inset ring-[var(--text-primary)]/20">{t('accounts.selected', { count: selectedCount })}</span>}
             </div>
@@ -2178,7 +2207,7 @@ export default function Accounts() {
                 <td className="px-3 py-2.5 font-mono text-sm text-[var(--text-primary)] align-top">
                   <div className="flex min-w-0 items-center gap-1.5">
                     <span className="truncate tracking-tight" title={acc.email}>{acc.email}</span>
-                    <button onClick={e => { e.stopPropagation(); copy(emailApiLine(acc.email)) }} title="复制 Email+邮件API" className="text-[var(--text-muted)] hover:text-[var(--text-primary)] opacity-0 group-hover:opacity-100 transition-opacity"><Copy className="h-3 w-3" /></button>
+                    <button onClick={e => { e.stopPropagation(); copy(acc.email) }} title="复制邮箱" className="text-[var(--text-muted)] hover:text-[var(--text-primary)] opacity-0 group-hover:opacity-100 transition-opacity"><Copy className="h-3 w-3" /></button>
                   </div>
                   {verificationMailbox && (verificationMailbox.email || verificationMailbox.account_id || verificationMailbox.provider) && (
                     <div
@@ -2234,8 +2263,9 @@ export default function Accounts() {
                     {(() => {
                       const planChip = getPlanChip(acc)
                       const validityChip = getValidityChip(acc)
+                      const checkoutChainChip = getCheckoutChainChip(acc)
                       const trialActive = isTrialAccount(acc) && getDisplayStatus(acc) !== 'trial'
-                      if (!planChip && !validityChip && !trialActive) return null
+                      if (!planChip && !validityChip && !checkoutChainChip && !trialActive) return null
                       return (
                         <div className="flex max-w-full flex-wrap items-center gap-1">
                           {planChip && <StatusIconChip {...planChip} />}
@@ -2245,6 +2275,7 @@ export default function Accounts() {
                               label={translateAccountStatus(validityChip.label, language)}
                             />
                           )}
+                          {checkoutChainChip && <StatusIconChip {...checkoutChainChip} />}
                           {trialActive && (
                             <StatusIconChip
                               label={translateAccountStatus('trial', language)}

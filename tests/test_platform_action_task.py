@@ -43,6 +43,24 @@ class _FakeLogger:
         self.finished = (status, error)
 
 
+def test_account_overview_persists_chatgpt_checkout_chain():
+    overview = runtime_module._build_account_overview(
+        "chatgpt",
+        {
+            "valid": True,
+            "check_state": "valid",
+            "plus_trial_eligible": True,
+            "plus_trial_checkout_chain": "oaics",
+            "plus_trial_checkout_state": "available",
+            "plus_trial_checkout_error": None,
+        },
+    )
+
+    assert overview["plus_trial_checkout_chain"] == "oaics"
+    assert overview["plus_trial_checkout_state"] == "available"
+    assert overview["plus_trial_checkout_error"] is None
+
+
 def test_platform_action_task_passes_task_logger_to_runtime(monkeypatch):
     seen = {}
 

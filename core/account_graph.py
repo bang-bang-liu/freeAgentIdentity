@@ -54,6 +54,18 @@ PLATFORM_CREDENTIAL_TYPES: dict[str, str] = {
     "sso_rw": "cookie",
 }
 
+# Checkout sessions are ephemeral, but the chain type is useful account
+# metadata.  Keep the last known successful value across transient checks so
+# a direct-network timeout cannot make a previously detected chain disappear.
+CHECKOUT_OVERVIEW_KEYS = (
+    "plus_trial_checkout_chain",
+    "plus_trial_checkout_state",
+    "plus_trial_checkout_error",
+)
+SUPPORTED_CHECKOUT_CHAINS = {"cs", "oaics"}
+TRANSIENT_CHECK_STATES = {"unavailable", "unknown", "credential_missing"}
+DEFINITIVE_CHECK_STATES = {"invalid", "credential_invalid"}
+
 PRIMARY_TOKEN_WRITE_KEYS: dict[str, str] = {
     "cursor": "session_token",
     "chatgpt": "access_token",
@@ -89,6 +101,46 @@ def _safe_list(value: Any) -> list[Any]:
 
 def _text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _has_successful_checkout(summary: dict[str, Any]) -> bool:
+    state = _text(summary.get("plus_trial_checkout_state")).lower()
+    chain = _text(summary.get("plus_trial_checkout_chain")).lower()
+    return state == "available" and chain in SUPPORTED_CHECKOUT_CHAINS
+
+
+def merge_check_overview(
+    existing: dict[str, Any] | None,
+    incoming: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Merge a check result without erasing a successful checkout chain.
+
+    A failed network request is not evidence that the account changed.  Keep
+    the last successful checkout fields for transient failures and checkout
+    failures, while allowing a definitive invalid/credential-invalid result
+    to clear them.
+    """
+    previous = _safe_dict(existing)
+    updates = _safe_dict(incoming)
+    if not _has_successful_checkout(previous):
+        return updates
+
+    check_state = _text(updates.get("check_state")).lower()
+    checkout_state = _text(updates.get("plus_trial_checkout_state")).lower()
+    checkout_chain = _text(updates.get("plus_trial_checkout_chain")).lower()
+    checkout_succeeded = (
+        checkout_state == "available"
+        and checkout_chain in SUPPORTED_CHECKOUT_CHAINS
+    )
+    should_preserve = (
+        check_state in TRANSIENT_CHECK_STATES
+        or (not checkout_succeeded and check_state not in DEFINITIVE_CHECK_STATES)
+    )
+    if should_preserve:
+        for key in CHECKOUT_OVERVIEW_KEYS:
+            if key in previous:
+                updates[key] = previous[key]
+    return updates
 
 
 def _preview_secret(value: Any) -> str:
@@ -933,7 +985,7 @@ def patch_account_graph(
     current = _graph_for_account(session, account_id)
     summary = _safe_dict(current.get("overview"))
     if summary_updates:
-        summary.update(summary_updates)
+        summary.update(merge_check_overview(summary, summary_updates))
     if cashier_url is not None:
         summary["cashier_url"] = cashier_url
     if region is not None:

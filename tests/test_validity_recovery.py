@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 
 from sqlmodel import Session, select
@@ -45,6 +46,33 @@ class _UnavailablePlatform:
         }
 
 
+def test_chatgpt_unavailable_check_clears_checkout_chain(monkeypatch):
+    def _network_failure(account, proxy=None):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(
+        subscription,
+        "fetch_subscription_status_details",
+        _network_failure,
+    )
+    monkeypatch.setattr(proxy_pool, "get_next", lambda region="": None)
+
+    plugin = ChatGPTPlatform.__new__(ChatGPTPlatform)
+    plugin.config = RegisterConfig()
+    plugin.mailbox = None
+    account = type(
+        "AccountStub",
+        (),
+        {"token": "token", "region": "", "extra": {"access_token": "token"}},
+    )()
+
+    assert plugin.check_valid(account) is False
+    overview = plugin.get_last_check_overview()
+    assert overview["plus_trial_eligible"] is None
+    assert overview["plus_trial_checkout_chain"] is None
+    assert overview["plus_trial_checkout_state"] == "unavailable"
+
+
 def _create_account(*, platform: str = "chatgpt", lifecycle_status: str = "registered") -> int:
     with Session(engine) as session:
         model = AccountModel(platform=platform, email=f"{platform}@example.com", password="secret")
@@ -66,6 +94,24 @@ def _overview(account_id: int):
         return session.exec(
             select(AccountOverviewModel).where(AccountOverviewModel.account_id == account_id)
         ).one()
+
+
+def _seed_successful_checkout(account_id: int, chain: str = "cs") -> None:
+    with Session(engine) as session:
+        model = session.get(AccountModel, account_id)
+        assert model is not None
+        patch_account_graph(
+            session,
+            model,
+            summary_updates={
+                "check_state": "valid",
+                "valid": True,
+                "plus_trial_checkout_chain": chain,
+                "plus_trial_checkout_state": "available",
+                "plus_trial_checkout_error": None,
+            },
+        )
+        session.commit()
 
 
 def test_single_account_check_recovers_previously_invalid_account(monkeypatch):
@@ -111,6 +157,21 @@ def test_single_check_network_failure_keeps_validity_unknown(monkeypatch):
     assert overview.get_summary()["check_error"] == "connection timed out"
 
 
+def test_single_check_network_failure_keeps_successful_checkout_chain(monkeypatch):
+    account_id = _create_account(lifecycle_status="registered")
+    _seed_successful_checkout(account_id, chain="cs")
+    monkeypatch.setattr("application.tasks.get", lambda _platform: _UnavailablePlatform)
+
+    _run_single_account_check(account_id)
+
+    summary = _overview(account_id).get_summary()
+    assert summary["check_state"] == "unavailable"
+    assert summary["plus_trial_checkout_chain"] == "cs"
+    assert summary["plus_trial_checkout_state"] == "available"
+    assert summary["plus_trial_checkout_error"] is None
+    assert summary["check_error"] == "connection timed out"
+
+
 def test_lifecycle_network_failure_is_counted_as_check_error(monkeypatch):
     account_id = _create_account(lifecycle_status="registered")
     monkeypatch.setattr("core.lifecycle.get", lambda _platform: _UnavailablePlatform)
@@ -121,6 +182,21 @@ def test_lifecycle_network_failure_is_counted_as_check_error(monkeypatch):
     assert results["invalid"] == 0
     assert results["error"] == 1
     assert _overview(account_id).validity_status == "unknown"
+
+
+def test_lifecycle_network_failure_keeps_successful_checkout_chain(monkeypatch):
+    account_id = _create_account(lifecycle_status="registered")
+    _seed_successful_checkout(account_id, chain="oaics")
+    monkeypatch.setattr("core.lifecycle.get", lambda _platform: _UnavailablePlatform)
+
+    check_accounts_validity(platform="chatgpt", limit=10)
+
+    summary = _overview(account_id).get_summary()
+    assert summary["check_state"] == "unavailable"
+    assert summary["plus_trial_checkout_chain"] == "oaics"
+    assert summary["plus_trial_checkout_state"] == "available"
+    assert summary["plus_trial_checkout_error"] is None
+    assert summary["check_error"] == "connection timed out"
 
 
 def test_single_check_rejected_token_keeps_account_validity_unknown(monkeypatch):
@@ -275,6 +351,131 @@ def test_chatgpt_plus_trial_eligibility_is_false_for_paid_account(monkeypatch):
     assert result["plus_trial_eligible"] is False
 
 
+def test_chatgpt_plus_trial_reads_current_nested_account_response(monkeypatch):
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "accounts": {
+                    "account-other": {
+                        "account": {"id": "account-other", "plan_type": "free"},
+                        "entitlement": {"subscription_plan": "chatgptfreeplan"},
+                        "eligible_promo_campaigns": {},
+                    },
+                    "account-target": {
+                        "account": {"id": "account-target", "plan_type": "free"},
+                        "entitlement": {"subscription_plan": "chatgptfreeplan"},
+                        "eligible_promo_campaigns": {"plus": {"id": "plus-1-month-free"}},
+                    },
+                },
+                "account_ordering": ["account-other"],
+            }
+
+    claims = {
+        "https://api.openai.com/auth": {"chatgpt_account_id": "account-target"},
+    }
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+    access_token = f"header.{payload}.signature"
+    monkeypatch.setattr(subscription.requests, "get", lambda *_args, **_kwargs: _Resp())
+    account = type("AccountStub", (), {"access_token": access_token})()
+
+    result = subscription.fetch_plus_trial_eligibility(account)
+
+    assert result["plus_trial_eligible"] is True
+    assert result["plus_trial_plan_type"] == "free"
+    assert result["plus_trial_subscription_plan"] == "chatgptfreeplan"
+
+
+def test_chatgpt_plus_trial_checkout_reports_session_chain(monkeypatch):
+    captured: dict = {}
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"checkout_session_id": "cs_live_12345"}
+
+    def _fake_post(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return _Resp()
+
+    monkeypatch.setattr(subscription.requests, "post", _fake_post)
+    account = type(
+        "AccountStub",
+        (),
+        {
+            "access_token": "token",
+            "cookies": "oai-did=device",
+            "region": "DE",
+            "extra": {},
+        },
+    )()
+
+    result = subscription.fetch_plus_trial_checkout_chain(account, proxy="http://proxy:8080")
+
+    assert result == {
+        "plus_trial_checkout_state": "available",
+        "plus_trial_checkout_chain": "cs",
+    }
+    assert captured["url"].endswith("/backend-api/payments/checkout")
+    assert captured["json"]["billing_details"] == {"country": "DE", "currency": "EUR"}
+    assert captured["json"]["promo_campaign"]["promo_campaign_id"] == "plus-1-month-free"
+    assert captured["headers"]["Authorization"] == "Bearer token"
+    assert captured["proxies"] == {"http": "http://proxy:8080", "https": "http://proxy:8080"}
+    assert captured["cookies"] == {"oai-did": "device"}
+
+
+def test_chatgpt_checkout_chain_omits_promo_for_non_eligible_region(monkeypatch):
+    captured: dict = {}
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"checkout_session_id": "oaics_67890"}
+
+    def _fake_post(_url, **kwargs):
+        captured.update(kwargs)
+        return _Resp()
+
+    monkeypatch.setattr(subscription.requests, "post", _fake_post)
+    account = type(
+        "AccountStub",
+        (),
+        {"access_token": "token", "region": "GB", "checkout_with_promo": False, "extra": {}},
+    )()
+
+    result = subscription.fetch_plus_trial_checkout_chain(account)
+
+    assert result["plus_trial_checkout_chain"] == "oaics"
+    assert "promo_campaign" not in captured["json"]
+    assert captured["json"]["billing_details"] == {"country": "GB", "currency": "GBP"}
+
+
+def test_chatgpt_plus_trial_checkout_reports_oaics_chain(monkeypatch):
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"url": "https://chatgpt.com/checkout/openai_llc/oaics_67890"}
+
+    monkeypatch.setattr(subscription.requests, "post", lambda *_args, **_kwargs: _Resp())
+    account = type("AccountStub", (), {"access_token": "token", "extra": {}})()
+
+    result = subscription.fetch_plus_trial_checkout_chain(account)
+
+    assert result["plus_trial_checkout_state"] == "available"
+    assert result["plus_trial_checkout_chain"] == "oaics"
+
+
 def test_chatgpt_plus_trial_failure_does_not_fail_subscription_status(monkeypatch):
     class _Resp:
         status_code = 200
@@ -321,6 +522,15 @@ def test_chatgpt_check_valid_uses_proxy_pool_before_direct(monkeypatch):
         }
 
     monkeypatch.setattr(subscription, "fetch_subscription_status_details", _fake_status)
+    checkout_calls: list[tuple[bool, str | None]] = []
+    monkeypatch.setattr(
+        subscription,
+        "fetch_plus_trial_checkout_chain",
+        lambda account, proxy=None: checkout_calls.append((account.checkout_with_promo, proxy)) or {
+            "plus_trial_checkout_state": "available",
+            "plus_trial_checkout_chain": "cs",
+        },
+    )
     monkeypatch.setattr(proxy_pool, "get_next", lambda region="": "http://127.0.0.1:7890")
     monkeypatch.setattr(proxy_pool, "report_success", lambda url: proxy_events.append(("success", url)))
     monkeypatch.setattr(proxy_pool, "report_fail", lambda url: proxy_events.append(("fail", url)))
@@ -345,6 +555,7 @@ def test_chatgpt_check_valid_uses_proxy_pool_before_direct(monkeypatch):
     assert plugin.check_valid(account) is True
     assert calls == ["http://127.0.0.1:7890"]
     assert proxy_events == [("success", "http://127.0.0.1:7890")]
+    assert checkout_calls == [(False, "http://127.0.0.1:7890")]
     assert plugin.get_last_check_overview()["chatgpt_usage"] == {"plan_type": "free"}
 
 
@@ -357,6 +568,14 @@ def test_chatgpt_check_valid_surfaces_plus_trial_eligibility(monkeypatch):
             "source": "backend-api/me",
             "plus_trial_eligible": True,
             "plus_trial_check_state": "available",
+        },
+    )
+    monkeypatch.setattr(
+        subscription,
+        "fetch_plus_trial_checkout_chain",
+        lambda account, proxy=None: {
+            "plus_trial_checkout_state": "available",
+            "plus_trial_checkout_chain": "oaics",
         },
     )
     monkeypatch.setattr(proxy_pool, "get_next", lambda region="": None)
@@ -374,3 +593,79 @@ def test_chatgpt_check_valid_surfaces_plus_trial_eligibility(monkeypatch):
     overview = plugin.get_last_check_overview()
     assert overview["plus_trial_eligible"] is True
     assert "带Plus试用" in overview["chips"]
+    assert overview["plus_trial_checkout_chain"] == "oaics"
+
+
+def test_chatgpt_check_valid_detects_checkout_without_promo_eligibility(monkeypatch):
+    checkout_calls: list[bool] = []
+    monkeypatch.setattr(
+        subscription,
+        "fetch_subscription_status_details",
+        lambda account, proxy=None: {
+            "status": "free",
+            "source": "backend-api/me",
+            "plus_trial_eligible": False,
+            "plus_trial_check_state": "available",
+        },
+    )
+    monkeypatch.setattr(
+        subscription,
+        "fetch_plus_trial_checkout_chain",
+        lambda account, proxy=None: checkout_calls.append(account.checkout_with_promo) or {
+            "plus_trial_checkout_state": "available",
+            "plus_trial_checkout_chain": "cs",
+        },
+    )
+    monkeypatch.setattr(proxy_pool, "get_next", lambda region="": None)
+
+    plugin = ChatGPTPlatform.__new__(ChatGPTPlatform)
+    plugin.config = RegisterConfig()
+    plugin.mailbox = None
+    account = type(
+        "AccountStub",
+        (),
+        {"token": "token", "region": "GB", "extra": {"access_token": "token"}},
+    )()
+
+    assert plugin.check_valid(account) is True
+    overview = plugin.get_last_check_overview()
+    assert checkout_calls == [False]
+    assert overview["plus_trial_eligible"] is False
+    assert overview["plus_trial_checkout_chain"] == "cs"
+
+
+def test_chatgpt_check_valid_checkout_failure_does_not_fail_account_check(monkeypatch):
+    def _checkout_failure(account, proxy=None):
+        raise RuntimeError("checkout unavailable")
+
+    monkeypatch.setattr(
+        subscription,
+        "fetch_subscription_status_details",
+        lambda account, proxy=None: {
+            "status": "free",
+            "source": "backend-api/me",
+            "plus_trial_eligible": True,
+            "plus_trial_check_state": "available",
+        },
+    )
+    monkeypatch.setattr(
+        subscription,
+        "fetch_plus_trial_checkout_chain",
+        _checkout_failure,
+    )
+    monkeypatch.setattr(proxy_pool, "get_next", lambda region="": None)
+
+    plugin = ChatGPTPlatform.__new__(ChatGPTPlatform)
+    plugin.config = RegisterConfig()
+    plugin.mailbox = None
+    account = type(
+        "AccountStub",
+        (),
+        {"token": "token", "region": "", "extra": {"access_token": "token"}},
+    )()
+
+    assert plugin.check_valid(account) is True
+    overview = plugin.get_last_check_overview()
+    assert overview["plus_trial_checkout_chain"] is None
+    assert overview["plus_trial_checkout_state"] == "unavailable"
+    assert "checkout unavailable" in overview["plus_trial_checkout_error"]

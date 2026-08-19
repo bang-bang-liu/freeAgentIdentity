@@ -113,6 +113,127 @@ def test_chatgpt_query_state_uses_manual_proxy_without_fallback(monkeypatch):
     assert result["data"]["check_state"] == "valid"
 
 
+def test_chatgpt_query_state_checks_eligible_checkout_with_same_proxy(monkeypatch):
+    from platforms.chatgpt import subscription, switch
+
+    checkout_calls = []
+    platform = ChatGPTPlatform()
+    account = Account(
+        platform="chatgpt",
+        email="user@example.com",
+        password="secret",
+        user_id="account-123",
+        region="DE",
+    )
+    account.extra = {"access_token": "token", "cookies": "oai-did=device"}
+
+    monkeypatch.setattr(
+        switch,
+        "fetch_chatgpt_account_state",
+        lambda **kwargs: {
+            "valid": True,
+            "plus_trial_eligible": True,
+            "plus_trial_check_state": "available",
+        },
+    )
+
+    def fake_checkout(checkout_account, proxy=None):
+        checkout_calls.append({
+            "access_token": checkout_account.access_token,
+            "account_id": checkout_account.account_id,
+            "region": checkout_account.region,
+            "with_promo": checkout_account.checkout_with_promo,
+            "proxy": proxy,
+        })
+        return {
+            "plus_trial_checkout_state": "available",
+            "plus_trial_checkout_chain": "cs",
+        }
+
+    monkeypatch.setattr(subscription, "fetch_plus_trial_checkout_chain", fake_checkout)
+
+    result = platform.execute_action("query_state", account, {"proxy": "http://127.0.0.1:8080"})
+
+    assert checkout_calls == [{
+        "access_token": "token",
+        "account_id": "account-123",
+        "region": "DE",
+        "with_promo": True,
+        "proxy": "http://127.0.0.1:8080",
+    }]
+    assert result["data"]["check_state"] == "valid"
+    assert result["data"]["plus_trial_checkout_state"] == "available"
+    assert result["data"]["plus_trial_checkout_chain"] == "cs"
+
+
+def test_chatgpt_query_state_checks_checkout_when_promo_is_not_eligible(monkeypatch):
+    from platforms.chatgpt import subscription, switch
+
+    checkout_calls = []
+    platform = ChatGPTPlatform()
+    account = Account(
+        platform="chatgpt",
+        email="user@example.com",
+        password="secret",
+        region="GB",
+    )
+    account.extra = {"access_token": "token"}
+
+    monkeypatch.setattr(
+        switch,
+        "fetch_chatgpt_account_state",
+        lambda **kwargs: {
+            "valid": True,
+            "plus_trial_eligible": False,
+            "plus_trial_check_state": "available",
+        },
+    )
+
+    def fake_checkout(checkout_account, proxy=None):
+        checkout_calls.append((checkout_account.checkout_with_promo, proxy))
+        return {
+            "plus_trial_checkout_state": "available",
+            "plus_trial_checkout_chain": "oaics",
+        }
+
+    monkeypatch.setattr(subscription, "fetch_plus_trial_checkout_chain", fake_checkout)
+
+    result = platform.execute_action("query_state", account, {"proxy": "http://127.0.0.1:8080"})
+
+    assert checkout_calls == [(False, "http://127.0.0.1:8080")]
+    assert result["data"]["plus_trial_eligible"] is False
+    assert result["data"]["plus_trial_checkout_state"] == "available"
+    assert result["data"]["plus_trial_checkout_chain"] == "oaics"
+
+
+def test_chatgpt_query_state_checkout_failure_does_not_fail_state_query(monkeypatch):
+    from platforms.chatgpt import subscription, switch
+
+    platform = ChatGPTPlatform()
+    account = Account(platform="chatgpt", email="user@example.com", password="secret")
+    account.extra = {"access_token": "token"}
+
+    monkeypatch.setattr(
+        switch,
+        "fetch_chatgpt_account_state",
+        lambda **kwargs: {"valid": True, "plus_trial_eligible": True},
+    )
+    monkeypatch.setattr(
+        subscription,
+        "fetch_plus_trial_checkout_chain",
+        lambda account, proxy=None: (_ for _ in ()).throw(RuntimeError("checkout unavailable")),
+    )
+    monkeypatch.setattr(proxy_pool, "get_next", lambda region="": None)
+
+    result = platform.execute_action("query_state", account, {})
+
+    assert result["ok"] is True
+    assert result["data"]["check_state"] == "valid"
+    assert result["data"]["plus_trial_checkout_chain"] is None
+    assert result["data"]["plus_trial_checkout_state"] == "unavailable"
+    assert "checkout unavailable" in result["data"]["plus_trial_checkout_error"]
+
+
 def test_chatgpt_query_state_network_failure_is_not_invalid(monkeypatch):
     from platforms.chatgpt import switch
 

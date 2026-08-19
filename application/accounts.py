@@ -1,10 +1,5 @@
 from __future__ import annotations
 
-import ast
-import csv
-import json
-import re
-
 from core.datetime_utils import serialize_datetime
 from domain.accounts import (
     AccountImportLine,
@@ -16,26 +11,7 @@ from domain.accounts import (
 from infrastructure.accounts_repository import AccountsRepository
 
 
-IMPORT_LINE_RE = re.compile(
-    r'^\s*(?P<email>"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|\S+)'
-    r'\s+(?P<password>"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|\S+)'
-    r'(?:\s+(?P<extra>.*))?\s*$'
-)
-
-
-def _decode_import_token(value: str) -> str:
-    text = str(value or "").strip()
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
-        try:
-            decoded = ast.literal_eval(text)
-            return decoded if isinstance(decoded, str) else str(decoded)
-        except Exception:
-            return text[1:-1]
-    return text
-
-
-def _parse_csv_row(raw: str) -> list[str]:
-    return next(csv.reader([raw]))
+IMPORT_DELIMITER = "----"
 
 
 class AccountsService:
@@ -63,55 +39,25 @@ class AccountsService:
 
     def import_accounts(self, platform: str, lines: list[str]) -> dict:
         parsed: list[AccountImportLine] = []
-        csv_header: list[str] | None = None
         for line in lines:
             raw = line.strip()
             if not raw:
                 continue
-            if csv_header is None and "," in raw:
-                try:
-                    header_candidate = [item.strip().lower() for item in _parse_csv_row(raw)]
-                except Exception:
-                    header_candidate = []
-                if "email" in header_candidate and "password" in header_candidate:
-                    csv_header = header_candidate
-                    continue
-            if csv_header is not None:
-                try:
-                    values = _parse_csv_row(raw)
-                except Exception:
-                    values = []
-                if values:
-                    row = {
-                        csv_header[index]: values[index]
-                        for index in range(min(len(csv_header), len(values)))
-                    }
-                    email = str(row.get("email", "") or "").strip()
-                    password = str(row.get("password", "") or "")
-                    if email and password and "@" in email and " " not in email:
-                        extra = {}
-                        cashier_url = str(row.get("cashier_url", "") or "").strip()
-                        if cashier_url:
-                            extra["cashier_url"] = cashier_url
-                        parsed.append(AccountImportLine(email=email, password=password, extra=extra))
-                        continue
-            match = IMPORT_LINE_RE.match(raw)
-            if not match:
+            parts = raw.split(IMPORT_DELIMITER)
+            if len(parts) != 3:
                 continue
-            email = _decode_import_token(match.group("email"))
-            password = _decode_import_token(match.group("password"))
-            extra = {}
-            payload = (match.group("extra") or "").strip()
-            if payload:
-                try:
-                    decoded = json.loads(payload)
-                    if isinstance(decoded, dict):
-                        extra = decoded
-                    elif decoded not in (None, ""):
-                        extra = {"cashier_url": str(decoded)}
-                except Exception:
-                    extra = {"cashier_url": _decode_import_token(payload)}
-            parsed.append(AccountImportLine(email=email, password=password, extra=extra))
+            email, password, totp_secret = (part.strip() for part in parts)
+            if not email or "@" not in email or any(char.isspace() for char in email):
+                continue
+            if not password or not totp_secret:
+                continue
+            parsed.append(
+                AccountImportLine(
+                    email=email,
+                    password=password,
+                    extra={"totp_secret": totp_secret},
+                )
+            )
         return {"created": self.repository.import_lines(platform, parsed)}
 
     def get_stats(self) -> dict:

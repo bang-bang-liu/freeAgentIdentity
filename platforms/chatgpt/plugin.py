@@ -50,7 +50,10 @@ class ChatGPTPlatform(BasePlatform):
     def check_valid(self, account: Account) -> bool:
         self._last_check_overview = {}
         try:
-            from platforms.chatgpt.subscription import fetch_subscription_status_details
+            from platforms.chatgpt.subscription import (
+                fetch_plus_trial_checkout_chain,
+                fetch_subscription_status_details,
+            )
             from core.proxy_pool import proxy_pool
             class _A: pass
             a = _A()
@@ -59,8 +62,10 @@ class ChatGPTPlatform(BasePlatform):
             a.id_token = extra.get("id_token", "")
             a.cookies = extra.get("cookies", "")
             a.extra = extra
+            a.account_id = getattr(account, "user_id", "") or extra.get("account_id", "")
 
             region = str(getattr(account, "region", "") or extra.get("region", "") or "").strip()
+            a.region = region
             configured_proxy = self.config.proxy if self.config else None
             proxy_candidates: list[tuple[str | None, str, bool]] = []
             if configured_proxy:
@@ -113,6 +118,37 @@ class ChatGPTPlatform(BasePlatform):
                         overview["plus_trial_error"] = details.get("plus_trial_error")
                     if details.get("plus_trial_eligible") is True:
                         overview["chips"].append("带Plus试用")
+                    can_checkout = status not in ("expired", "invalid", "banned", None)
+                    if can_checkout:
+                        # Checkout-chain detection is intentionally
+                        # independent from the promotion-eligibility result.
+                        # Use the promo payload only when eligibility is
+                        # affirmative; a normal checkout still reveals
+                        # whether the backend uses cs or oaics in other
+                        # regions.
+                        a.checkout_with_promo = details.get("plus_trial_eligible") is True
+                        try:
+                            checkout_details = fetch_plus_trial_checkout_chain(a, proxy=proxy)
+                        except Exception as exc:
+                            checkout_details = {
+                                "plus_trial_checkout_state": "unavailable",
+                                "plus_trial_checkout_error": f"checkout_check_error: {exc}",
+                            }
+                        if not isinstance(checkout_details, dict):
+                            checkout_details = {
+                                "plus_trial_checkout_state": "unavailable",
+                                "plus_trial_checkout_error": "checkout check returned an invalid result",
+                            }
+                        overview["plus_trial_checkout_chain"] = checkout_details.get("plus_trial_checkout_chain")
+                        overview["plus_trial_checkout_state"] = checkout_details.get(
+                            "plus_trial_checkout_state",
+                            "unavailable",
+                        )
+                        overview["plus_trial_checkout_error"] = checkout_details.get("plus_trial_checkout_error")
+                    else:
+                        overview["plus_trial_checkout_chain"] = None
+                        overview["plus_trial_checkout_state"] = "unavailable"
+                        overview["plus_trial_checkout_error"] = "account status is not eligible for checkout detection"
                     if isinstance(details.get("usage"), dict):
                         overview["chatgpt_usage"] = details["usage"]
                     self._last_check_overview = overview
@@ -131,6 +167,13 @@ class ChatGPTPlatform(BasePlatform):
             "check_error": last_error or "State check did not reach ChatGPT",
             "network_path": last_network_path,
             "chips": ["检测失败"],
+            # Explicitly clear enrichment fields so a failed refresh cannot
+            # leave a stale promotion/checkout chain visible in the UI.
+            "plus_trial_eligible": None,
+            "plus_trial_check_state": "unavailable",
+            "plus_trial_checkout_chain": None,
+            "plus_trial_checkout_state": "unavailable",
+            "plus_trial_checkout_error": last_error or "State check did not reach ChatGPT",
         }
         return False
 
@@ -295,6 +338,8 @@ class ChatGPTPlatform(BasePlatform):
         a.access_token = extra.get("access_token") or account.token
         a.session_token = extra.get("session_token", "")
         a.cookies = extra.get("cookies", "")
+        a.id_token = extra.get("id_token", "")
+        a.extra = extra
 
         from core.proxy_pool import proxy_pool
         from platforms.chatgpt.switch import fetch_chatgpt_account_state
@@ -305,6 +350,8 @@ class ChatGPTPlatform(BasePlatform):
         manual_proxy = str((params or {}).get("proxy") or "").strip()
         configured_proxy = manual_proxy or (self.config.proxy if self.config else None)
         region = str(getattr(account, "region", "") or extra.get("region", "") or "").strip()
+        a.region = region
+        a.account_id = account.user_id or extra.get("account_id", "")
         proxy_candidates: list[tuple[str | None, str, bool]] = []
         if configured_proxy:
             proxy_candidates.append((configured_proxy, "manual_proxy" if manual_proxy else "explicit_proxy", False))
@@ -318,6 +365,7 @@ class ChatGPTPlatform(BasePlatform):
             proxy_candidates.append((None, "direct", False))
 
         data: dict = {}
+        successful_proxy: str | None = None
         for proxy, network_path, should_report in proxy_candidates:
             candidate = fetch_chatgpt_account_state(
                 access_token=a.access_token,
@@ -330,6 +378,7 @@ class ChatGPTPlatform(BasePlatform):
                 if should_report and proxy:
                     proxy_pool.report_success(proxy)
                 data = candidate
+                successful_proxy = proxy
                 break
             if should_report and proxy:
                 proxy_pool.report_fail(proxy)
@@ -352,6 +401,40 @@ class ChatGPTPlatform(BasePlatform):
             data["check_state"] = "invalid"
         else:
             data["check_state"] = "valid"
+
+        if data.get("check_state") == "valid":
+            from platforms.chatgpt.subscription import fetch_plus_trial_checkout_chain
+
+            # A positive eligibility result gets the promotional payload; all
+            # other valid accounts get a normal checkout request so chain
+            # detection still works in regions where the campaign is absent.
+            a.checkout_with_promo = data.get("plus_trial_eligible") is True
+            try:
+                checkout_details = fetch_plus_trial_checkout_chain(a, proxy=successful_proxy)
+            except Exception as exc:
+                checkout_details = {
+                    "plus_trial_checkout_state": "unavailable",
+                    "plus_trial_checkout_error": f"checkout_check_error: {exc}",
+                }
+            if not isinstance(checkout_details, dict):
+                checkout_details = {
+                    "plus_trial_checkout_state": "unavailable",
+                    "plus_trial_checkout_error": "checkout check returned an invalid result",
+                }
+            data["plus_trial_checkout_chain"] = checkout_details.get("plus_trial_checkout_chain")
+            data["plus_trial_checkout_state"] = checkout_details.get(
+                "plus_trial_checkout_state",
+                "unavailable",
+            )
+            data["plus_trial_checkout_error"] = checkout_details.get("plus_trial_checkout_error")
+        else:
+            data["plus_trial_checkout_chain"] = None
+            data["plus_trial_checkout_state"] = "unavailable"
+            data["plus_trial_checkout_error"] = (
+                data.get("plus_trial_error")
+                or data.get("check_error")
+                or "Plus trial eligibility is unavailable"
+            )
 
         return {"ok": True, "data": data}
 
