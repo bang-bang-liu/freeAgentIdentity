@@ -24,6 +24,7 @@ from core.base_mailbox import (
     BaseMailbox,
     MailboxAccount,
     _extract_verification_link,
+    _read_manual_code,
     _raise_if_cancelled,
     _sleep_with_cancel,
 )
@@ -76,6 +77,7 @@ class ApiMailboxPool(BaseMailbox):
     """Use fixed email addresses and poll their individual API URLs for OTPs."""
 
     _lock = threading.Lock()
+    _active_by_state_file: dict[str, set[str]] = {}
 
     def __init__(
         self,
@@ -95,6 +97,12 @@ class ApiMailboxPool(BaseMailbox):
         self.request_timeout = max(1.0, float(15 if request_timeout in (None, "") else request_timeout))
         self.proxy = {"http": proxy, "https": proxy} if proxy else None
         self.session = session or requests.Session()
+        # Reuse permits selecting a previously used address again, but never
+        # handing the same address to two concurrent workers.
+        state_key = str(self.state_file.expanduser().resolve())
+        with self._lock:
+            self._active = self._active_by_state_file.setdefault(state_key, set())
+        self._last_code_identity: dict[str, str] = {}
 
     @classmethod
     def from_config(cls, config: dict) -> "ApiMailboxPool":
@@ -132,13 +140,13 @@ class ApiMailboxPool(BaseMailbox):
         entries = self._entries()
         used = set((self._state().get("used") or {}).keys())
         for entry in entries:
+            if entry.key in self._active:
+                continue
             if self.allow_reuse or entry.key not in used:
                 return entry
         raise RuntimeError(f"API 邮箱池已用尽: total={len(entries)}")
 
     def _reserve(self, entry: ApiMailboxEntry) -> None:
-        if self.allow_reuse:
-            return
         state = self._state()
         used = dict(state.get("used") or {})
         used[entry.key] = {
@@ -155,6 +163,7 @@ class ApiMailboxPool(BaseMailbox):
     def get_email(self) -> MailboxAccount:
         with self._lock:
             entry = self._available_entry()
+            self._active.add(entry.key)
             self._reserve(entry)
         return MailboxAccount(
             email=entry.email,
@@ -183,6 +192,50 @@ class ApiMailboxPool(BaseMailbox):
                 },
             },
         )
+
+    def release_email(self, account: MailboxAccount | None) -> None:
+        if account is None:
+            return
+        key = str(getattr(account, "account_id", "") or getattr(account, "email", "")).strip().lower()
+        if key:
+            with self._lock:
+                self._active.discard(key)
+
+    def list_mailboxes(self) -> list[dict]:
+        used = dict(self._state().get("used") or {})
+        return [
+            {
+                "email": entry.email,
+                "key": entry.key,
+                "used": entry.key in used,
+                "active": entry.key in self._active,
+            }
+            for entry in self._entries()
+        ]
+
+    def set_mailbox_used(self, email: str, used: bool = False) -> bool:
+        key = str(email or "").strip().lower()
+        if not key:
+            raise ValueError("邮箱不能为空")
+        entry = next((item for item in self._entries() if item.key == key), None)
+        if entry is None:
+            raise ValueError(f"API 邮箱池未找到账号: {email}")
+        with self._lock:
+            if not used and key in self._active:
+                raise ValueError(f"API 邮箱 {entry.email} 当前使用中，不能重置")
+            state = self._state()
+            used_map = dict(state.get("used") or {})
+            if used:
+                used_map[key] = {
+                    "email": entry.email,
+                    "reserved_at": datetime.now(timezone.utc).isoformat(),
+                    "source_id": self._source_id(),
+                }
+            else:
+                used_map.pop(key, None)
+            state["used"] = used_map
+            self._save_state(state)
+        return True
 
     def _entry_for_account(self, account: MailboxAccount) -> ApiMailboxEntry:
         extra = dict(getattr(account, "extra", {}) or {})
@@ -311,6 +364,9 @@ class ApiMailboxPool(BaseMailbox):
         except Exception:
             return set()
 
+    def get_last_code_identity(self, account: MailboxAccount) -> str | None:
+        return self._last_code_identity.get(str(account.email or "").strip().lower()) or None
+
     def wait_for_code(
         self,
         account: MailboxAccount,
@@ -319,6 +375,7 @@ class ApiMailboxPool(BaseMailbox):
         before_ids: set | None = None,
         code_pattern: str | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        manual_code_check: Callable[[], str | None] | None = None,
     ) -> str:
         del keyword  # This API exposes the requested mailbox's code directly.
         entry = self._entry_for_account(account)
@@ -327,18 +384,45 @@ class ApiMailboxPool(BaseMailbox):
         last_error = ""
         while time.monotonic() < deadline:
             _raise_if_cancelled(cancel_check)
+            manual_code = _read_manual_code(manual_code_check)
+            if manual_code:
+                return manual_code
             try:
                 payload, raw = self._request(entry)
                 code = self._extract_code(payload, raw, code_pattern=code_pattern)
                 signatures = self._signatures(payload, raw)
                 code_signature = f"code:{code}" if code else ""
-                if code and code_signature not in seen:
-                    return code
+                # ``code:<digits>`` is not a message identity.  A later
+                # response may legitimately contain the same numeric OTP in a
+                # newly delivered message; use the body/link signature to
+                # distinguish that case.  Exact-repeat responses remain
+                # ignored as stale.
+                new_signatures = signatures.difference(seen)
+                has_new_message_signature = any(
+                    not signature.startswith("code:")
+                    for signature in new_signatures
+                )
+                if code and (code_signature not in seen or has_new_message_signature):
+                    body_identity = next(
+                        (signature for signature in signatures if signature.startswith("body:")),
+                        "",
+                    )
+                    if body_identity:
+                        self._last_code_identity[str(account.email or "").strip().lower()] = body_identity
+                    return _read_manual_code(manual_code_check) or code
                 seen.update(signatures)
             except Exception as exc:
                 last_error = str(exc).strip() or exc.__class__.__name__
-            _raise_if_cancelled(cancel_check)
-            _sleep_with_cancel(self.poll_interval, cancel_check)
+            manual_code = _sleep_with_cancel(
+                self.poll_interval,
+                cancel_check,
+                manual_code_check,
+            )
+            if manual_code:
+                return manual_code
+        manual_code = _read_manual_code(manual_code_check)
+        if manual_code:
+            return manual_code
         suffix = f"，最后错误: {last_error}" if last_error else ""
         raise TimeoutError(f"等待 API 邮箱验证码超时 ({timeout}s){suffix}")
 

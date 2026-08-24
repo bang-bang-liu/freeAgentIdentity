@@ -12,7 +12,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { getTaskStatusText, TASK_STATUS_VARIANTS } from '@/lib/tasks'
-import { RefreshCw, Copy, Download, Upload, Plus, X, Mail, Trash2, Zap, UserCheck, FlaskConical, Crown, Clock, CircleX, Sparkles, BadgeCheck, Gift, Circle } from 'lucide-react'
+import { RefreshCw, Copy, Download, Upload, Plus, X, Mail, Trash2, UserCheck, FlaskConical, Crown, Clock, CircleX, Sparkles, BadgeCheck, Gift, Circle } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 
 const STATUS_VARIANT: Record<string, any> = {
@@ -29,6 +29,21 @@ const QUERY_PROXY_PRESETS = [
   'http://127.0.0.1:7897',
   'http://127.0.0.1:7890',
 ]
+const TRIAL_COUNTRY_OPTIONS = [
+  ['PH', '菲律宾'],
+  ['JP', '日本'],
+  ['GB', '英国'],
+  ['US', '美国'],
+  ['TH', '泰国'],
+  ['VN', '越南'],
+  ['BR', '巴西'],
+  ['CA', '加拿大'],
+  ['AU', '澳大利亚'],
+  ['DE', '德国'],
+  ['FR', '法国'],
+  ['SG', '新加坡'],
+] as const
+const TRIAL_COUNTRY_LABELS: Record<string, string> = Object.fromEntries(TRIAL_COUNTRY_OPTIONS)
 
 function getAccountOverview(acc: any) {
   return acc?.overview || {}
@@ -128,6 +143,18 @@ function getCheckoutChainChip(acc: unknown): { label: 'cs' | 'oaics'; tone: 'sky
   if (chain === 'cs') return { label: 'cs', tone: 'sky', title: 'cs_live checkout' }
   if (chain === 'oaics') return { label: 'oaics', tone: 'violet', title: 'oaics checkout' }
   return null
+}
+
+function getGCashChip(acc: unknown): { label: 'GCash'; tone: 'emerald'; title: string } | null {
+  const overview = getAccountOverview(acc)
+  const chips = Array.isArray(overview?.chips) ? overview.chips : []
+  const qualifies = overview?.gcash_eligible === true
+    || overview?.gcash_qualified === true
+    || overview?.gcash_available === true
+  if (!qualifies && !chips.some((chip: unknown) => String(chip || '').trim().toLowerCase() === 'gcash')) {
+    return null
+  }
+  return { label: 'GCash', tone: 'emerald', title: 'GCash' }
 }
 
 function isTrialAccount(acc: any): boolean {
@@ -336,7 +363,7 @@ function buildActionParamDraft(action: any, acc: any) {
       draft[param?.key || ''] = String(options[0] ?? '')
       return
     }
-    draft[param?.key || ''] = ''
+    draft[param?.key || ''] = param?.type === 'checkbox' ? 'false' : ''
   })
   return draft
 }
@@ -366,6 +393,7 @@ function RegisterModal({
   const [concurrency, setConcurrency] = useState(1)
   const [dynamicProxy, setDynamicProxy] = useState('')
   const [outlookPoolText, setOutlookPoolText] = useState('')
+  const [enableTwoFactorPassword, setEnableTwoFactorPassword] = useState(true)
   const [autoUploadSub2Api, setAutoUploadSub2Api] = useState(false)
   const [sub2ApiConfigOpen, setSub2ApiConfigOpen] = useState(false)
   const [sub2ApiUrl, setSub2ApiUrl] = useState('http://127.0.0.1:8080')
@@ -476,6 +504,22 @@ function RegisterModal({
   const selectedMailboxProvider = enabledMailboxProviders.find(
     item => item.provider_key === selection.mailboxProvider,
   ) || defaultMailboxProvider
+  const selectedMailboxLabel = selectedMailboxProvider?.display_name
+    || selectedMailboxProvider?.catalog_label
+    || selectedMailboxProvider?.provider_key
+    || '-'
+  const isProtocolOutlookPool = selection.executorType === 'protocol'
+    && selectedMailboxProvider?.provider_key === 'local_ms_pool'
+  const hasConfiguredOutlookPool = Boolean(
+    selectedMailboxProvider?.config?.local_ms_pool_file
+    || selectedMailboxProvider?.auth?.local_ms_pool_text
+    || selectedMailboxProvider?.config?.local_ms_pool_text,
+  )
+  const mailboxSelectionMissing = selection.identityProvider === 'mailbox'
+    && !selectedMailboxProvider?.provider_key
+  const outlookPoolMissing = isProtocolOutlookPool
+    && !outlookPoolText.trim()
+    && !hasConfiguredOutlookPool
 
   const start = async () => {
     setStarting(true)
@@ -487,20 +531,21 @@ function RegisterModal({
       }
       const extra: Record<string, any> = {
         identity_provider: selection.identityProvider,
+        enable_2fa_password: enableTwoFactorPassword,
         auto_upload_sub2api_agent_identity: autoUploadSub2Api,
       }
       if (selection.identityProvider === 'mailbox') {
-        if (selection.executorType === 'protocol') {
-          if (!outlookPoolText.trim()) {
+        if (!selectedMailboxProvider?.provider_key) {
+          throw new Error(t('accounts.missingDefaultMailbox'))
+        }
+        extra.mail_provider = selectedMailboxProvider.provider_key
+        if (isProtocolOutlookPool) {
+          if (!outlookPoolText.trim() && !hasConfiguredOutlookPool) {
             throw new Error(t('accounts.outlookPoolRequired'))
           }
-          extra.mail_provider = 'local_ms_pool'
-          extra.local_ms_pool_text = outlookPoolText.trim()
-        } else {
-          if (!selectedMailboxProvider?.provider_key) {
-            throw new Error(t('accounts.missingDefaultMailbox'))
+          if (outlookPoolText.trim()) {
+            extra.local_ms_pool_text = outlookPoolText.trim()
           }
-          extra.mail_provider = selectedMailboxProvider.provider_key
         }
       }
       const res = await apiFetch('/tasks/register', {
@@ -527,7 +572,7 @@ function RegisterModal({
   }
 
   const dialog = (
-    <div className="dialog-backdrop" onClick={!taskId ? onClose : undefined}>
+    <div className="dialog-backdrop">
       <div className="dialog-panel dialog-panel-md flex flex-col"
            onClick={e => e.stopPropagation()} style={{maxHeight: '88vh'}}>
         <div className="flex items-center justify-between px-6 py-4 border-b border-[var(--border)]">
@@ -604,7 +649,7 @@ function RegisterModal({
                   </div>
                 </div>
 
-                {selection.identityProvider === 'mailbox' && selection.executorType !== 'protocol' ? (
+                {selection.identityProvider === 'mailbox' ? (
                   <div>
                     <label className="text-xs text-[var(--text-muted)] block mb-1">
                       {t('register.mailboxService')}
@@ -628,7 +673,7 @@ function RegisterModal({
                   </div>
                 ) : null}
 
-                {selection.executorType === 'protocol' ? (
+                {isProtocolOutlookPool ? (
                   <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-pane)]/45 p-4">
                     <label className="text-sm font-semibold text-[var(--text-primary)] block mb-1">
                       {t('accounts.outlookPoolLabel')}
@@ -639,6 +684,11 @@ function RegisterModal({
                     <div className="mb-2 text-xs text-sky-300">
                       {t('accounts.outlookAliasHint')}
                     </div>
+                    {hasConfiguredOutlookPool ? (
+                      <div className="mb-2 text-xs text-emerald-300">
+                        {t('accounts.outlookPoolConfiguredHint')}
+                      </div>
+                    ) : null}
                     <textarea
                       value={outlookPoolText}
                       onChange={(event) => setOutlookPoolText(event.target.value)}
@@ -647,6 +697,27 @@ function RegisterModal({
                       placeholder={t('accounts.outlookPoolPlaceholder')}
                       className="control-surface w-full resize-y font-mono text-xs"
                     />
+                  </div>
+                ) : null}
+
+                {platformMeta?.name === 'chatgpt' || platformMeta?.value === 'chatgpt' ? (
+                  <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-pane)]/45 px-4 py-3">
+                    <label className="flex cursor-pointer items-start gap-3">
+                      <input
+                        type="checkbox"
+                        checked={enableTwoFactorPassword}
+                        onChange={(event) => setEnableTwoFactorPassword(event.target.checked)}
+                        className="mt-0.5 h-4 w-4 accent-[var(--accent)]"
+                      />
+                      <span>
+                        <span className="block text-sm font-medium text-[var(--text-primary)]">
+                          {t('accounts.enableTwoFactorPassword')}
+                        </span>
+                        <span className="mt-1 block text-xs text-[var(--text-muted)]">
+                          {t('accounts.enableTwoFactorPasswordHint')}
+                        </span>
+                      </span>
+                    </label>
                   </div>
                 ) : null}
 
@@ -703,7 +774,7 @@ function RegisterModal({
                       type="text"
                       value={dynamicProxy}
                       onChange={(e) => setDynamicProxy(e.target.value)}
-                      placeholder="http://user:pass@host:port"
+                      placeholder="http://proxy.example.com:8080"
                       spellCheck={false}
                       className="control-surface control-surface-compact w-full font-mono text-xs"
                     />
@@ -716,14 +787,14 @@ function RegisterModal({
                 <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-hover)] px-4 py-3 text-xs text-[var(--text-secondary)]">
                   <div>{t('accounts.identitySummary')}: <span className="text-[var(--text-primary)]">{selectedRegistration?.label || '-'}</span></div>
                   <div className="mt-1">{t('accounts.executorSummary')}: <span className="text-[var(--text-primary)]">{selectedExecutor?.label || '-'}</span></div>
-                  {selection.identityProvider === 'mailbox' && selection.executorType !== 'protocol' ? (
+                  {selection.identityProvider === 'mailbox' ? (
                     <div className="mt-1">{t('register.mailboxService')}: <span className="text-[var(--text-primary)]">
-                      {selectedMailboxProvider?.display_name || selectedMailboxProvider?.catalog_label || '-'}
+                      {selectedMailboxLabel}
                     </span></div>
                   ) : null}
                   <div className="mt-1">{t('accounts.verificationSummary')}: <span className="text-[var(--text-primary)]">{
                     selection.executorType === 'protocol'
-                      ? t('accounts.protocolVerificationSummary')
+                      ? t('accounts.protocolVerificationSummary', { provider: selectedMailboxLabel })
                       : getCaptchaStrategyLabel(selection.executorType, configOptions.captcha_policy, configOptions.captcha_providers, language)
                   }</span></div>
                 </div>
@@ -736,7 +807,7 @@ function RegisterModal({
 
                 <Button
                   onClick={start}
-                  disabled={starting || !selection.identityProvider || !selection.executorType || (selection.executorType === 'protocol' && !outlookPoolText.trim()) || (autoUploadSub2Api && (!sub2ApiUrl.trim() || !sub2ApiApiKey.trim()))}
+                  disabled={starting || !selection.identityProvider || !selection.executorType || mailboxSelectionMissing || outlookPoolMissing || (autoUploadSub2Api && (!sub2ApiUrl.trim() || !sub2ApiApiKey.trim()))}
                   className="w-full"
                 >
                   {starting ? t('accounts.starting') : t('accounts.startAutoRegister')}
@@ -760,10 +831,6 @@ function RegisterModal({
       {sub2ApiConfigOpen ? (
         <div
           className="fixed inset-0 z-[120] flex items-center justify-center bg-black/60 p-4"
-          onClick={(event) => {
-            event.stopPropagation()
-            setSub2ApiConfigOpen(false)
-          }}
         >
           <div
             className="w-full max-w-md rounded-2xl border border-[var(--border)] bg-[var(--bg-card)] p-5 shadow-xl"
@@ -958,7 +1025,7 @@ function ActionResultModal({
   const content = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2)
 
   return (
-    <div className="dialog-backdrop" onClick={onClose}>
+    <div className="dialog-backdrop">
       <div
         className="dialog-panel dialog-panel-lg"
         onClick={e => e.stopPropagation()}
@@ -1004,7 +1071,7 @@ function ActionTaskModal({
 }) {
   const { t, language } = useI18n()
   return (
-    <div className="dialog-backdrop" onClick={onClose}>
+    <div className="dialog-backdrop">
       <div
         className="dialog-panel flex w-[min(960px,calc(100vw-32px))] max-w-none flex-col overflow-hidden"
         onClick={e => e.stopPropagation()}
@@ -1046,6 +1113,156 @@ function ActionTaskModal({
   )
 }
 
+function BatchCheckProxyModal({
+  defaultProxy,
+  selectedCount,
+  submitting,
+  kind = 'status',
+  onClose,
+  onSubmit,
+}: {
+  defaultProxy: string
+  selectedCount: number
+  submitting: boolean
+  kind?: 'status' | 'gcash' | 'trial'
+  onClose: () => void
+  onSubmit: (proxy: string, checkChain: boolean, country: string) => void | Promise<void>
+}) {
+  const { t } = useI18n()
+  const [proxy, setProxy] = useState(defaultProxy)
+  const [country, setCountry] = useState('PH')
+  const [checkChain, setCheckChain] = useState(kind !== 'status')
+
+  useEffect(() => {
+    setProxy(defaultProxy)
+    setCountry('PH')
+    setCheckChain(kind !== 'status')
+  }, [defaultProxy, kind])
+
+  const normalizedProxy = proxy.trim()
+  const selectedPreset = QUERY_PROXY_PRESETS.includes(normalizedProxy)
+    ? normalizedProxy
+    : '__manual__'
+
+  return (
+    <div className="dialog-backdrop">
+      <div
+        className="dialog-panel dialog-panel-md"
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-6 py-4 border-b border-[var(--border)]">
+          <div>
+            <h2 className="text-base font-semibold text-[var(--text-primary)]">
+              {kind === 'gcash'
+                ? t('accounts.gcashCheckProxyTitle')
+                : kind === 'trial' ? t('accounts.trialCheckProxyTitle') : t('accounts.batchCheckProxyTitle')}
+            </h2>
+            <p className="mt-0.5 text-xs text-[var(--text-muted)]">
+              {selectedCount > 0
+                ? kind === 'gcash'
+                  ? t('accounts.gcashCheckSelected', { count: selectedCount })
+                  : t('accounts.batchCheckSelected', { count: selectedCount })
+                : kind === 'gcash'
+                  ? t('accounts.gcashCheck')
+                  : kind === 'trial' ? t('accounts.trialCheck') : t('accounts.batchCheckAll')}
+            </p>
+          </div>
+          <button
+            onClick={onClose}
+            disabled={submitting}
+            className="text-[var(--text-muted)] hover:text-[var(--text-primary)] disabled:opacity-50"
+            aria-label={t('common.close')}
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <div className="space-y-3 px-6 py-5">
+          {kind === 'trial' && (
+            <label className="block">
+              <div className="mb-1.5 text-xs text-[var(--text-muted)]">{t('accounts.trialCheckCountry')}</div>
+              <select
+                value={country}
+                onChange={event => setCountry(event.target.value)}
+                disabled={submitting}
+                className="w-full rounded-xl border border-[var(--border)] bg-[var(--bg-hover)] px-3 py-2 text-sm text-[var(--text-primary)] outline-none focus:border-[var(--text-accent)] disabled:opacity-60"
+              >
+                {TRIAL_COUNTRY_OPTIONS.map(([code, label]) => (
+                  <option key={code} value={code}>{label} ({code})</option>
+                ))}
+              </select>
+            </label>
+          )}
+          <label className="block">
+            <div className="mb-1.5 text-xs text-[var(--text-muted)]">
+              {kind === 'gcash'
+                ? t('accounts.gcashCheckProxyLabel')
+                : kind === 'trial' ? t('accounts.trialCheckProxyLabel') : t('accounts.batchCheckProxyLabel')}
+            </div>
+            <div className="flex flex-col gap-2 sm:flex-row">
+              <select
+                value={selectedPreset}
+                onChange={event => {
+                  const next = event.target.value === '__manual__' ? '' : event.target.value
+                  setProxy(next)
+                }}
+                disabled={submitting}
+                className="w-full shrink-0 rounded-xl border border-[var(--border)] bg-[var(--bg-hover)] px-3 py-2 text-sm text-[var(--text-primary)] outline-none focus:border-[var(--text-accent)] disabled:opacity-60 sm:w-[190px]"
+              >
+                {QUERY_PROXY_PRESETS.map(option => (
+                  <option key={option} value={option}>{option}</option>
+                ))}
+                <option value="__manual__">{t('accounts.batchCheckProxyManual')}</option>
+              </select>
+              <input
+                type="text"
+                value={proxy}
+                onChange={event => setProxy(event.target.value)}
+                disabled={submitting}
+                placeholder="http://127.0.0.1:7897"
+                autoFocus
+                className="min-w-0 flex-1 rounded-xl border border-[var(--border)] bg-[var(--bg-hover)] px-3 py-2 text-sm text-[var(--text-primary)] outline-none focus:border-[var(--text-accent)] disabled:opacity-60"
+              />
+            </div>
+          </label>
+          <p className="text-xs text-[var(--text-muted)]">
+            {kind === 'gcash'
+              ? t('accounts.gcashCheckProxyHint')
+              : kind === 'trial' ? t('accounts.trialCheckProxyHint') : t('accounts.batchCheckProxyHint')}
+          </p>
+          {kind !== 'gcash' && (
+            <label className="flex items-center gap-2 text-xs text-[var(--text-secondary)]">
+              <input
+                type="checkbox"
+                checked={checkChain}
+                onChange={event => setCheckChain(event.target.checked)}
+                disabled={submitting}
+                className="h-4 w-4 accent-[var(--text-accent)]"
+              />
+              {kind === 'trial' ? t('accounts.trialCheckChain') : t('accounts.batchCheckChain')}
+            </label>
+          )}
+        </div>
+        <div className="flex gap-3 border-t border-[var(--border)] px-6 py-4">
+          <Button
+            onClick={() => onSubmit(normalizedProxy, checkChain, country)}
+            disabled={submitting || !normalizedProxy}
+            className="flex-1"
+          >
+            {submitting
+              ? t('accounts.batchChecking')
+              : kind === 'gcash'
+                ? t('accounts.gcashCheckStart')
+                : kind === 'trial' ? t('accounts.trialCheckStart') : t('accounts.batchCheckProxyStart')}
+          </Button>
+          <Button variant="outline" onClick={onClose} disabled={submitting} className="flex-1">
+            {t('common.cancel')}
+          </Button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function ActionParamsModal({
   action,
   initialValues,
@@ -1059,17 +1276,20 @@ function ActionParamsModal({
   onClose: () => void
   onSubmit: (params: Record<string, string>) => void
 }) {
+  const { t } = useI18n()
   const [form, setForm] = useState<Record<string, string>>(initialValues)
 
   useEffect(() => {
-    setForm(initialValues)
+    setForm(action?.id === 'query_state'
+      ? { ...initialValues, check_chain: initialValues.check_chain ?? 'false' }
+      : initialValues)
   }, [action?.id, initialValues])
 
   const params = Array.isArray(action?.params) ? action.params : []
   const missingRequired = params.some((param: any) => param?.required && !String(form[param.key] ?? '').trim())
 
   return (
-    <div className="dialog-backdrop" onClick={onClose}>
+    <div className="dialog-backdrop">
       <div
         className="dialog-panel dialog-panel-md"
         onClick={e => e.stopPropagation()}
@@ -1121,6 +1341,35 @@ function ActionParamsModal({
                 </label>
               )
             }
+            if (param.type === 'checkbox') {
+              return (
+                <label key={param.key} className="flex items-center gap-2 text-sm text-[var(--text-secondary)]">
+                  <input
+                    type="checkbox"
+                    checked={String(value).toLowerCase() === 'true' || String(value) === '1'}
+                    onChange={event => setForm(current => ({ ...current, [param.key]: String(event.target.checked) }))}
+                    className="h-4 w-4 accent-[var(--text-accent)]"
+                  />
+                  {param.label || param.key}
+                </label>
+              )
+            }
+            if (param.type === 'country') {
+              return (
+                <label key={param.key} className="block">
+                  <div className="mb-1 text-xs text-[var(--text-muted)]">{param.label || param.key}</div>
+                  <select
+                    value={value}
+                    onChange={event => setForm(current => ({ ...current, [param.key]: event.target.value }))}
+                    className="w-full rounded-xl border border-[var(--border)] bg-[var(--bg-hover)] px-3 py-2 text-sm outline-none focus:border-[var(--text-accent)]"
+                  >
+                    {(Array.isArray(param.options) ? param.options : ['PH']).map((option: string) => (
+                      <option key={option} value={option}>{TRIAL_COUNTRY_LABELS[option] || option} ({option})</option>
+                    ))}
+                  </select>
+                </label>
+              )
+            }
             if (Array.isArray(param.options) && param.options.length > 0) {
               return (
                 <label key={param.key} className="block">
@@ -1164,12 +1413,27 @@ function ActionParamsModal({
               </label>
             )
           })}
+          {action?.id === 'query_state' && (
+            <label className="flex items-center gap-2 text-sm text-[var(--text-secondary)]">
+              <input
+                type="checkbox"
+                checked={String(form.check_chain || '').toLowerCase() === 'true' || String(form.check_chain || '') === '1'}
+                onChange={event => setForm(current => ({ ...current, check_chain: String(event.target.checked) }))}
+                className="h-4 w-4 accent-[var(--text-accent)]"
+              />
+              {t('accounts.batchCheckChain')}
+            </label>
+          )}
         </div>
         <div className="relative px-6 py-4 border-t border-[var(--border)] flex gap-3">
           {missingRequired && (
             <div className="absolute left-6 -translate-y-7 text-[11px] text-[#f0b0b0]">请填写必填参数</div>
           )}
-          <Button onClick={() => onSubmit(form)} disabled={submitting || missingRequired} className="flex-1">
+          <Button
+            onClick={() => onSubmit(action?.id === 'query_state' ? { ...form, check_chain: form.check_chain ?? 'false' } : form)}
+            disabled={submitting || missingRequired}
+            className="flex-1"
+          >
             {submitting ? '执行中...' : action?.id === 'query_state' ? '开始查询' : '执行'}
           </Button>
           <Button variant="outline" onClick={onClose} disabled={submitting} className="flex-1">取消</Button>
@@ -1490,7 +1754,7 @@ function DetailModal({ acc, onClose, onSave }: { acc: any; onClose: () => void; 
   }
 
   return (
-    <div className="dialog-backdrop" onClick={onClose}>
+    <div className="dialog-backdrop">
       <div className="dialog-panel dialog-panel-sm flex flex-col" style={{maxHeight:'90vh'}} onClick={e => e.stopPropagation()}>
         {/* ── Sticky Header ── */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-[var(--border)] shrink-0">
@@ -1754,7 +2018,7 @@ function ImportModal({ onClose, onDone }: { onClose: () => void; onDone: () => v
     }
   }
   return (
-    <div className="dialog-backdrop" onClick={onClose}>
+    <div className="dialog-backdrop">
       <div className="dialog-panel dialog-panel-sm p-6" onClick={e => e.stopPropagation()}>
         <h2 className="text-base font-semibold text-[var(--text-primary)] mb-2">批量导入</h2>
         <p className="text-xs text-[var(--text-muted)] mb-3">每行格式: <code className="bg-[var(--bg-hover)] px-1 rounded">邮箱----密码----totp</code></p>
@@ -1882,6 +2146,12 @@ export default function Accounts() {
   const [actionResult, setActionResult] = useState<{ title: string; payload: any } | null>(null)
   const [bulkDeleting, setBulkDeleting] = useState(false)
   const [batchRefreshing, setBatchRefreshing] = useState(false)
+  const [batchProxyDialogOpen, setBatchProxyDialogOpen] = useState(false)
+  const [batchProxyStarting, setBatchProxyStarting] = useState(false)
+  const [gcashProxyDialogOpen, setGcashProxyDialogOpen] = useState(false)
+  const [gcashCheckStarting, setGcashCheckStarting] = useState(false)
+  const [trialProxyDialogOpen, setTrialProxyDialogOpen] = useState(false)
+  const [trialCheckStarting, setTrialCheckStarting] = useState(false)
   const [batchTask, setBatchTask] = useState<{ taskId: string; title: string } | null>(null)
   const [batchTaskStatus, setBatchTaskStatus] = useState<string | null>(null)
 
@@ -1995,6 +2265,116 @@ export default function Accounts() {
       {showImport && <ImportModal onClose={() => setShowImport(false)} onDone={() => { setShowImport(false); load() }} />}
       {showRegister && <RegisterModal platformMeta={platformsMap[tab]} onClose={() => setShowRegister(false)} onDone={() => load()} />}
       {actionResult && <ActionResultModal title={actionResult.title} payload={actionResult.payload} onClose={() => setActionResult(null)} />}
+      {batchProxyDialogOpen && (
+        <BatchCheckProxyModal
+          defaultProxy={QUERY_PROXY_PRESETS[0]}
+          selectedCount={selectedCount}
+          submitting={batchProxyStarting}
+          onClose={() => setBatchProxyDialogOpen(false)}
+          onSubmit={async (proxy, checkChain) => {
+            setBatchProxyStarting(true)
+            try {
+              const ids = selectedCount > 0 ? [...selectedIds] : []
+              const res = await apiFetch('/accounts/check-all', {
+                method: 'POST',
+                body: JSON.stringify({ platform: tab, ids, proxy, check_chain: checkChain }),
+              })
+              if (res?.task_id) {
+                setBatchProxyDialogOpen(false)
+                setBatchProxyStarting(false)
+                setBatchRefreshing(true)
+                setBatchTask({
+                  taskId: res.task_id,
+                  title: selectedCount > 0
+                    ? t('accounts.batchCheckSelectedTask', { platform: platformLabel, count: selectedCount })
+                    : t('accounts.batchCheckAllTask', { platform: platformLabel }),
+                })
+                setBatchTaskStatus(null)
+              } else {
+                setBatchProxyStarting(false)
+              }
+            } catch (e) {
+              console.error(e)
+              setBatchProxyStarting(false)
+              window.alert(e instanceof Error ? e.message : t('accounts.batchCheckStartFailed'))
+            }
+          }}
+        />
+      )}
+      {gcashProxyDialogOpen && (
+        <BatchCheckProxyModal
+          kind="gcash"
+          defaultProxy={QUERY_PROXY_PRESETS[0]}
+          selectedCount={selectedCount}
+          submitting={gcashCheckStarting}
+          onClose={() => setGcashProxyDialogOpen(false)}
+          onSubmit={async (proxy) => {
+            setGcashCheckStarting(true)
+            try {
+              const ids = selectedCount > 0 ? [...selectedIds] : []
+              const res = await apiFetch('/accounts/check-gcash', {
+                method: 'POST',
+                body: JSON.stringify({ platform: tab, ids, proxy }),
+              })
+              if (res?.task_id) {
+                setGcashProxyDialogOpen(false)
+                setGcashCheckStarting(false)
+                setBatchRefreshing(true)
+                setBatchTask({
+                  taskId: res.task_id,
+                  title: selectedCount > 0
+                    ? t('accounts.gcashCheckSelectedTask', { count: selectedCount })
+                    : t('accounts.gcashCheckAllTask'),
+                })
+                setBatchTaskStatus(null)
+              } else {
+                setGcashCheckStarting(false)
+              }
+            } catch (e) {
+              console.error(e)
+              setGcashCheckStarting(false)
+              window.alert(e instanceof Error ? e.message : t('accounts.gcashCheckStartFailed'))
+            }
+          }}
+        />
+      )}
+      {trialProxyDialogOpen && (
+        <BatchCheckProxyModal
+          kind="trial"
+          defaultProxy={QUERY_PROXY_PRESETS[0]}
+          selectedCount={selectedCount}
+          submitting={trialCheckStarting}
+          onClose={() => setTrialProxyDialogOpen(false)}
+          onSubmit={async (proxy, checkChain, country) => {
+            setTrialCheckStarting(true)
+            try {
+              const ids = selectedCount > 0 ? [...selectedIds] : []
+              const res = await apiFetch('/accounts/check-trial', {
+                method: 'POST',
+                body: JSON.stringify({ platform: tab, ids, proxy, country, check_chain: checkChain }),
+              })
+              if (res?.task_id) {
+                setTrialProxyDialogOpen(false)
+                setTrialCheckStarting(false)
+                setBatchRefreshing(true)
+                setBatchTask({
+                  taskId: res.task_id,
+                  title: selectedCount > 0
+                    ? t('accounts.trialCheckSelectedTask', { count: selectedCount })
+                    : t('accounts.trialCheckAllTask'),
+                })
+                setBatchTaskStatus(null)
+              } else {
+                setTrialCheckStarting(false)
+              }
+            } catch (e) {
+              console.error(e)
+              setTrialCheckStarting(false)
+              window.alert(e instanceof Error ? e.message : t('accounts.trialCheckStartFailed'))
+            }
+          }}
+        />
+      )}
       {batchTask && (
         <ActionTaskModal
           title={batchTask.title}
@@ -2090,25 +2470,53 @@ export default function Accounts() {
             <Button
               variant="ghost"
               size="sm"
-              disabled={batchRefreshing || loading}
+              disabled={batchRefreshing || batchProxyStarting || loading || total === 0}
               className="h-7 px-2.5 text-[var(--text-muted)] hover:text-amber-500 hover:bg-amber-500/10"
-              title={t('accounts.refreshCreditsTitle')}
-              onClick={async () => {
-                setBatchRefreshing(true)
-                try {
-                  const res = await apiFetch(`/accounts/check-all?platform=${tab}`, { method: 'POST' })
-                  if (res?.task_id) {
-                    setBatchTask({ taskId: res.task_id, title: t('accounts.refreshAllCreditsTask', { platform: platformLabel }) })
-                    setBatchTaskStatus(null)
-                  }
-                } catch (e) {
-                  console.error(e)
-                  setBatchRefreshing(false)
-                }
-              }}
+              title={selectedCount > 0
+                ? t('accounts.batchCheckSelectedTitle', { count: selectedCount })
+                : t('accounts.batchCheckAllTitle')}
+              onClick={() => setBatchProxyDialogOpen(true)}
             >
-              <Zap className={`mr-1 h-3.5 w-3.5 ${batchRefreshing ? 'animate-pulse' : ''}`} />
-              {batchRefreshing ? t('accounts.refreshingCredits') : t('accounts.refreshCredits')}
+              <BadgeCheck className={`mr-1 h-3.5 w-3.5 ${batchRefreshing ? 'animate-pulse' : ''}`} />
+              {batchRefreshing
+                ? t('accounts.batchChecking')
+                : selectedCount > 0
+                  ? t('accounts.batchCheckSelected', { count: selectedCount })
+                  : t('accounts.batchCheckAll')}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={batchRefreshing || batchProxyStarting || gcashCheckStarting || loading || total === 0}
+              className="h-7 px-2.5 text-[var(--text-muted)] hover:text-emerald-500 hover:bg-emerald-500/10"
+              title={selectedCount > 0
+                ? t('accounts.gcashCheckSelectedTitle', { count: selectedCount })
+                : t('accounts.gcashCheckAllTitle')}
+              onClick={() => setGcashProxyDialogOpen(true)}
+            >
+              <BadgeCheck className={`mr-1 h-3.5 w-3.5 ${gcashCheckStarting ? 'animate-pulse' : ''}`} />
+              {gcashCheckStarting
+                ? t('accounts.batchChecking')
+                : selectedCount > 0
+                  ? t('accounts.gcashCheckSelected', { count: selectedCount })
+                  : t('accounts.gcashCheck')}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={batchRefreshing || batchProxyStarting || gcashCheckStarting || trialCheckStarting || loading || total === 0}
+              className="h-7 px-2.5 text-[var(--text-muted)] hover:text-sky-500 hover:bg-sky-500/10"
+              title={selectedCount > 0
+                ? t('accounts.trialCheckSelectedTitle', { count: selectedCount })
+                : t('accounts.trialCheckAllTitle')}
+              onClick={() => setTrialProxyDialogOpen(true)}
+            >
+              <FlaskConical className={`mr-1 h-3.5 w-3.5 ${trialCheckStarting ? 'animate-pulse' : ''}`} />
+              {trialCheckStarting
+                ? t('accounts.batchChecking')
+                : selectedCount > 0
+                  ? t('accounts.trialCheckSelected', { count: selectedCount })
+                  : t('accounts.trialCheck')}
             </Button>
             <Button variant="ghost" size="sm" onClick={() => load()} disabled={loading} className="h-7 w-7 p-0 text-[var(--text-muted)] hover:text-[var(--text-primary)]">
               <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
@@ -2264,8 +2672,9 @@ export default function Accounts() {
                       const planChip = getPlanChip(acc)
                       const validityChip = getValidityChip(acc)
                       const checkoutChainChip = getCheckoutChainChip(acc)
+                      const gcashChip = getGCashChip(acc)
                       const trialActive = isTrialAccount(acc) && getDisplayStatus(acc) !== 'trial'
-                      if (!planChip && !validityChip && !checkoutChainChip && !trialActive) return null
+                      if (!planChip && !validityChip && !checkoutChainChip && !gcashChip && !trialActive) return null
                       return (
                         <div className="flex max-w-full flex-wrap items-center gap-1">
                           {planChip && <StatusIconChip {...planChip} />}
@@ -2276,6 +2685,7 @@ export default function Accounts() {
                             />
                           )}
                           {checkoutChainChip && <StatusIconChip {...checkoutChainChip} />}
+                          {gcashChip && <StatusIconChip {...gcashChip} />}
                           {trialActive && (
                             <StatusIconChip
                               label={translateAccountStatus('trial', language)}

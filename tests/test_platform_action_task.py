@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import threading
+import time
+
 from application import tasks as tasks_module
 from core.base_platform import Account
 from domain.actions import ActionExecutionResult
@@ -232,6 +235,53 @@ def test_register_task_honors_twenty_worker_concurrency_limit():
     assert tasks_module._registration_concurrency(20, 6) == 6
 
 
+def test_register_task_cancel_returns_without_waiting_for_running_workers(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            started.set()
+            release.wait(timeout=5)
+            return Account(
+                platform="chatgpt",
+                email=email or "cancelled@example.com",
+                password=password or "Secret123!",
+            )
+
+    monkeypatch.setattr(tasks_module, "get", lambda _platform_name: object)
+    monkeypatch.setattr(
+        tasks_module,
+        "_resolve_registration_proxy_for_platform",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(tasks_module, "_build_platform_instance", lambda *args, **kwargs: FakePlatform())
+    monkeypatch.setattr(tasks_module, "create_mailbox", lambda **kwargs: object())
+
+    logger = _FakeLogger(task_id="cancel-fast")
+    runner = threading.Thread(
+        target=tasks_module._execute_register_task,
+        args=({
+            "platform": "chatgpt",
+            "count": 2,
+            "concurrency": 2,
+            "extra": {"identity_provider": "mailbox"},
+        }, logger),
+        daemon=True,
+    )
+    runner.start()
+    assert started.wait(timeout=2)
+    logger.cancel_requested = True
+    started_at = time.monotonic()
+    runner.join(timeout=1)
+    elapsed = time.monotonic() - started_at
+    release.set()
+
+    assert not runner.is_alive()
+    assert elapsed < 0.8
+    assert logger.finished == (tasks_module.TASK_STATUS_CANCELLED, "任务已取消")
+
+
 def test_register_task_uploads_each_saved_account_immediately(monkeypatch):
     events = []
 
@@ -318,7 +368,7 @@ def test_register_api_preserves_protocol_outlook_pool(client, monkeypatch):
         return {"task_id": "task_protocol"}
 
     monkeypatch.setattr("api.task_commands.command_service.create_register_task", fake_create)
-    pool_text = "user@outlook.com----mail-pass----client-id----refresh-token"
+    pool_text = "user@example.com----test-password----test-client-id----test-refresh-token"
 
     response = client.post(
         "/api/tasks/register",
@@ -361,7 +411,7 @@ def test_register_api_keeps_sub2api_key_out_of_task_payload(client, monkeypatch)
             "sub2api_url": "https://sub2api.example",
             "sub2api_api_key": "volatile-admin-key",
             "extra": {
-                "local_ms_pool_text": "user@outlook.com----mail-pass----client-id----refresh-token",
+                "local_ms_pool_text": "user@example.com----test-password----test-client-id----test-refresh-token",
                 "auto_upload_sub2api_agent_identity": True,
             },
         },
@@ -383,7 +433,7 @@ def test_register_api_allows_six_outlook_child_addresses_per_parent(client, monk
         "api.task_commands.command_service.create_register_task",
         lambda payload: captured.update(payload) or {"task_id": "task_protocol"},
     )
-    pool_text = "user@outlook.com----mail-pass----client-id----refresh-token"
+    pool_text = "user@example.com----test-password----test-client-id----test-refresh-token"
 
     accepted = client.post(
         "/api/tasks/register",
@@ -416,6 +466,28 @@ def test_register_api_rejects_protocol_without_outlook_pool(client):
 
     assert response.status_code == 400
     assert "Outlook" in response.json()["detail"]
+
+
+def test_register_api_keeps_selected_domain_mailbox_for_protocol(client, monkeypatch):
+    captured = {}
+
+    monkeypatch.setattr(
+        "api.task_commands.command_service.create_register_task",
+        lambda payload: captured.update(payload) or {"task_id": "task_domain_protocol"},
+    )
+
+    response = client.post(
+        "/api/tasks/register",
+        json={
+            "count": 3,
+            "executor_type": "protocol",
+            "extra": {"mail_provider": "domain_mailbox"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["extra"]["mail_provider"] == "domain_mailbox"
+    assert "local_ms_pool_alias_count" not in captured["extra"]
 
 
 def test_platform_action_task_finishes_cancelled_without_starting_runtime(monkeypatch):

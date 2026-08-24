@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import queue
+import threading
+import time
 from typing import Any
 
 from .errors import BrowserReuseRequiredError, IdentityResolutionError, RegistrationUnsupportedError
@@ -41,6 +45,104 @@ def ensure_oauth_browser_reuse(ctx: RegistrationContext, message: str) -> None:
         raise BrowserReuseRequiredError(message)
 
 
+def _wait_for_code_with_manual_override(
+    mailbox: Any,
+    mail_acct: Any,
+    *,
+    kwargs: dict[str, Any],
+    manual_otp_handle: Any,
+    request_id: str,
+    timeout: int,
+) -> tuple[str, bool]:
+    """Race automatic mailbox polling with a prompt manual handoff."""
+    results: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+    stop_event = threading.Event()
+    cancel_check = kwargs.get("cancel_check")
+    worker_kwargs = dict(kwargs)
+
+    def combined_cancel_check() -> bool:
+        return stop_event.is_set() or (
+            callable(cancel_check) and bool(cancel_check())
+        )
+
+    worker_kwargs["cancel_check"] = combined_cancel_check
+
+    def automatic_wait() -> None:
+        try:
+            results.put(("code", mailbox.wait_for_code(mail_acct, **worker_kwargs)))
+        except Exception as exc:
+            results.put(("error", exc))
+
+    worker = threading.Thread(
+        target=automatic_wait,
+        name="automatic-mailbox-otp",
+        daemon=True,
+    )
+    worker.start()
+    deadline = time.monotonic() + max(int(timeout), 1)
+    automatic_error: Exception | None = None
+    try:
+        while True:
+            if callable(cancel_check) and cancel_check():
+                raise RuntimeError("任务已取消")
+            manual_code = manual_otp_handle.consume_code(request_id)
+            if manual_code:
+                return str(manual_code), True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if automatic_error is not None:
+                    raise automatic_error
+                raise TimeoutError(f"等待验证码超时 ({timeout}s)")
+            try:
+                result_type, value = results.get(timeout=min(0.1, remaining))
+            except queue.Empty:
+                continue
+            if result_type == "error":
+                # Keep the manual request alive when automatic IMAP/API
+                # polling fails.  The operator can still submit the code from
+                # the mailbox UI; surface the automatic error only if manual
+                # input also times out.
+                automatic_error = value if isinstance(value, Exception) else RuntimeError(str(value))
+                continue
+            manual_code = manual_otp_handle.consume_code(request_id)
+            return str(manual_code or value or ""), bool(manual_code)
+    finally:
+        stop_event.set()
+
+
+def _refresh_mailbox_baseline(ctx: RegistrationContext, mailbox: Any, mail_acct: Any) -> None:
+    try:
+        ctx.identity.before_ids = mailbox.get_current_ids(mail_acct)
+    except Exception:
+        pass
+
+
+def _refresh_mailbox_baseline_async(
+    ctx: RegistrationContext,
+    mailbox: Any,
+    mail_acct: Any,
+) -> None:
+    threading.Thread(
+        target=_refresh_mailbox_baseline,
+        args=(ctx, mailbox, mail_acct),
+        name="refresh-mailbox-baseline",
+        daemon=True,
+    ).start()
+
+
+def _otp_fingerprint(value: object) -> str:
+    """Return a short, non-reversible diagnostic fingerprint for an OTP."""
+    normalized = str(value or "").strip()
+    if not normalized:
+        return ""
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
+
+
+def _message_fingerprint(value: object) -> str:
+    """Return a short diagnostic fingerprint for a mailbox message identity."""
+    return _otp_fingerprint(value)
+
+
 def build_otp_callback(
     ctx: RegistrationContext,
     *,
@@ -55,8 +157,20 @@ def build_otp_callback(
     if not mailbox or not mail_acct:
         return None
 
+    extra = getattr(ctx, "extra", {}) or {}
+    manual_otp_handle = extra.get("_manual_otp_handle") if isinstance(extra, dict) else None
+
     def otp_cb(*, timeout_override: int | None = None):
         ctx.log(wait_message)
+        # The security flow inspects these attributes to distinguish a newly
+        # delivered message from a stale response with the same numeric OTP.
+        # Clear them before every mailbox request so a timeout/manual entry
+        # cannot accidentally inherit the previous message identity.
+        otp_cb.last_message_identity = None
+        otp_cb.last_message_manual = False
+        otp_cb.last_code_fingerprint = ""
+        otp_cb.last_message_fingerprint = ""
+        otp_cb.last_message_received_at = ""
         kwargs = {
             "keyword": keyword,
             "before_ids": getattr(ctx.identity, "before_ids", set()),
@@ -67,19 +181,77 @@ def build_otp_callback(
             kwargs["timeout"] = effective_timeout
         if code_pattern:
             kwargs["code_pattern"] = code_pattern
-        code = mailbox.wait_for_code(mail_acct, **kwargs)
+        request_id = ""
+        manual_override_used = False
+        if manual_otp_handle and callable(getattr(manual_otp_handle, "open_request", None)):
+            request_id = manual_otp_handle.open_request(getattr(mail_acct, "email", ""))
+        try:
+            if request_id:
+                code, manual_override_used = _wait_for_code_with_manual_override(
+                    mailbox,
+                    mail_acct,
+                    kwargs=kwargs,
+                    manual_otp_handle=manual_otp_handle,
+                    request_id=request_id,
+                    timeout=int(effective_timeout or 120),
+                )
+            else:
+                code = mailbox.wait_for_code(mail_acct, **kwargs)
+        finally:
+            if request_id:
+                manual_otp_handle.close_request(request_id)
         if code:
+            if not manual_override_used:
+                try:
+                    otp_cb.last_message_identity = mailbox.get_last_code_identity(mail_acct)
+                except Exception:
+                    otp_cb.last_message_identity = None
+            otp_cb.last_message_manual = bool(manual_override_used)
+            otp_cb.last_code_fingerprint = _otp_fingerprint(code)
+            otp_cb.last_message_fingerprint = _message_fingerprint(
+                otp_cb.last_message_identity
+            )
+            try:
+                metadata = mailbox.get_last_code_metadata(mail_acct)
+            except Exception:
+                metadata = {}
+            if isinstance(metadata, dict):
+                otp_cb.last_message_received_at = str(
+                    metadata.get("received_at") or metadata.get("receivedAt") or ""
+                ).strip()
             # A later security re-auth must wait for a genuinely new email.
             # Advance the identity baseline after this code has been consumed
             # so the same message cannot be returned a second time.
+            if manual_override_used:
+                _refresh_mailbox_baseline_async(ctx, mailbox, mail_acct)
+            else:
+                _refresh_mailbox_baseline(ctx, mailbox, mail_acct)
+            source = "手动输入" if manual_override_used else "邮箱"
+            message_tag = otp_cb.last_message_fingerprint or "unknown"
+            code_tag = otp_cb.last_code_fingerprint or "unknown"
+            received_at = otp_cb.last_message_received_at or "unknown"
+            metadata_source = ""
             try:
-                ctx.identity.before_ids = mailbox.get_current_ids(mail_acct)
+                metadata_source = str(
+                    (metadata if isinstance(metadata, dict) else {}).get("source") or ""
+                ).strip()
             except Exception:
-                pass
-            ctx.log(f"{success_label}: {code}")
+                metadata_source = ""
+            ctx.log(
+                f"{success_label}已获取（来源={source}，"
+                f"验证码={str(code).strip()}，邮件时间={received_at}，"
+                f"邮件接口={metadata_source or 'unknown'}，"
+                f"消息指纹={message_tag}，"
+                f"验证码指纹={code_tag}）"
+            )
         return code
 
     otp_cb.supports_timeout_override = True
+    otp_cb.last_message_identity = None
+    otp_cb.last_message_manual = False
+    otp_cb.last_code_fingerprint = ""
+    otp_cb.last_message_fingerprint = ""
+    otp_cb.last_message_received_at = ""
     return otp_cb
 
 

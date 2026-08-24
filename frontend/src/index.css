@@ -108,6 +108,23 @@ textarea {
   font: inherit;
 }
 
+/* Native select menus use the browser's color scheme instead of inheriting
+   the surrounding Tailwind text color.  Without this, Chromium on Windows
+   can render a white option list with white text in the dark theme. */
+select {
+  color: var(--text-primary);
+  color-scheme: dark;
+}
+
+select option {
+  background-color: var(--bg-card);
+  color: var(--text-primary);
+}
+
+.light select {
+  color-scheme: light;
+}
+
 a {
   color: inherit;
 }

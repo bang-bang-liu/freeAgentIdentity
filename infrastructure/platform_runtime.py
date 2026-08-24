@@ -115,6 +115,13 @@ def _build_account_overview(platform: str, data: dict[str, Any]) -> dict[str, An
         if data.get("plus_trial_error"):
             overview["plus_trial_error"] = data.get("plus_trial_error")
     for key in (
+        "plus_trial_country",
+        "plus_trial_currency",
+        "plus_trial_checked_at",
+    ):
+        if key in data:
+            overview[key] = data.get(key)
+    for key in (
         "plus_trial_checkout_chain",
         "plus_trial_checkout_state",
         "plus_trial_checkout_error",

@@ -33,11 +33,11 @@ class FakeSession:
 
 def test_parse_api_mailbox_rows_accepts_email_and_full_api_url():
     rows = parse_api_mailbox_rows(
-        "user+tag@outlook.com----https://mail.example/api/code?email=user%2Btag%40outlook.com&pass=secret&json=1"
+        "user+tag@example.com----https://mail.example/api/code?email=user%2Btag%40example.com&pass=test-password&json=1"
     )
 
     assert len(rows) == 1
-    assert rows[0].email == "user+tag@outlook.com"
+    assert rows[0].email == "user+tag@example.com"
     assert rows[0].api_url.endswith("&json=1")
 
 
@@ -98,3 +98,51 @@ def test_api_mailbox_account_metadata_keeps_runtime_api_url(tmp_path):
 
     assert account.extra["provider_account"]["provider_name"] == "api_mailbox"
     assert account.extra["provider_account"]["credentials"]["api_url"] == api_url
+
+
+def test_api_mailbox_allow_reuse_still_excludes_active_concurrent_addresses(tmp_path):
+    mailbox = ApiMailboxPool(
+        pool_text=(
+            "first@example.com----https://mail.example/first\n"
+            "second@example.com----https://mail.example/second"
+        ),
+        state_file=str(tmp_path / "state.json"),
+        allow_reuse=True,
+    )
+
+    first = mailbox.get_email()
+    second = mailbox.get_email()
+    assert {first.email, second.email} == {"first@example.com", "second@example.com"}
+    assert all(item["used"] for item in mailbox.list_mailboxes())
+
+    mailbox.release_email(first)
+    assert mailbox.get_email().email == first.email
+
+
+def test_api_mailbox_manual_reset_removes_used_state(tmp_path):
+    mailbox = ApiMailboxPool(
+        pool_text="user@example.com----https://mail.example/code",
+        state_file=str(tmp_path / "state.json"),
+    )
+    account = mailbox.get_email()
+    assert mailbox.list_mailboxes()[0]["used"] is True
+    mailbox.release_email(account)
+    mailbox.set_mailbox_used(account.email, used=False)
+    assert mailbox.list_mailboxes()[0]["used"] is False
+
+
+def test_api_mailbox_accepts_same_code_when_message_signature_changes(tmp_path):
+    session = FakeSession([
+        {"id": "message-1", "code": "123456"},
+        {"id": "message-2", "code": "123456"},
+    ])
+    mailbox = ApiMailboxPool(
+        pool_text="user@example.com----https://mail.example/code",
+        state_file=str(tmp_path / "state.json"),
+        poll_interval=0,
+        session=session,
+    )
+    account = mailbox.get_email()
+    before_ids = mailbox.get_current_ids(account)
+
+    assert mailbox.wait_for_code(account, timeout=1, before_ids=before_ids) == "123456"

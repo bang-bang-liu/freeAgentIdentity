@@ -34,6 +34,42 @@ class ProviderSettingsService:
     def delete_setting(self, setting_id: int) -> dict:
         return {"ok": self.repository.delete(setting_id)}
 
+    def list_mailboxes(self, setting_id: int) -> dict:
+        item = self.repository.get(setting_id)
+        if not item or item.provider_type != "mailbox":
+            raise ValueError("邮箱 provider 配置不存在")
+        from core.base_mailbox import MAILBOX_FACTORY_REGISTRY
+
+        definition = self.definitions.get_by_key("mailbox", item.provider_key)
+        driver = definition.driver_type if definition else item.provider_key
+        if driver not in {"api_mailbox", "local_ms_pool"}:
+            raise ValueError("该邮箱 provider 不支持本地邮箱管理")
+        factory = MAILBOX_FACTORY_REGISTRY.get(driver)
+        if factory is None:
+            raise ValueError(f"未找到邮箱驱动: {driver}")
+        mailbox = factory(self.repository.resolve_runtime_settings("mailbox", item.provider_key), None)
+        return {
+            "provider_key": item.provider_key,
+            "items": mailbox.list_mailboxes(),
+        }
+
+    def set_mailbox_used(self, setting_id: int, email: str, used: bool = False) -> dict:
+        item = self.repository.get(setting_id)
+        if not item or item.provider_type != "mailbox":
+            raise ValueError("邮箱 provider 配置不存在")
+        from core.base_mailbox import MAILBOX_FACTORY_REGISTRY
+
+        definition = self.definitions.get_by_key("mailbox", item.provider_key)
+        driver = definition.driver_type if definition else item.provider_key
+        if driver not in {"api_mailbox", "local_ms_pool"}:
+            raise ValueError("该邮箱 provider 不支持本地邮箱管理")
+        factory = MAILBOX_FACTORY_REGISTRY.get(driver)
+        if factory is None:
+            raise ValueError(f"未找到邮箱驱动: {driver}")
+        mailbox = factory(self.repository.resolve_runtime_settings("mailbox", item.provider_key), None)
+        mailbox.set_mailbox_used(email, used=used)
+        return self.list_mailboxes(setting_id)
+
     def get_catalog_options(self) -> dict:
         return {
             "mailbox_settings": self.list_settings("mailbox"),

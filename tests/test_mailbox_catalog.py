@@ -23,4 +23,5 @@ def test_mailbox_driver_catalog_only_exposes_supported_providers():
         "local_ms_pool",
         "api_mailbox",
         "icloud_workbench",
+        "domain_mailbox",
     }

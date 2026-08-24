@@ -41,7 +41,7 @@ def create_mailbox(responses, **overrides):
     return ICloudWorkbenchMailbox(
         base_url="http://127.0.0.1:4173",
         username="admin",
-        password="secret-password",
+        password="test-password",
         poll_interval=0,
         session=FakeSession(responses),
         **overrides,
@@ -52,14 +52,14 @@ def test_connection_reports_inventory_without_consuming_address():
     mailbox = create_mailbox([
         FakeResponse(200, {"username": "admin"}),
         FakeResponse(200, {"addresses": [{
-            "id": "address-1", "email": "one@icloud.com", "label": "freeagent-1",
+            "id": "address-1", "email": "one@example.com", "label": "freeagent-1",
         }]}),
     ])
 
     result = mailbox.test_connection()
 
     assert result["ok"] is True
-    assert result["email"] == "one@icloud.com"
+    assert result["email"] == "one@example.com"
     assert [call[0:2] for call in mailbox.session.calls] == [
         ("POST", "http://127.0.0.1:4173/api/auth/login"),
         ("GET", "http://127.0.0.1:4173/api/addresses"),
@@ -70,15 +70,15 @@ def test_get_email_claims_unused_address_and_persists_public_api_url():
     mailbox = create_mailbox([
         FakeResponse(200, {"username": "admin"}),
         FakeResponse(200, {"addresses": [{
-            "id": "address-1", "accountId": "icloud-1", "email": "one@icloud.com", "label": "freeagent-1",
+            "id": "address-1", "accountId": "icloud-1", "email": "one@example.com", "label": "freeagent-1",
         }]}),
-        FakeResponse(201, {"apiUrl": "http://127.0.0.1:4173/openapi/mail/one%40icloud.com/token/latest"}),
+        FakeResponse(201, {"apiUrl": "http://127.0.0.1:4173/openapi/mail/one%40example.com/token/latest"}),
         FakeResponse(200, {"ok": True}),
     ])
 
     account = mailbox.get_email()
 
-    assert account.email == "one@icloud.com"
+    assert account.email == "one@example.com"
     assert account.account_id == "address-1"
     assert account.extra["provider_account"]["credentials"]["api_url"].endswith("/token/latest")
     assert account.extra["provider_resource"]["metadata"]["workbench_account_id"] == "icloud-1"
@@ -110,7 +110,7 @@ def test_account_email_is_resolved_to_workbench_internal_id_before_inventory_fil
             "id": "icloud-1", "appleId": "owner@example.com", "status": "active",
         }]}),
         FakeResponse(200, {"addresses": [{
-            "id": "address-1", "email": "one@icloud.com", "label": "freeagent-1",
+            "id": "address-1", "email": "one@example.com", "label": "freeagent-1",
         }]}),
     ], account_id="owner@example.com")
 
@@ -126,37 +126,37 @@ def test_inventory_is_filtered_and_sorted_by_creation_time():
         FakeResponse(200, {"addresses": [
             {
                 "id": "newest",
-                "email": "newest@icloud.com",
-                "label": "eronicaawayn-101",
+                "email": "newest@example.com",
+                "label": "test-user-101",
                 "createdAt": "2026-08-17T12:00:00.000Z",
             },
             {
                 "id": "oldest",
-                "email": "oldest@icloud.com",
-                "label": "eronicaawayn-102",
+                "email": "oldest@example.com",
+                "label": "test-user-102",
                 "createdAt": "2026-08-17T10:00:00.000Z",
             },
         ]}),
-    ], label_prefix="eronicaawayn-1")
+    ], label_prefix="test-user-1")
 
     result = mailbox.test_connection()
 
-    assert result["email"] == "oldest@icloud.com"
-    assert mailbox.session.calls[-1][2]["params"]["search"] == "eronicaawayn-1"
+    assert result["email"] == "oldest@example.com"
+    assert mailbox.session.calls[-1][2]["params"]["search"] == "test-user-1"
 
 
 def test_wait_for_code_ignores_baseline_message_and_returns_new_message_code():
     mailbox = create_mailbox([
-        FakeResponse(200, {"email": "one@icloud.com", "message": {"id": "old", "code": "111111"}}),
-        FakeResponse(200, {"email": "one@icloud.com", "message": {"id": "old", "code": "111111"}}),
-        FakeResponse(200, {"email": "one@icloud.com", "message": {
+        FakeResponse(200, {"email": "one@example.com", "message": {"id": "old", "code": "111111"}}),
+        FakeResponse(200, {"email": "one@example.com", "message": {"id": "old", "code": "111111"}}),
+        FakeResponse(200, {"email": "one@example.com", "message": {
             "id": "new", "subject": "OpenAI verification code", "code": "654321", "bodyText": "Code 654321",
         }}),
     ])
     account = type("Account", (), {
-        "email": "one@icloud.com",
+        "email": "one@example.com",
         "extra": {"provider_account": {"credentials": {
-            "api_url": "http://127.0.0.1:4173/openapi/mail/one%40icloud.com/token/latest",
+            "api_url": "http://127.0.0.1:4173/openapi/mail/one%40example.com/token/latest",
         }}},
     })()
 
@@ -170,9 +170,9 @@ def test_wait_for_code_ignores_baseline_message_and_returns_new_message_code():
 def test_wait_for_code_stops_immediately_when_task_is_cancelled():
     mailbox = create_mailbox([])
     account = type("Account", (), {
-        "email": "one@icloud.com",
+        "email": "one@example.com",
         "extra": {"provider_account": {"credentials": {
-            "api_url": "http://127.0.0.1:4173/openapi/mail/one%40icloud.com/token/latest",
+            "api_url": "http://127.0.0.1:4173/openapi/mail/one%40example.com/token/latest",
         }}},
     })()
 
@@ -186,16 +186,131 @@ def test_wait_for_code_stops_immediately_when_task_is_cancelled():
     assert mailbox.session.calls == []
 
 
+def test_wait_for_code_uses_workbench_history_and_accepts_same_code_from_new_messages():
+    mailbox = create_mailbox([
+        FakeResponse(200, {
+            "messages": [
+                {
+                    "id": "newer",
+                    "receivedAt": "2026-08-22T15:28:51.000Z",
+                    "subject": "OpenAI verification code",
+                    "code": "492799",
+                    "preview": "492799",
+                },
+                {
+                    "id": "older",
+                    "receivedAt": "2026-08-22T15:27:46.000Z",
+                    "subject": "OpenAI verification code",
+                    "code": "492799",
+                    "preview": "492799",
+                },
+            ],
+            "pagination": {"total": 2, "totalPages": 1},
+        }),
+    ])
+    mailbox._logged_in = True
+    account = type("Account", (), {
+        "email": "one@example.com",
+        "account_id": "address-1",
+        "extra": {},
+    })()
+
+    first = mailbox.wait_for_code(account, keyword="OpenAI", timeout=1)
+    assert first == "492799"
+    assert mailbox.get_last_code_identity(account) == "newer"
+    assert mailbox.get_last_code_metadata(account)["received_at"].endswith("15:28:51.000Z")
+    assert mailbox.get_last_code_metadata(account)["source"] == "history"
+
+    mailbox.session.responses.append(FakeResponse(200, {
+        "messages": [
+            {
+                "id": "newest",
+                "receivedAt": "2026-08-22T15:29:53.000Z",
+                "subject": "OpenAI verification code",
+                "code": "492799",
+                "preview": "492799",
+            },
+            {
+                "id": "newer",
+                "receivedAt": "2026-08-22T15:28:51.000Z",
+                "subject": "OpenAI verification code",
+                "code": "492799",
+                "preview": "492799",
+            },
+        ],
+        "pagination": {"total": 2, "totalPages": 1},
+    }))
+    second = mailbox.wait_for_code(
+        account,
+        keyword="OpenAI",
+        timeout=1,
+        before_ids={"newer"},
+    )
+    assert second == "492799"
+    assert mailbox.get_last_code_identity(account) == "newest"
+
+
+def test_history_endpoint_falls_back_to_public_latest_when_unavailable():
+    mailbox = create_mailbox([
+        FakeResponse(404, {"error": "not found"}),
+        FakeResponse(200, {"message": {
+            "id": "latest",
+            "subject": "OpenAI verification code",
+            "code": "123456",
+        }}),
+    ])
+    mailbox._logged_in = True
+    account = type("Account", (), {
+        "email": "one@example.com",
+        "account_id": "address-1",
+        "extra": {"provider_account": {"credentials": {
+            "api_url": "http://127.0.0.1:4173/openapi/mail/token/latest",
+        }}},
+    })()
+
+    assert mailbox.wait_for_code(account, keyword="OpenAI", timeout=1) == "123456"
+    assert mailbox._history_supported is False
+
+
+def test_wait_for_code_syncs_source_inbox_before_reading_history():
+    mailbox = create_mailbox([
+        FakeResponse(200, {"scanned": 1, "added": 1}),
+        FakeResponse(200, {
+            "messages": [{
+                "id": "synced-message",
+                "receivedAt": "2026-08-22T16:11:23.000Z",
+                "subject": "OpenAI verification code",
+                "code": "807632",
+            }],
+            "pagination": {"total": 1, "totalPages": 1},
+        }),
+    ], account_id="icloud-account-1")
+    mailbox._logged_in = True
+    mailbox._resolved_account_id = "icloud-account-1"
+    account = type("Account", (), {
+        "email": "one@example.com",
+        "account_id": "address-1",
+        "extra": {},
+    })()
+
+    assert mailbox.wait_for_code(account, keyword="OpenAI", timeout=1) == "807632"
+    assert [call[0:2] for call in mailbox.session.calls] == [
+        ("POST", "http://127.0.0.1:4173/api/inbox/sync"),
+        ("GET", "http://127.0.0.1:4173/api/addresses/address-1/messages"),
+    ]
+    assert mailbox.session.calls[0][2]["json"] == {"accountId": "icloud-account-1"}
+
+
 def test_wait_for_link_extracts_link_from_new_message_html():
     mailbox = create_mailbox([
-        FakeResponse(200, {"email": "one@icloud.com", "message": {
+        FakeResponse(200, {"email": "one@example.com", "message": {
             "id": "new", "subject": "Verify account", "bodyHtml": '<a href="https://example.com/verify?id=1">Verify</a>',
         }}),
     ])
     account = type("Account", (), {
-        "email": "one@icloud.com",
+        "email": "one@example.com",
         "extra": {"provider_account": {"credentials": {
-            "api_url": "http://127.0.0.1:4173/openapi/mail/one%40icloud.com/token/latest",
+            "api_url": "http://127.0.0.1:4173/openapi/mail/one%40example.com/token/latest",
         }}},
     })()
 

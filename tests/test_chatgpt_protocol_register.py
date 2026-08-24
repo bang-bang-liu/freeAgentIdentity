@@ -143,10 +143,10 @@ def test_protocol_register_completes_email_flow_without_browser():
         sentinel_runtime=False,
     )
 
-    result = worker.run(email="user@outlook.com", password="StrongPass123!")
+    result = worker.run(email="user@example.com", password="test-password")
 
-    assert result["email"] == "user@outlook.com"
-    assert result["password"] == "StrongPass123!"
+    assert result["email"] == "user@example.com"
+    assert result["password"] == "test-password"
     assert result["access_token"] == "header.payload.signature"
     assert result["session_token"] == "session-token"
     assert result["account_id"] == "account-123"
@@ -155,10 +155,10 @@ def test_protocol_register_completes_email_flow_without_browser():
     assert result["password_set"] is True
     assert result["password_path"] == "/api/accounts/password/add"
     assert session.password_body == {
-        "username": "user@outlook.com",
-        "password": "StrongPass123!",
+        "username": "user@example.com",
+        "password": "test-password",
     }
-    assert session.password_add_body == {"password": "StrongPass123!"}
+    assert session.password_add_body == {"password": "test-password"}
     assert session.mfa_enroll_body == {"factor_type": "totp"}
     assert session.mfa_activate_body["factor_type"] == "totp"
     assert len(session.mfa_activate_body["code"]) == 6
@@ -168,7 +168,64 @@ def test_protocol_register_completes_email_flow_without_browser():
     assert sentinel["c"] == "challenge-token"
     assert any("协议注册完成" in line for line in logs)
     assert any("TOTP enrollment/activate 成功，Base32 Secret: JBSWY3DPEHPK3PXP" in line for line in logs)
-    assert any("设置的密码: StrongPass123!" in line for line in logs)
+    assert any("设置的密码: test-password" in line for line in logs)
+
+
+def test_protocol_register_can_skip_post_registration_security_setup():
+    session = _FakeSession()
+    worker = ChatGPTProtocolRegister(
+        session=session,
+        otp_callback=lambda **_kwargs: "123456",
+        sentinel_runtime=False,
+        setup_security=False,
+    )
+
+    result = worker.run(email="user@example.com", password="test-password")
+
+    assert result["password_set"] is True
+    assert result["password_path"] == "registration"
+    assert result["totp_set"] is False
+    assert result["totp_secret"] == ""
+    assert session.mfa_enroll_body == {}
+    assert session.password_add_body == {}
+
+
+def test_protocol_reauth_submits_repeated_registration_code_once_before_blocking_it(monkeypatch):
+    worker = ChatGPTProtocolRegister(
+        session=_FakeSession(),
+        otp_callback=None,
+        sentinel_runtime=False,
+    )
+    # Avoid waiting for the production resend cooldown in this unit test.
+    monkeypatch.setattr(
+        "platforms.chatgpt.protocol_register.SECURITY_EMAIL_RESEND_MIN_INTERVAL",
+        0,
+    )
+    resend_calls = []
+    validation_codes = []
+    responses = iter([
+        (type("Response", (), {"status_code": 400})(), {"error": "code already used"}),
+        (type("Response", (), {"status_code": 200})(), {"continue_url": "/reset-password/new-password"}),
+    ])
+    codes = iter(["123456", "123456", "654321"])
+
+    worker.otp_callback = lambda: next(codes)
+    worker._resend_email_otp_protocol = lambda **_kwargs: resend_calls.append(True)
+    worker._validate_email_otp_protocol = lambda code, **_kwargs: validation_codes.append(code) or next(responses)
+    worker._follow_security_url = lambda *_args, **_kwargs: "https://auth.openai.com/reset-password/new-password"
+
+    result = worker._complete_security_reauth_protocol(
+        start_url="https://auth.openai.com/email-verification",
+        password="test-password",
+        secret="",
+        excluded_codes={"123456"},
+        expect_password_page=True,
+        timeout=5,
+    )
+
+    assert result.endswith("/reset-password/new-password")
+    assert validation_codes == ["123456", "654321"]
+    assert len(resend_calls) == 2
 
 
 def test_protocol_profile_is_shared_by_headers_and_sentinel_fingerprint():
@@ -278,9 +335,13 @@ def test_sentinel_runtime_uses_camoufox_and_releases_it(monkeypatch):
         def goto(self, *_args, **_kwargs):
             events.append("goto")
 
-        def evaluate(self, expression, *_args):
-            if expression == "typeof window.SentinelSDK":
-                return "object"
+        def evaluate(self, _expression, *args):
+            payload = args[0] if args else None
+            if isinstance(payload, dict) and "code" in payload:
+                events.append("install")
+                assert "t.__D=D" in payload["code"]
+                assert payload["sdkKey"] == _SentinelBrowserRuntime._SDK_GLOBAL
+                return {"ready": True, "hasD": True, "hasTurnstile": True}
             return None
 
     class _Browser:
@@ -314,7 +375,7 @@ def test_sentinel_runtime_uses_camoufox_and_releases_it(monkeypatch):
     runtime = _SentinelBrowserRuntime.create(
         _Session(),
         user_agent=FIREFOX_UA,
-        proxy="http://name:pass@127.0.0.1:8080",
+        proxy="http://proxy.example.com:8080",
     )
     assert _Camoufox.options["headless"] is True
     assert _Camoufox.options["block_webrtc"] is True
@@ -332,7 +393,48 @@ def test_sentinel_runtime_uses_camoufox_and_releases_it(monkeypatch):
     runtime.close()
     runtime.close()
     assert events.count("enter") == 1
+    assert events.count("install") == 1
     assert events.count("exit") == 1
+
+
+def test_sentinel_runtime_reinstalls_private_sdk_before_vm_tokens():
+    class _Page:
+        def __init__(self):
+            self.install_count = 0
+            self.vm_count = 0
+
+        def evaluate(self, _expression, *args):
+            payload = args[0] if args else None
+            if payload == _SentinelBrowserRuntime._SDK_GLOBAL:
+                return False
+            if isinstance(payload, dict) and "code" in payload:
+                self.install_count += 1
+                return {"ready": True, "hasD": True, "hasTurnstile": True}
+            if isinstance(payload, dict) and "chatReq" in payload:
+                self.vm_count += 1
+                assert payload["sdkKey"] == _SentinelBrowserRuntime._SDK_GLOBAL
+                return {
+                    "t": "turnstile-proof",
+                    "so": "",
+                    "soFallback": "",
+                }
+            raise AssertionError(f"unexpected evaluate payload: {payload!r}")
+
+    runtime = _SentinelBrowserRuntime.__new__(_SentinelBrowserRuntime)
+    runtime._page = _Page()
+    runtime._patched_sdk_code = "patched sdk"
+
+    result = runtime.vm_tokens(
+        {
+            "turnstile": {"required": True, "dx": "turnstile-dx"},
+            "so": {},
+        },
+        "cached-proof",
+    )
+
+    assert result == {"t": "turnstile-proof", "so": ""}
+    assert runtime._page.install_count == 1
+    assert runtime._page.vm_count == 1
 
 
 def test_sentinel_runtime_releases_failed_camoufox_startup(monkeypatch):

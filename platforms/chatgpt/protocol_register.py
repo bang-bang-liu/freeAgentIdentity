@@ -68,6 +68,26 @@ LAST_NAMES = (
     "Lee", "White",
 )
 
+SECURITY_EMAIL_RESEND_MIN_INTERVAL = 60.0
+
+
+def _diagnostic_fingerprint(value: object) -> str:
+    """Return a short diagnostic tag without putting secrets in task logs."""
+    normalized = str(value or "").strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12] if normalized else "unknown"
+
+
+def _otp_submission_diagnostic(otp_callback, code: str) -> str:
+    code_tag = str(getattr(otp_callback, "last_code_fingerprint", "") or "").strip()
+    if not code_tag:
+        code_tag = _diagnostic_fingerprint(code)
+    message_tag = str(getattr(otp_callback, "last_message_fingerprint", "") or "").strip()
+    if not message_tag:
+        message_tag = _diagnostic_fingerprint(
+            getattr(otp_callback, "last_message_identity", "")
+        )
+    return f"消息指纹={message_tag}，验证码指纹={code_tag}"
+
 
 def _random_profile() -> tuple[str, str]:
     name = f"{random.choice(FIRST_NAMES)} {random.choice(LAST_NAMES)}"
@@ -287,6 +307,7 @@ class _SentinelBrowserRuntime:
 
     _sdk_lock = threading.Lock()
     _sdk_code: str | None = None
+    _SDK_GLOBAL = "__freeAgentIdentitySentinelSDK"
 
     def __init__(self, session, *, user_agent: str, proxy: str | None):
         from camoufox.sync_api import Camoufox
@@ -302,6 +323,7 @@ class _SentinelBrowserRuntime:
         self._camoufox = None
         self._browser = None
         self._page = None
+        self._patched_sdk_code = ""
         launch_options = {
             "headless": True,
             "locale": list(FIREFOX_LOCALES),
@@ -388,11 +410,57 @@ class _SentinelBrowserRuntime:
         )
         if hook not in sdk_code:
             raise RuntimeError("Sentinel SDK 内部接口发生变化，无法生成 VM token")
-        self._page.evaluate(
-            "code => window.eval(code)", sdk_code.replace(hook, replacement)
+        self._patched_sdk_code = sdk_code.replace(hook, replacement, 1)
+        self._install_sdk()
+
+    def _install_sdk(self) -> None:
+        result = self._page.evaluate(
+            """({ code, sdkKey }) => {
+                window.eval(code);
+                const sdk = window.SentinelSDK;
+                if (!sdk || typeof sdk !== "object") {
+                    return { ready: false, reason: "sdk_object_missing" };
+                }
+                Object.defineProperty(window, sdkKey, {
+                    configurable: true,
+                    writable: true,
+                    value: sdk,
+                });
+                return {
+                    ready: typeof sdk.__D === "function"
+                        && typeof sdk.___n === "function",
+                    hasD: typeof sdk.__D === "function",
+                    hasTurnstile: typeof sdk.___n === "function",
+                };
+            }""",
+            {
+                "code": self._patched_sdk_code,
+                "sdkKey": self._SDK_GLOBAL,
+            },
         )
-        if self._page.evaluate("typeof window.SentinelSDK") != "object":
-            raise RuntimeError("Sentinel SDK 初始化失败")
+        if not isinstance(result, dict) or not result.get("ready"):
+            reason = (
+                str((result or {}).get("reason") or "private_api_missing")
+                if isinstance(result, dict)
+                else "invalid_install_result"
+            )
+            raise RuntimeError(f"Sentinel SDK 初始化失败: {reason}")
+
+    def _sdk_private_api_ready(self) -> bool:
+        try:
+            return bool(self._page.evaluate(
+                """sdkKey => {
+                    const sdk = window[sdkKey];
+                    return Boolean(
+                        sdk
+                        && typeof sdk.__D === "function"
+                        && typeof sdk.___n === "function"
+                    );
+                }""",
+                self._SDK_GLOBAL,
+            ))
+        except Exception:
+            return False
 
     @classmethod
     def create(cls, *args, **kwargs):
@@ -417,27 +485,48 @@ class _SentinelBrowserRuntime:
         return "syntaxerror" in lowered or "typeerror" in lowered or "error:" in lowered
 
     def vm_tokens(self, chat_req: dict, cached_proof: str) -> dict[str, str]:
-        result = self._page.evaluate(
-            """async ({ chatReq, cachedProof }) => {
-                const sdk = window.SentinelSDK;
-                sdk.__D(chatReq, cachedProof);
-                const turnstile = chatReq.turnstile || {};
-                const t = turnstile.dx
-                    ? await sdk.___n(chatReq, turnstile.dx)
-                    : null;
-                let so = null;
-                const observer = chatReq.so || {};
-                if (observer.collector_dx && typeof sdk.__Nt === "function") {
-                    so = await sdk.__Nt(observer.collector_dx);
-                }
-                let soFallback = null;
-                if (observer.snapshot_dx && typeof sdk.__jt === "function") {
-                    soFallback = await sdk.__jt(observer.snapshot_dx, cachedProof);
-                }
-                return { t, so, soFallback };
-            }""",
-            {"chatReq": chat_req, "cachedProof": cached_proof},
-        )
+        result = None
+        for attempt in range(2):
+            if not self._sdk_private_api_ready():
+                self._install_sdk()
+            result = self._page.evaluate(
+                """async ({ sdkKey, chatReq, cachedProof }) => {
+                    const sdk = window[sdkKey];
+                    const turnstile = chatReq.turnstile || {};
+                    if (
+                        !sdk
+                        || typeof sdk.__D !== "function"
+                        || (turnstile.dx && typeof sdk.___n !== "function")
+                    ) {
+                        return { runtimeError: "private_api_missing" };
+                    }
+                    sdk.__D(chatReq, cachedProof);
+                    const t = turnstile.dx
+                        ? await sdk.___n(chatReq, turnstile.dx)
+                        : null;
+                    let so = null;
+                    const observer = chatReq.so || {};
+                    if (observer.collector_dx && typeof sdk.__Nt === "function") {
+                        so = await sdk.__Nt(observer.collector_dx);
+                    }
+                    let soFallback = null;
+                    if (observer.snapshot_dx && typeof sdk.__jt === "function") {
+                        soFallback = await sdk.__jt(observer.snapshot_dx, cachedProof);
+                    }
+                    return { t, so, soFallback };
+                }""",
+                {
+                    "sdkKey": self._SDK_GLOBAL,
+                    "chatReq": chat_req,
+                    "cachedProof": cached_proof,
+                },
+            )
+            if not isinstance(result, dict) or not result.get("runtimeError"):
+                break
+            if attempt == 0:
+                self._install_sdk()
+                continue
+            raise RuntimeError("Sentinel SDK 私有接口丢失，重新初始化后仍不可用")
         t_value = str((result or {}).get("t") or "")
         if (chat_req.get("turnstile", {}).get("required") and not t_value):
             raise RuntimeError("Sentinel Turnstile VM 未生成 t token")
@@ -451,9 +540,11 @@ class _SentinelBrowserRuntime:
         return {"t": t_value, "so": so_value}
 
     def token_headers(self, flow: str) -> dict[str, str]:
+        if not self._sdk_private_api_ready():
+            self._install_sdk()
         result = self._page.evaluate(
-            """async flow => {
-                const sdk = window.SentinelSDK;
+            """async ({ sdkKey, flow }) => {
+                const sdk = window[sdkKey];
                 const token = await sdk.token(flow);
                 let so = null;
                 if (typeof sdk.sessionObserverToken === "function") {
@@ -461,7 +552,7 @@ class _SentinelBrowserRuntime:
                 }
                 return { token, so };
             }""",
-            flow,
+            {"sdkKey": self._SDK_GLOBAL, "flow": flow},
         )
         token = result.get("token") if isinstance(result, dict) else None
         if isinstance(token, str):
@@ -690,6 +781,7 @@ class ChatGPTProtocolRegister:
         otp_callback: Callable[[], str] | None = None,
         log_fn: Callable[[str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        setup_security: bool = True,
         impersonate: str = FIREFOX_IMPERSONATE,
         user_agent: str | None = None,
         session=None,
@@ -699,6 +791,7 @@ class ChatGPTProtocolRegister:
         self.otp_callback = otp_callback
         self.log = log_fn or (lambda _message: None)
         self.cancel_check = cancel_check or (lambda: False)
+        self.setup_security = bool(setup_security)
         self.user_agent = str(user_agent or type(self).user_agent)
         self.platform = (
             FIREFOX_LINUX_PLATFORM
@@ -730,6 +823,17 @@ class ChatGPTProtocolRegister:
             f"{status} (TLS={alignment['tls']}, "
             f"headers={alignment['headers']}, sentinel={alignment['sentinel']})"
         )
+
+    def close(self) -> None:
+        """Stop an in-flight protocol registration from a cancel callback."""
+        try:
+            self.sentinel.close()
+        except Exception:
+            pass
+        try:
+            self.session.close()
+        except Exception:
+            pass
 
     def _navigation_headers(self, referer: str = "", *, accept: str | None = None) -> dict:
         """Build browser-like headers for HTML/redirect GET requests."""
@@ -993,10 +1097,21 @@ class ChatGPTProtocolRegister:
         self,
         excluded_codes: set[str],
         *,
+        excluded_identities: set[str] | None = None,
+        prior_codes: set[str] | None = None,
+        prior_identities: set[str] | None = None,
         deadline: float,
     ) -> str:
+        """Read an OTP while skipping codes rejected by this re-auth step."""
         if not callable(self.otp_callback):
             return ""
+        excluded_identities = {
+            str(value or "").strip()
+            for value in (excluded_identities or set())
+            if str(value or "").strip()
+        }
+        prior_codes = {str(value or "").strip() for value in (prior_codes or set()) if str(value or "").strip()}
+        prior_identities = {str(value or "").strip() for value in (prior_identities or set()) if str(value or "").strip()}
         while time.time() < deadline:
             remaining = max(1, int(deadline - time.time()))
             if getattr(self.otp_callback, "supports_timeout_override", False):
@@ -1006,10 +1121,24 @@ class ChatGPTProtocolRegister:
             code = str(code or "").strip()
             if not code:
                 return ""
-            if code not in excluded_codes:
-                return code
-            self.log(f"忽略注册阶段已使用的邮箱验证码: {code}，继续等待 re-auth 新验证码")
-            time.sleep(0.5)
+            identity = str(getattr(self.otp_callback, "last_message_identity", "") or "").strip()
+            manual_override = bool(getattr(self.otp_callback, "last_message_manual", False))
+            if code in excluded_codes and not manual_override and (
+                not identity or identity in excluded_identities
+            ):
+                self.log(f"忽略此前同一封邮件已拒绝的邮箱验证码: {code}，继续等待新邮件")
+                time.sleep(0.5)
+                continue
+            if code in prior_codes and (
+                manual_override or not identity or not prior_identities or identity in prior_identities
+            ):
+                self.log(
+                    f"忽略注册阶段重复验证码: {code}，"
+                    "未确认来自新的邮箱消息，继续等待"
+                )
+                time.sleep(0.5)
+                continue
+            return code
         return ""
 
     def _verify_password_reauth_protocol(self, password: str, *, referer: str) -> dict:
@@ -1032,12 +1161,44 @@ class ChatGPTProtocolRegister:
         password: str,
         secret: str,
         excluded_codes: set[str],
+        registration_email_identities: set[str] | None = None,
         expect_password_page: bool,
         timeout: int = 120,
+        restart_reauth: Callable[[], str] | None = None,
     ) -> str:
         deadline = time.time() + timeout
         current_url = str(start_url or "").strip()
         email_resend_requested = False
+        # Codes explicitly rejected by this re-auth step are blocked for its
+        # message identity.  A registration-stage code is additionally gated
+        # by its message identity in _get_new_email_code_protocol.
+        rejected_codes: set[str] = set()
+        rejected_code_identities: set[str] = set()
+        resend_count = 0
+        max_resends = 3
+        last_resend_at = 0.0
+        reauth_restart_count = 0
+        max_reauth_restarts = 2
+
+        def restart_after_invalid_state(reason: str) -> bool:
+            nonlocal current_url, deadline, email_resend_requested, resend_count, reauth_restart_count
+            if not callable(restart_reauth) or reauth_restart_count >= max_reauth_restarts:
+                return False
+            reauth_restart_count += 1
+            self.log(
+                f"安全设置 re-auth 当前步骤已失效 ({reason})，"
+                f"重新启动认证步骤 ({reauth_restart_count}/{max_reauth_restarts})"
+            )
+            current_url = str(restart_reauth() or "").strip()
+            if not current_url:
+                return False
+            # A fresh server-side auth step needs a fresh OTP wait budget.
+            deadline = time.time() + timeout
+            email_resend_requested = False
+            resend_count = 0
+            rejected_codes.clear()
+            rejected_code_identities.clear()
+            return True
 
         while time.time() < deadline:
             self._check_cancelled()
@@ -1046,24 +1207,67 @@ class ChatGPTProtocolRegister:
                 if not callable(self.otp_callback):
                     raise RuntimeError("安全设置 re-auth 需要邮箱验证码，但未提供 otp_callback")
                 if not email_resend_requested:
-                    self._resend_email_otp_protocol(referer=current_url)
+                    if resend_count >= max_resends:
+                        raise RuntimeError("安全设置 re-auth 邮箱验证码多次无效，请稍后重试")
+                    remaining_cooldown = (
+                        last_resend_at
+                        + SECURITY_EMAIL_RESEND_MIN_INTERVAL
+                        - time.monotonic()
+                    )
+                    if remaining_cooldown > 0:
+                        self.log(
+                            f"安全设置 re-auth 验证码重发冷却中，等待 {int(remaining_cooldown) + 1} 秒"
+                        )
+                    while remaining_cooldown > 0:
+                        self._check_cancelled()
+                        time.sleep(min(1.0, remaining_cooldown))
+                        remaining_cooldown = (
+                            last_resend_at
+                            + SECURITY_EMAIL_RESEND_MIN_INTERVAL
+                            - time.monotonic()
+                        )
+                    try:
+                        self._resend_email_otp_protocol(referer=current_url)
+                    except RuntimeError as exc:
+                        if "invalid_state" in str(exc).lower() and restart_after_invalid_state("invalid_state"):
+                            continue
+                        raise
                     email_resend_requested = True
+                    resend_count += 1
+                    last_resend_at = time.monotonic()
+                    deadline = max(deadline, time.time() + timeout)
                 code = self._get_new_email_code_protocol(
-                    excluded_codes,
+                    rejected_codes,
+                    excluded_identities=rejected_code_identities,
+                    prior_codes=excluded_codes if registration_email_identities is not None else None,
+                    prior_identities=registration_email_identities,
                     deadline=deadline,
                 )
                 if not code:
                     raise RuntimeError("安全设置 re-auth 未获取到新的邮箱验证码")
+                self.log(
+                    "安全设置 re-auth 提交邮箱验证码（"
+                    f"验证码={str(code).strip()}，"
+                    f"{_otp_submission_diagnostic(self.otp_callback, code)}）"
+                )
                 response, payload = self._validate_email_otp_protocol(
                     code,
                     referer=current_url,
                 )
                 if getattr(response, "status_code", 0) >= 400 or payload.get("error"):
-                    excluded_codes.add(code)
+                    rejected_codes.add(code)
+                    rejected_identity = str(
+                        getattr(self.otp_callback, "last_message_identity", "") or ""
+                    ).strip()
+                    if rejected_identity:
+                        rejected_code_identities.add(rejected_identity)
                     self.log(
                         "安全设置 re-auth 邮箱验证码校验失败: "
                         f"{_response_error(response, payload)}，准备重新请求新验证码"
                     )
+                    validation_error = _response_error(response, payload)
+                    if any(marker in validation_error.lower() for marker in ("invalid_auth_step", "invalid_state")):
+                        self.log("安全设置 re-auth 保留当前认证步骤，重新发送邮箱验证码")
                     email_resend_requested = False
                     continue
                 continue_url = _continue_url(payload)
@@ -1071,7 +1275,6 @@ class ChatGPTProtocolRegister:
                     raise RuntimeError(
                         "安全设置 re-auth 邮箱验证码验证成功但未返回密码页面 URL"
                     )
-                excluded_codes.add(code)
                 current_url = self._follow_security_url(
                     continue_url,
                     referer=current_url,
@@ -1160,6 +1363,7 @@ class ChatGPTProtocolRegister:
         password: str,
         session_payload: dict,
         excluded_codes: set[str],
+        registration_email_identities: set[str] | None = None,
     ) -> dict:
         access_token = str(session_payload.get("accessToken") or "").strip()
         if not access_token:
@@ -1199,21 +1403,29 @@ class ChatGPTProtocolRegister:
                 "TOTP enrollment 需要 re-auth: "
                 f"{_response_error(enroll_response, enroll_payload)}"
             )
-            start_url = self._start_security_reauth_protocol(
-                email=email,
-                params={
+            reauth_params = {
                     "connection": "password",
                     "reauth": "password",
                     "max_age": "0",
-                },
-                callback_url=f"{CHATGPT_APP}/?security_setup=totp_continue",
-            )
+            }
+            callback_url = f"{CHATGPT_APP}/?security_setup=totp_continue"
+
+            def restart_reauth() -> str:
+                return self._start_security_reauth_protocol(
+                    email=email,
+                    params=reauth_params,
+                    callback_url=callback_url,
+                )
+
+            start_url = restart_reauth()
             self._complete_security_reauth_protocol(
                 start_url=start_url,
                 password=password,
                 secret="",
                 excluded_codes=excluded_codes,
+                registration_email_identities=registration_email_identities,
                 expect_password_page=False,
+                restart_reauth=restart_reauth,
             )
             session_payload = self._session_payload()
             access_token = str(session_payload.get("accessToken") or "").strip()
@@ -1298,25 +1510,33 @@ class ChatGPTProtocolRegister:
         password: str,
         secret: str,
         excluded_codes: set[str],
+        registration_email_identities: set[str] | None = None,
     ) -> dict:
         callback_url = f"{CHATGPT_APP}/?security_setup=password_done"
-        start_url = self._start_security_reauth_protocol(
-            email=email,
-            params={
+        reauth_params = {
                 "connection": "password",
                 "reauth": "password",
                 "post_login_add_password": "true",
                 "prompt": "login",
                 "max_age": "0",
-            },
-            callback_url=callback_url,
-        )
+        }
+
+        def restart_reauth() -> str:
+            return self._start_security_reauth_protocol(
+                email=email,
+                params=reauth_params,
+                callback_url=callback_url,
+            )
+
+        start_url = restart_reauth()
         password_page_url = self._complete_security_reauth_protocol(
             start_url=start_url,
             password=password,
             secret=secret,
             excluded_codes=excluded_codes,
+            registration_email_identities=registration_email_identities,
             expect_password_page=True,
+            restart_reauth=restart_reauth,
         )
         return self._add_password_protocol(
             password=password,
@@ -1329,6 +1549,7 @@ class ChatGPTProtocolRegister:
         email: str,
         password: str,
         excluded_codes: set[str],
+        registration_email_identities: set[str] | None = None,
     ) -> dict:
         session_payload = self._session_payload()
         self.log("安全设置前置认证完成")
@@ -1337,6 +1558,7 @@ class ChatGPTProtocolRegister:
             password=password,
             session_payload=session_payload,
             excluded_codes=excluded_codes,
+            registration_email_identities=registration_email_identities,
         )
         if totp_result.get("totp_already_enabled") and not totp_result.get("totp_secret"):
             # 注册阶段已经提交过密码；已有 TOTP 时无法推导出账户原有的 secret，
@@ -1352,6 +1574,7 @@ class ChatGPTProtocolRegister:
                 password=password,
                 secret=str(totp_result.get("totp_secret") or ""),
                 excluded_codes=excluded_codes,
+                registration_email_identities=registration_email_identities,
             )
         if password_result.get("password_set"):
             self.log(f"设置的密码: {password}")
@@ -1438,6 +1661,7 @@ class ChatGPTProtocolRegister:
         self._check_cancelled()
         self.log(f"开始 ChatGPT 协议注册: {email}")
         registration_email_codes: set[str] = set()
+        registration_email_identities: set[str] = set()
         try:
             self._initialize_signup(email)
             self.log("等待 Outlook 验证码...")
@@ -1445,6 +1669,9 @@ class ChatGPTProtocolRegister:
             if not code:
                 raise RuntimeError("未收到 Outlook 验证码")
             registration_email_codes.add(code)
+            identity = str(getattr(self.otp_callback, "last_message_identity", "") or "").strip()
+            if identity:
+                registration_email_identities.add(identity)
             validation = self._validate_otp(code)
             self.log("邮箱验证码校验通过")
             continue_url = str(validation.get("continue_url") or "").strip()
@@ -1478,12 +1705,23 @@ class ChatGPTProtocolRegister:
                     headers=self._navigation_headers(),
                     allow_redirects=True,
                 )
-            self.log("注册流程完成，开始设置 TOTP+密码")
-            security_info = self._setup_password_and_totp_protocol(
-                email=email,
-                password=password,
-                excluded_codes=registration_email_codes,
-            )
+            if self.setup_security:
+                self.log("注册流程完成，开始设置 TOTP+密码")
+                security_info = self._setup_password_and_totp_protocol(
+                    email=email,
+                    password=password,
+                    excluded_codes=registration_email_codes,
+                    registration_email_identities=registration_email_identities,
+                )
+            else:
+                self.log("已跳过注册后的 TOTP+密码设置")
+                security_info = {
+                    "password_set": bool(password),
+                    "password_path": "registration",
+                    "totp_set": False,
+                    "totp_secret": "",
+                    "otpauth": "",
+                }
             result = self._session_result(email, password)
             result.update(
                 {

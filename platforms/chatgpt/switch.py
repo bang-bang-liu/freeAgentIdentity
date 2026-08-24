@@ -109,6 +109,7 @@ def fetch_chatgpt_account_state(
     session_token: str = "",
     cookies: str = "",
     proxy: str | None = None,
+    include_trial: bool = True,
 ) -> dict:
     state = {
         "platform": "chatgpt",
@@ -143,29 +144,36 @@ def fetch_chatgpt_account_state(
                 # still be valid, so keep that result independent from this
                 # optional enrichment.
                 if resolved_access:
-                    details = fetch_subscription_status_details(account, proxy=proxy)
+                    details = fetch_subscription_status_details(
+                        account,
+                        proxy=proxy,
+                        include_trial=include_trial,
+                    )
                     state["subscription_status"] = details.get("status")
-                    if "plus_trial_eligible" in details:
+                    if include_trial and "plus_trial_eligible" in details:
                         state["plus_trial_eligible"] = details.get("plus_trial_eligible")
-                    if details.get("plus_trial_check_state"):
+                    if include_trial and details.get("plus_trial_check_state"):
                         state["plus_trial_check_state"] = details.get("plus_trial_check_state")
-                    if details.get("plus_trial_error"):
+                    if include_trial and details.get("plus_trial_error"):
                         state["plus_trial_error"] = details.get("plus_trial_error")
             except Exception as exc:
                 state["subscription_error"] = str(exc)
-                state["plus_trial_eligible"] = None
-                state["plus_trial_check_state"] = "unavailable"
-                state["plus_trial_error"] = str(exc)
+                if include_trial:
+                    state["plus_trial_eligible"] = None
+                    state["plus_trial_check_state"] = "unavailable"
+                    state["plus_trial_error"] = str(exc)
         else:
             state["profile_error"] = profile
-            state["plus_trial_eligible"] = None
-            state["plus_trial_check_state"] = "unavailable"
-            state["plus_trial_error"] = "账号 profile 查询失败，无法查询 Plus 试用资格"
+            if include_trial:
+                state["plus_trial_eligible"] = None
+                state["plus_trial_check_state"] = "unavailable"
+                state["plus_trial_error"] = "账号 profile 查询失败，无法查询 Plus 试用资格"
     else:
         state["valid"] = False
         state["profile_error"] = "缺少 access_token，且无法通过 session_token 刷新"
-        state["plus_trial_eligible"] = None
-        state["plus_trial_check_state"] = "unavailable"
-        state["plus_trial_error"] = "缺少 access_token，无法查询 Plus 试用资格"
+        if include_trial:
+            state["plus_trial_eligible"] = None
+            state["plus_trial_check_state"] = "unavailable"
+            state["plus_trial_error"] = "缺少 access_token，无法查询 Plus 试用资格"
 
     return state

@@ -58,6 +58,11 @@ class ProviderTestRequest(BaseModel):
     auth: dict[str, str] = Field(default_factory=dict)
 
 
+class MailboxStateRequest(BaseModel):
+    email: str
+    used: bool = False
+
+
 @router.post("/test")
 def test_provider(body: ProviderTestRequest):
     """测试 provider 配置是否正确 — 尝试创建/获取一个邮箱地址。"""
@@ -76,6 +81,22 @@ def test_provider(body: ProviderTestRequest):
     elif body.provider_type == "captcha":
         return {"ok": True, "message": "验证码服务暂不支持在线测试，请在注册任务中验证"}
     return {"ok": False, "error": f"不支持测试的 provider 类型: {body.provider_type}"}
+
+
+@router.get("/{setting_id}/mailboxes")
+def list_mailbox_state(setting_id: int):
+    try:
+        return service.list_mailboxes(setting_id)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.post("/{setting_id}/mailboxes/state")
+def update_mailbox_state(setting_id: int, body: MailboxStateRequest):
+    try:
+        return service.set_mailbox_used(setting_id, body.email, used=body.used)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 def _test_mailbox(driver_type: str, extra: dict, definition) -> dict:

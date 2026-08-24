@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, ChevronRight, CircleStop, LoaderCircle } from "lucide-react";
+import { ChevronDown, ChevronRight, CircleStop, KeyRound, LoaderCircle } from "lucide-react";
 
 import { API_BASE, apiFetch } from "@/lib/utils";
 import {
@@ -27,6 +27,14 @@ type LogGroup = {
   events: LogEvent[];
 };
 
+type OtpRequest = {
+  request_id: string;
+  worker_id: string;
+  worker_label: string;
+  email: string;
+  created_at: string;
+};
+
 const MAIN_GROUP_ID = "__main__";
 
 function classifyLine(line: string): string {
@@ -49,6 +57,10 @@ export function TaskLogPanel({
   const [doneStatus, setDoneStatus] = useState<string | null>(null);
   const [cancelSubmitting, setCancelSubmitting] = useState(false);
   const [cancelError, setCancelError] = useState("");
+  const [otpRequests, setOtpRequests] = useState<OtpRequest[]>([]);
+  const [otpValues, setOtpValues] = useState<Record<string, string>>({});
+  const [otpSubmitting, setOtpSubmitting] = useState<Record<string, boolean>>({});
+  const [otpErrors, setOtpErrors] = useState<Record<string, string>>({});
   // 折叠状态：默认全展开（undefined / false 都视为展开）
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const seenEventIdsRef = useRef<Set<number>>(new Set());
@@ -69,11 +81,13 @@ export function TaskLogPanel({
     eventSourceRef.current?.close();
     eventSourceRef.current = null;
     setDoneStatus(status);
+    setOtpRequests([]);
     onDoneRef.current(status);
   }, []);
 
   useEffect(() => {
     if (!taskId) return;
+    let disposed = false;
     seenEventIdsRef.current = new Set();
     cursorRef.current = 0;
     doneRef.current = false;
@@ -83,6 +97,10 @@ export function TaskLogPanel({
     setDoneStatus(null);
     setCancelSubmitting(false);
     setCancelError("");
+    setOtpRequests([]);
+    setOtpValues({});
+    setOtpSubmitting({});
+    setOtpErrors({});
     setCollapsed({});
 
     const pushEvent = (payload: any) => {
@@ -112,10 +130,35 @@ export function TaskLogPanel({
 
     const syncTask = async () => {
       const latest = await apiFetch(`/tasks/${taskId}`);
+      if (disposed) return;
       setTask(latest);
       if (isTerminalTaskStatus(latest.status) && !doneRef.current) {
         pushEvent({ done: true, status: latest.status });
       }
+    };
+
+    const syncOtpRequests = async () => {
+      const data = await apiFetch(`/tasks/${taskId}/otp-requests`);
+      if (disposed || doneRef.current) return;
+      const items = Array.isArray(data?.items) ? data.items : [];
+      const nextRequests: OtpRequest[] = items.map((item: Record<string, unknown>) => ({
+        request_id: String(item?.request_id || ""),
+        worker_id: String(item?.worker_id || ""),
+        worker_label: String(item?.worker_label || ""),
+        email: String(item?.email || ""),
+        created_at: String(item?.created_at || ""),
+      })).filter((item: OtpRequest) => item.request_id);
+      const activeIds = new Set(nextRequests.map((item) => item.request_id));
+      setOtpRequests(nextRequests);
+      setOtpValues((prev) => Object.fromEntries(
+        Object.entries(prev).filter(([requestId]) => activeIds.has(requestId)),
+      ));
+      setOtpSubmitting((prev) => Object.fromEntries(
+        Object.entries(prev).filter(([requestId]) => activeIds.has(requestId)),
+      ));
+      setOtpErrors((prev) => Object.fromEntries(
+        Object.entries(prev).filter(([requestId]) => activeIds.has(requestId)),
+      ));
     };
 
     const es = new EventSource(`${API_BASE}/tasks/${taskId}/logs/stream`);
@@ -139,6 +182,7 @@ export function TaskLogPanel({
     };
 
     syncTask().catch(() => {});
+    syncOtpRequests().catch(() => {});
 
     // 进度需要持续轮询：SSE 只发 events，progress 在 task model 上，
     // 必须主动 GET /tasks/{id} 拿。原实现里只在 SSE 不健康时轮询，导致
@@ -162,12 +206,19 @@ export function TaskLogPanel({
       }
     }, 1000);
 
+    const otpPoll = window.setInterval(() => {
+      if (doneRef.current) return;
+      syncOtpRequests().catch(() => {});
+    }, 500);
+
     return () => {
+      disposed = true;
       sseHealthyRef.current = false;
       eventSourceRef.current?.close();
       eventSourceRef.current = null;
       window.clearInterval(progressPoll);
       window.clearInterval(fallbackPoll);
+      window.clearInterval(otpPoll);
     };
   }, [completeTask, taskId]);
 
@@ -250,6 +301,32 @@ export function TaskLogPanel({
     }
   };
 
+  const submitOtp = async (requestId: string) => {
+    const code = String(otpValues[requestId] || "").trim();
+    if (!/^\d{4,10}$/.test(code) || otpSubmitting[requestId]) return;
+    setOtpSubmitting((prev) => ({ ...prev, [requestId]: true }));
+    setOtpErrors((prev) => ({ ...prev, [requestId]: "" }));
+    try {
+      await apiFetch(`/tasks/${taskId}/otp`, {
+        method: "POST",
+        body: JSON.stringify({ request_id: requestId, code }),
+      });
+      setOtpRequests((prev) => prev.filter((item) => item.request_id !== requestId));
+      setOtpValues((prev) => {
+        const next = { ...prev };
+        delete next[requestId];
+        return next;
+      });
+    } catch {
+      setOtpErrors((prev) => ({
+        ...prev,
+        [requestId]: t("taskLog.otpSubmitFailed"),
+      }));
+    } finally {
+      setOtpSubmitting((prev) => ({ ...prev, [requestId]: false }));
+    }
+  };
+
   return (
     <div className="flex h-full flex-col gap-4">
       <div className="grid gap-3 md:grid-cols-3">
@@ -306,6 +383,77 @@ export function TaskLogPanel({
       {cancelError ? (
         <div className="rounded-lg border border-red-400/35 bg-red-500/10 px-3 py-2 text-xs text-red-100">
           {cancelError}
+        </div>
+      ) : null}
+
+      {otpRequests.length > 0 ? (
+        <div className="space-y-2 rounded-lg border border-amber-400/35 bg-amber-400/10 p-3">
+          {otpRequests.map((request) => {
+            const code = otpValues[request.request_id] || "";
+            const submitting = Boolean(otpSubmitting[request.request_id]);
+            const canSubmit = /^\d{4,10}$/.test(code) && !submitting;
+            return (
+              <div
+                key={request.request_id}
+                className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center"
+              >
+                <div className="min-w-0 sm:flex-1">
+                  <div className="flex items-center gap-2 text-xs font-medium text-amber-100">
+                    <KeyRound className="h-4 w-4 shrink-0" />
+                    <span>{t("taskLog.otpWaiting")}</span>
+                    <span className="truncate text-amber-100/65">
+                      {request.worker_label || request.worker_id}
+                    </span>
+                  </div>
+                  <div className="mt-1 truncate pl-6 text-[11px] text-amber-100/70">
+                    {request.email} · {t("taskLog.otpAutoPolling")}
+                  </div>
+                </div>
+                <div className="flex min-w-0 items-center gap-2 sm:w-[260px]">
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    pattern="[0-9]*"
+                    autoComplete="one-time-code"
+                    value={code}
+                    onChange={(event) => {
+                      const value = event.target.value.replace(/\D/g, "").slice(0, 10);
+                      setOtpValues((prev) => ({ ...prev, [request.request_id]: value }));
+                      setOtpErrors((prev) => ({ ...prev, [request.request_id]: "" }));
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" && canSubmit) {
+                        event.preventDefault();
+                        submitOtp(request.request_id);
+                      }
+                    }}
+                    placeholder={t("taskLog.otpPlaceholder")}
+                    aria-label={`${t("taskLog.otpPlaceholder")} ${request.email}`}
+                    className="h-9 min-w-0 flex-1 rounded-md border border-amber-300/30 bg-[var(--bg-input)] px-3 text-sm text-[var(--text-primary)] outline-none focus:border-amber-300/70"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => submitOtp(request.request_id)}
+                    disabled={!canSubmit}
+                    title={t("taskLog.otpSubmit")}
+                    aria-label={t("taskLog.otpSubmit")}
+                    className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-amber-300/35 bg-amber-300/15 text-amber-100 hover:bg-amber-300/25 disabled:cursor-not-allowed disabled:opacity-45"
+                  >
+                    {submitting ? (
+                      <LoaderCircle className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <KeyRound className="h-4 w-4" />
+                    )}
+                  </button>
+                </div>
+                {otpErrors[request.request_id] ? (
+                  <div className="w-full text-xs text-red-300">
+                    {otpErrors[request.request_id]}
+                  </div>
+                ) : null}
+              </div>
+            );
+          })}
         </div>
       ) : null}
 

@@ -17,15 +17,29 @@ def _raise_if_cancelled(cancel_check: Callable[[], bool] | None) -> None:
         raise RuntimeError("任务已取消")
 
 
-def _sleep_with_cancel(seconds: float, cancel_check: Callable[[], bool] | None) -> None:
-    """Sleep in short slices so a task cancellation is observed promptly."""
+def _read_manual_code(manual_code_check: Callable[[], str | None] | None) -> str | None:
+    if not callable(manual_code_check):
+        return None
+    code = str(manual_code_check() or "").strip()
+    return code or None
+
+
+def _sleep_with_cancel(
+    seconds: float,
+    cancel_check: Callable[[], bool] | None,
+    manual_code_check: Callable[[], str | None] | None = None,
+) -> str | None:
+    """Sleep in short slices so cancellation and manual OTPs are observed promptly."""
     deadline = time.monotonic() + max(float(seconds or 0), 0.0)
     while True:
         _raise_if_cancelled(cancel_check)
+        manual_code = _read_manual_code(manual_code_check)
+        if manual_code:
+            return manual_code
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return
-        time.sleep(min(0.25, remaining))
+            return None
+        time.sleep(min(0.1, remaining))
 
 
 @dataclass
@@ -49,12 +63,32 @@ class BaseMailbox(ABC):
         before_ids: set | None = None,
         code_pattern: str | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        manual_code_check: Callable[[], str | None] | None = None,
     ) -> str:
         """等待并返回验证码。"""
 
     @abstractmethod
     def get_current_ids(self, account: MailboxAccount) -> set:
         """返回当前邮件 ID 集合，用于过滤旧邮件。"""
+
+    def release_email(self, account: MailboxAccount | None) -> None:
+        """释放本次注册期间的邮箱租约（默认 provider 无需处理）。"""
+        del account
+
+    def get_last_code_identity(self, account: MailboxAccount) -> str | None:
+        """Return the message identity that produced the last automatic code.
+
+        Providers that expose a message ID/UID should override this.  The
+        registration flow uses it to distinguish a newly delivered message
+        that happens to reuse the previous numeric OTP from a stale response.
+        """
+        del account
+        return None
+
+    def get_last_code_metadata(self, account: MailboxAccount) -> dict:
+        """Return non-secret metadata for the message that produced the code."""
+        del account
+        return {}
 
     def wait_for_link(
         self,
@@ -100,6 +134,16 @@ class FallbackMailbox(BaseMailbox):
     def get_current_ids(self, account: MailboxAccount) -> set:
         return self._resolve(account).get_current_ids(account)
 
+    def release_email(self, account: MailboxAccount | None) -> None:
+        if account is not None:
+            self._resolve(account).release_email(account)
+
+    def get_last_code_identity(self, account: MailboxAccount) -> str | None:
+        return self._resolve(account).get_last_code_identity(account)
+
+    def get_last_code_metadata(self, account: MailboxAccount) -> dict:
+        return self._resolve(account).get_last_code_metadata(account)
+
     def wait_for_code(
         self,
         account: MailboxAccount,
@@ -108,6 +152,7 @@ class FallbackMailbox(BaseMailbox):
         before_ids: set | None = None,
         code_pattern: str | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        manual_code_check: Callable[[], str | None] | None = None,
     ) -> str:
         return self._resolve(account).wait_for_code(
             account,
@@ -116,6 +161,7 @@ class FallbackMailbox(BaseMailbox):
             before_ids=before_ids,
             code_pattern=code_pattern,
             cancel_check=cancel_check,
+            manual_code_check=manual_code_check,
         )
 
     def wait_for_link(
@@ -190,10 +236,18 @@ def _create_icloud_workbench(extra: dict, proxy: str | None) -> BaseMailbox:
     )
 
 
+def _create_domain_mailbox(extra: dict, proxy: str | None) -> BaseMailbox:
+    from core.domain_mailbox import DomainImapMailbox
+
+    del proxy  # IMAP connects to the configured mail server directly.
+    return DomainImapMailbox.from_config(extra)
+
+
 MAILBOX_FACTORY_REGISTRY = {
     "local_ms_pool": _create_local_ms_pool,
     "api_mailbox": _create_api_mailbox,
     "icloud_workbench": _create_icloud_workbench,
+    "domain_mailbox": _create_domain_mailbox,
 }
 
 

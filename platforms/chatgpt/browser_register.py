@@ -6,6 +6,7 @@ import json
 import random
 import re
 import secrets
+import threading
 import time
 import uuid
 from typing import Any, Callable, Optional
@@ -27,6 +28,25 @@ from .constants import (
 
 
 CAMOUFOX_VISIBLE_WINDOW_SIZE = (1280, 720)
+SECURITY_EMAIL_RESEND_MIN_INTERVAL = 60.0
+
+
+def _diagnostic_fingerprint(value: object) -> str:
+    """Return a short diagnostic tag without putting secrets in task logs."""
+    normalized = str(value or "").strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12] if normalized else "unknown"
+
+
+def _otp_submission_diagnostic(otp_callback, code: str) -> str:
+    code_tag = str(getattr(otp_callback, "last_code_fingerprint", "") or "").strip()
+    if not code_tag:
+        code_tag = _diagnostic_fingerprint(code)
+    message_tag = str(getattr(otp_callback, "last_message_fingerprint", "") or "").strip()
+    if not message_tag:
+        message_tag = _diagnostic_fingerprint(
+            getattr(otp_callback, "last_message_identity", "")
+        )
+    return f"消息指纹={message_tag}，验证码指纹={code_tag}"
 
 
 def _apply_camoufox_visible_window_limit(
@@ -281,6 +301,48 @@ def _wait_for_any_selector(page, selectors: list[str], timeout: int = 30):
             return found
         time.sleep(0.5)
     return None
+
+
+def _iter_page_contexts(page):
+    """Yield the main page and any child frames once, preserving order."""
+    contexts = [page]
+    try:
+        for frame in page.frames:
+            if frame is not getattr(page, "main_frame", None):
+                contexts.append(frame)
+    except Exception:
+        pass
+    return contexts
+
+
+def _wait_for_visible_otp_input(page, timeout: int = 15) -> bool:
+    """Wait until an actual visible OTP control has rendered.
+
+    The authorize URL can identify the email-verification state before the
+    React form (or its iframe) has finished rendering.  URL-only detection
+    otherwise consumes the mailbox code and then fails while trying to fill a
+    page that still has no usable input.
+    """
+    deadline = time.time() + max(int(timeout or 1), 1)
+    selectors = [
+        *OTP_INPUT_SELECTORS,
+        "input[aria-label*='code' i]",
+        "input[placeholder*='code' i]",
+        "input[placeholder*='验证码' i]",
+        "[role='textbox']",
+        "[contenteditable='true']",
+    ]
+    while time.time() < deadline:
+        for context in _iter_page_contexts(page):
+            for selector in selectors:
+                try:
+                    target = context.locator(selector).first
+                    if target.is_visible(timeout=250):
+                        return True
+                except Exception:
+                    continue
+        time.sleep(0.25)
+    return False
 
 
 def _click_first(page, selectors: list[str], *, timeout: int = 10) -> str | None:
@@ -1402,6 +1464,53 @@ def _browser_fetch(page, url: str, *, method: str = "GET", headers: dict | None 
     )
 
 
+def _browser_fetch_retry(
+    page,
+    url: str,
+    *,
+    method: str = "GET",
+    headers: dict | None = None,
+    body: str | None = None,
+    redirect: str = "manual",
+    timeout_ms: int = 30000,
+    attempts: int = 2,
+    log: Callable[[str], None] | None = None,
+) -> dict:
+    """Retry browser-side fetches that fail at the proxy/transport layer.
+
+    A transient connection timeout is represented as status ``0`` by
+    ``_browser_fetch``.  Security endpoints are especially prone to this
+    after the account returns from the auth callback, so one retry avoids
+    turning a healthy registration into a false failure.
+    """
+    last: dict = {"ok": False, "status": 0, "url": url, "headers": {}, "text": "", "data": None}
+    for attempt in range(1, max(int(attempts or 1), 1) + 1):
+        try:
+            result = _browser_fetch(
+                page,
+                url,
+                method=method,
+                headers=headers,
+                body=body,
+                redirect=redirect,
+                timeout_ms=timeout_ms,
+            )
+        except Exception as exc:
+            result = {**last, "text": str(exc)}
+        if isinstance(result, dict):
+            last = result
+        if bool(last.get("ok")) or int(last.get("status") or 0) != 0:
+            return last
+        if attempt < attempts:
+            if callable(log):
+                log(
+                    f"浏览器请求超时，准备重试 ({attempt + 1}/{attempts}): "
+                    f"{str(last.get('text') or '')[:120]}"
+                )
+            time.sleep(0.8)
+    return last
+
+
 def _build_browser_sentinel_token(page, device_id: str, flow: str, user_agent: str) -> str:
     generator = _SentinelTokenGenerator(device_id, user_agent)
     req_body = json.dumps(
@@ -1717,13 +1826,15 @@ def _chatgpt_security_api(
         "content-type": "application/json",
         "oai-language": "en-US",
     }
-    return _browser_fetch(
+    return _browser_fetch_retry(
         page,
         f"{CHATGPT_APP}{path}",
         method=method,
         headers=headers,
         body=json.dumps(body, separators=(",", ":")) if body is not None else None,
         redirect="follow",
+        timeout_ms=30000,
+        attempts=2,
     )
 
 
@@ -1744,7 +1855,8 @@ def _chatgpt_security_session(page, log) -> dict:
 
 
 def _start_chatgpt_security_reauth(page, email: str, params: dict, callback_url: str, log) -> str:
-    csrf_token = _get_browser_csrf_token(page)
+    _ensure_chatgpt_csrf_origin(page, log=log)
+    csrf_token = _get_browser_csrf_token(page, log=log)
     if not csrf_token:
         raise RuntimeError("安全设置 re-auth 获取 CSRF token 失败")
     try:
@@ -1778,6 +1890,53 @@ def _start_chatgpt_security_reauth(page, email: str, params: dict, callback_url:
 def _security_auth_referer(page, fallback: str) -> str:
     current_url = str(getattr(page, "url", "") or "").strip()
     return current_url if current_url.startswith(("http://", "https://")) else fallback
+
+
+def _ensure_chatgpt_csrf_origin(page, log: Callable[[str], None] | None = None) -> None:
+    """Put the browser page on ChatGPT's origin before reading its CSRF token.
+
+    The re-auth page lives on ``auth.openai.com``.  When an auth step expires
+    and is restarted, the page is still on that origin, but the next step first
+    reads ``chatgpt.com/api/auth/csrf`` with a page-side ``fetch``.  Firefox /
+    Camoufox can reject that cross-origin fetch as a generic ``NetworkError``
+    (status 0), which used to be reported as a CSRF failure.  Navigating back
+    to the app origin restores the correct host context for the CSRF cookie.
+    """
+    app_url = f"{CHATGPT_APP.rstrip('/')}/"
+    app_host = (urlparse(app_url).hostname or "").strip().lower()
+    current_url = str(getattr(page, "url", "") or "").strip()
+    current_host = (urlparse(current_url).hostname or "").strip().lower()
+    if app_host and current_host == app_host:
+        return
+    if callable(log):
+        log(
+            "安全设置 re-auth 重启前返回 ChatGPT 页面"
+            f"（当前页面: {current_url[:160] or 'unknown'}）"
+        )
+    _goto_with_retry(
+        page,
+        app_url,
+        wait_until="domcontentloaded",
+        timeout=30000,
+        log=log,
+    )
+
+
+def _wait_for_security_email_resend_window(page, last_resend_at: float, log) -> None:
+    remaining = last_resend_at + SECURITY_EMAIL_RESEND_MIN_INTERVAL - time.monotonic()
+    if remaining <= 0:
+        return
+    log(f"安全设置 re-auth 验证码重发冷却中，等待 {int(remaining) + 1} 秒")
+    deadline = time.monotonic() + remaining
+    while time.monotonic() < deadline:
+        try:
+            if callable(getattr(page, "is_closed", None)) and page.is_closed():
+                raise RuntimeError("任务已取消")
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+        time.sleep(min(0.25, max(deadline - time.monotonic(), 0.0)))
 
 
 def _resend_security_email_otp(page, log) -> dict:
@@ -2012,12 +2171,30 @@ def _get_security_email_code(
     otp_callback: Callable[[], str] | None,
     *,
     excluded_codes: set[str],
+    excluded_identities: set[str] | None = None,
+    prior_codes: set[str] | None = None,
+    prior_identities: set[str] | None = None,
     deadline: float,
     log,
 ) -> str:
-    """Return a re-auth email code that was not consumed by registration."""
+    """Read a re-auth OTP, rejecting stale reuse of a registration message.
+
+    ``excluded_codes`` contains values the current auth step already rejected;
+    ``excluded_identities`` narrows that rejection to the specific mailbox
+    messages that produced them, so a newly delivered message may legitimately
+    reuse the same numeric OTP.
+    ``prior_codes`` contains registration-stage values; those are only
+    eligible when the callback can prove they came from a different message.
+    """
     if not callable(otp_callback):
         return ""
+    excluded_identities = {
+        str(value or "").strip()
+        for value in (excluded_identities or set())
+        if str(value or "").strip()
+    }
+    prior_codes = {str(value or "").strip() for value in (prior_codes or set()) if str(value or "").strip()}
+    prior_identities = {str(value or "").strip() for value in (prior_identities or set()) if str(value or "").strip()}
     while time.time() < deadline:
         remaining = max(1, int(deadline - time.time()))
         if getattr(otp_callback, "supports_timeout_override", False):
@@ -2027,10 +2204,24 @@ def _get_security_email_code(
         code = str(code or "").strip()
         if not code:
             return ""
-        if code not in excluded_codes:
-            return code
-        log(f"忽略注册阶段已使用的邮箱验证码: {code}，继续等待 re-auth 新验证码")
-        time.sleep(0.5)
+        identity = str(getattr(otp_callback, "last_message_identity", "") or "").strip()
+        manual_override = bool(getattr(otp_callback, "last_message_manual", False))
+        if code in excluded_codes and not manual_override and (
+            not identity or identity in excluded_identities
+        ):
+            log(f"忽略此前同一封邮件已拒绝的邮箱验证码: {code}，继续等待新邮件")
+            time.sleep(0.5)
+            continue
+        if code in prior_codes and (
+            manual_override or not identity or not prior_identities or identity in prior_identities
+        ):
+            log(
+                f"忽略注册阶段重复验证码: {code}，"
+                "未确认来自新的邮箱消息，继续等待"
+            )
+            time.sleep(0.5)
+            continue
+        return code
     return ""
 
 
@@ -2041,18 +2232,48 @@ def _complete_security_reauth(
     secret: str,
     otp_callback: Callable[[], str] | None,
     excluded_email_codes: set[str] | None = None,
+    registration_email_identities: set[str] | None = None,
     log,
     expect_password_page: bool,
     timeout: int = 120,
+    restart_reauth: Callable[[], None] | None = None,
 ) -> bool:
     deadline = time.time() + timeout
-    excluded_codes = {
-        str(code or "").strip()
-        for code in (excluded_email_codes or set())
-        if str(code or "").strip()
-    }
+    # A repeated numeric OTP can be a genuinely newly issued code.  The getter
+    # accepts it only when the mailbox identity differs from registration;
+    # a code rejected from one message is blocked only for that message.
+    rejected_codes: set[str] = set()
+    rejected_code_identities: set[str] = set()
     password_submitted = False
     email_resend_requested = False
+    resend_count = 0
+    max_resends = 3
+    last_resend_at = 0.0
+    reauth_restart_count = 0
+    max_reauth_restarts = 2
+
+    def _restart_after_invalid_state(reason: str) -> bool:
+        nonlocal deadline, email_resend_requested, resend_count, password_submitted, reauth_restart_count
+        if not callable(restart_reauth) or reauth_restart_count >= max_reauth_restarts:
+            return False
+        reauth_restart_count += 1
+        log(
+            f"安全设置 re-auth 当前步骤已失效 ({reason})，"
+            f"重新启动认证步骤 ({reauth_restart_count}/{max_reauth_restarts})"
+        )
+        restart_reauth()
+        # A restarted auth step has its own OTP lifetime.  Keeping the old
+        # deadline would leave only the tail of the previous wait (for example
+        # 40 seconds after a slow mailbox delivery) and make the recovery
+        # path fail before the new code can arrive.
+        deadline = time.time() + timeout
+        rejected_codes.clear()
+        rejected_code_identities.clear()
+        email_resend_requested = False
+        resend_count = 0
+        password_submitted = False
+        return True
+
     while time.time() < deadline:
         if _security_is_mfa_selection_page(page):
             if not _click_totp_method(page, log):
@@ -2069,20 +2290,47 @@ def _complete_security_reauth(
             if not callable(otp_callback):
                 raise RuntimeError("安全设置 re-auth 需要邮箱验证码，但未提供 otp_callback")
             if not email_resend_requested:
-                _resend_security_email_otp(page, log)
+                if resend_count >= max_resends:
+                    raise RuntimeError("安全设置 re-auth 邮箱验证码多次无效，请稍后重试")
+                _wait_for_security_email_resend_window(page, last_resend_at, log)
+                try:
+                    _resend_security_email_otp(page, log)
+                except RuntimeError as exc:
+                    if "invalid_state" in str(exc).lower() and _restart_after_invalid_state("invalid_state"):
+                        continue
+                    raise
                 email_resend_requested = True
+                resend_count += 1
+                last_resend_at = time.monotonic()
+                deadline = max(deadline, time.time() + timeout)
             code = _get_security_email_code(
                 otp_callback,
-                excluded_codes=excluded_codes,
+                excluded_codes=rejected_codes,
+                excluded_identities=rejected_code_identities,
+                prior_codes=excluded_email_codes,
+                prior_identities=registration_email_identities,
                 deadline=deadline,
                 log=log,
             )
             if not code:
                 raise RuntimeError("安全设置 re-auth 未获取到新的邮箱验证码")
+            log(
+                "安全设置 re-auth 提交邮箱验证码（"
+                f"验证码={str(code).strip()}，"
+                f"{_otp_submission_diagnostic(otp_callback, code)}）"
+            )
             validation = _validate_security_email_otp(page, code, log)
             if not validation.get("ok"):
-                excluded_codes.add(code)
-                log(f"安全设置 re-auth 邮箱验证码校验失败: {_security_result_error(validation)}，准备重新请求新验证码")
+                rejected_codes.add(code)
+                rejected_identity = str(
+                    getattr(otp_callback, "last_message_identity", "") or ""
+                ).strip()
+                if rejected_identity:
+                    rejected_code_identities.add(rejected_identity)
+                validation_error = _security_result_error(validation)
+                log(f"安全设置 re-auth 邮箱验证码校验失败: {validation_error}，准备重新请求新验证码")
+                if any(marker in validation_error.lower() for marker in ("invalid_auth_step", "invalid_state")):
+                    log("安全设置 re-auth 保留当前认证步骤，重新发送邮箱验证码")
                 email_resend_requested = False
                 continue
             continue_url = _security_continue_url(validation.get("data"))
@@ -2145,6 +2393,8 @@ def _submit_security_password_dom(
     secret: str,
     otp_callback: Callable[[], str] | None,
     excluded_email_codes: set[str] | None = None,
+    registration_email_identities: set[str] | None = None,
+    restart_reauth: Callable[[], None] | None = None,
     log,
     timeout: int = 90,
 ) -> bool:
@@ -2171,12 +2421,12 @@ def _submit_security_password_dom(
         return False
     log("设置密码页面已提交")
     deadline = time.time() + timeout
-    excluded_codes = {
-        str(code or "").strip()
-        for code in (excluded_email_codes or set())
-        if str(code or "").strip()
-    }
+    rejected_codes: set[str] = set()
+    rejected_code_identities: set[str] = set()
     email_resend_requested = False
+    resend_count = 0
+    max_resends = 3
+    last_resend_at = 0.0
     while time.time() < deadline:
         if _security_is_mfa_selection_page(page):
             if not _click_totp_method(page, log):
@@ -2192,20 +2442,42 @@ def _submit_security_password_dom(
             if not callable(otp_callback):
                 return False
             if not email_resend_requested:
+                if resend_count >= max_resends:
+                    return False
+                _wait_for_security_email_resend_window(page, last_resend_at, log)
                 _resend_security_email_otp(page, log)
                 email_resend_requested = True
+                resend_count += 1
+                last_resend_at = time.monotonic()
+                deadline = max(deadline, time.time() + timeout)
             code = _get_security_email_code(
                 otp_callback,
-                excluded_codes=excluded_codes,
+                excluded_codes=rejected_codes,
+                excluded_identities=rejected_code_identities,
+                prior_codes=excluded_email_codes,
+                prior_identities=registration_email_identities,
                 deadline=deadline,
                 log=log,
             )
             if not code:
                 return False
+            log(
+                "设置密码后提交邮箱验证码（"
+                f"验证码={str(code).strip()}，"
+                f"{_otp_submission_diagnostic(otp_callback, code)}）"
+            )
             validation = _validate_security_email_otp(page, code, log)
             if not validation.get("ok"):
-                excluded_codes.add(code)
-                log(f"设置密码后邮箱验证码校验失败: {_security_result_error(validation)}，准备重新请求新验证码")
+                rejected_codes.add(code)
+                rejected_identity = str(
+                    getattr(otp_callback, "last_message_identity", "") or ""
+                ).strip()
+                if rejected_identity:
+                    rejected_code_identities.add(rejected_identity)
+                validation_error = _security_result_error(validation)
+                log(f"设置密码后邮箱验证码校验失败: {validation_error}，准备重新请求新验证码")
+                if any(marker in validation_error.lower() for marker in ("invalid_auth_step", "invalid_state")):
+                    log("设置密码后 re-auth 保留当前认证步骤，重新发送邮箱验证码")
                 email_resend_requested = False
                 continue
             continue_url = _security_continue_url(validation.get("data"))
@@ -2295,6 +2567,7 @@ def _setup_chatgpt_totp(
     password: str,
     otp_callback: Callable[[], str] | None,
     excluded_email_codes: set[str] | None = None,
+    registration_email_identities: set[str] | None = None,
     log,
     session_data: dict,
 ) -> dict:
@@ -2316,21 +2589,22 @@ def _setup_chatgpt_totp(
     if not bool(enroll.get("ok")) or not isinstance(enroll_data, dict):
         log(f"TOTP enrollment 需要 re-auth: {_security_result_error(enroll)}")
         callback_url = f"{CHATGPT_APP}/?security_setup=totp_continue"
-        _start_chatgpt_security_reauth(
-            page,
-            email,
-            {"connection": "password", "reauth": "password", "max_age": "0"},
-            callback_url,
-            log,
-        )
+        reauth_params = {"connection": "password", "reauth": "password", "max_age": "0"}
+
+        def restart_reauth() -> None:
+            _start_chatgpt_security_reauth(page, email, reauth_params, callback_url, log)
+
+        restart_reauth()
         _complete_security_reauth(
             page,
             password=password,
             secret="",
             otp_callback=otp_callback,
             excluded_email_codes=excluded_email_codes,
+            registration_email_identities=registration_email_identities,
             log=log,
             expect_password_page=False,
+            restart_reauth=restart_reauth,
         )
         if "chatgpt.com" not in str(getattr(page, "url", "") or "").lower():
             _goto_with_retry(page, f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=30000, log=log)
@@ -2415,31 +2689,33 @@ def _setup_chatgpt_password(
     secret: str,
     otp_callback: Callable[[], str] | None,
     excluded_email_codes: set[str] | None = None,
+    registration_email_identities: set[str] | None = None,
     log,
 ) -> dict:
     callback_url = f"{CHATGPT_APP}/?security_setup=password_done"
     log("设置密码前启动安全设置 re-auth")
-    _start_chatgpt_security_reauth(
-        page,
-        email,
-        {
+    reauth_params = {
             "connection": "password",
             "reauth": "password",
             "post_login_add_password": "true",
             "prompt": "login",
             "max_age": "0",
-        },
-        callback_url,
-        log,
-    )
+    }
+
+    def restart_reauth() -> None:
+        _start_chatgpt_security_reauth(page, email, reauth_params, callback_url, log)
+
+    restart_reauth()
     _complete_security_reauth(
         page,
         password=password,
         secret=secret,
         otp_callback=otp_callback,
         excluded_email_codes=excluded_email_codes,
+        registration_email_identities=registration_email_identities,
         log=log,
         expect_password_page=True,
+        restart_reauth=restart_reauth,
     )
 
     mode = "reset" if "reset-password" in str(getattr(page, "url", "") or "").lower() else "add"
@@ -2449,6 +2725,8 @@ def _setup_chatgpt_password(
         secret=secret,
         otp_callback=otp_callback,
         excluded_email_codes=excluded_email_codes,
+        registration_email_identities=registration_email_identities,
+        restart_reauth=restart_reauth,
         log=log,
     ):
         if "auth.openai.com" in str(getattr(page, "url", "") or "").lower():
@@ -2478,6 +2756,7 @@ def _setup_chatgpt_password_and_totp(
     password: str,
     otp_callback: Callable[[], str] | None,
     excluded_email_codes: set[str] | None = None,
+    registration_email_identities: set[str] | None = None,
     log,
 ) -> dict:
     """Run the user-script security flow before the final session request."""
@@ -2489,6 +2768,7 @@ def _setup_chatgpt_password_and_totp(
         password=password,
         otp_callback=otp_callback,
         excluded_email_codes=excluded_email_codes,
+        registration_email_identities=registration_email_identities,
         log=log,
         session_data=session_data,
     )
@@ -2505,6 +2785,7 @@ def _setup_chatgpt_password_and_totp(
             secret=str(totp_result.get("totp_secret") or ""),
             otp_callback=otp_callback,
             excluded_email_codes=excluded_email_codes,
+            registration_email_identities=registration_email_identities,
             log=log,
         )
     if password_result.get("password_set"):
@@ -2610,8 +2891,8 @@ def _seed_browser_device_id(page, device_id: str) -> None:
     )
 
 
-def _get_browser_csrf_token(page) -> str:
-    result = _browser_fetch(
+def _get_browser_csrf_token(page, log: Callable[[str], None] | None = None) -> str:
+    result = _browser_fetch_retry(
         page,
         f"{CHATGPT_APP}/api/auth/csrf",
         method="GET",
@@ -2621,6 +2902,9 @@ def _get_browser_csrf_token(page) -> str:
             "sec-fetch-site": "same-origin",
         },
         redirect="follow",
+        timeout_ms=30000,
+        attempts=2,
+        log=log,
     )
     if result.get("ok") and isinstance(result.get("data"), dict):
         return str((result.get("data") or {}).get("csrfToken") or "").strip()
@@ -2790,6 +3074,7 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
     time.sleep(1)
 
     filled = False
+    filled_context = page
 
     # 先尝试 6 格 OTP 输入框
     try:
@@ -2815,6 +3100,40 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
         pass
 
     # 再尝试单输入框
+    if not filled:
+        # Some auth deployments render the verification form inside a child
+        # frame.  Search those contexts as a fallback after the main-page
+        # selectors above have been exhausted.
+        for context in _iter_page_contexts(page):
+            if context is page:
+                continue
+            frame_candidates = [
+                context.locator("input[inputmode='numeric']"),
+                context.locator("input[autocomplete='one-time-code']"),
+                context.locator("input[name*='code' i]"),
+                context.locator("input[id*='code' i]"),
+                context.locator("input[type='text']"),
+                context.locator("input"),
+                context.locator("[role='textbox']"),
+                context.locator("[contenteditable='true']"),
+            ]
+            for candidate in frame_candidates:
+                try:
+                    target = candidate.first
+                    target.wait_for(state="visible", timeout=1200)
+                    target.click(timeout=1200)
+                    target.fill("")
+                    target.type(otp, delay=random.randint(18, 45))
+                    if str(target.input_value() or "").strip() or target.get_attribute("contenteditable") == "true":
+                        filled = True
+                        filled_context = context
+                        log("验证码页已填写 iframe 输入框")
+                        break
+                except Exception:
+                    continue
+            if filled:
+                break
+
     if not filled:
         otp_candidates = [
             page.get_by_label(re.compile(r"verification code|code|otp|認証コード|確認コード|ワンタイムコード", re.IGNORECASE)),
@@ -2868,7 +3187,7 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
 
     _browser_pause(page)
     submit_selector = _click_first(
-        page,
+        filled_context,
         [
             'button[type="submit"]',
             'button[data-testid="continue-button"]',
@@ -3644,6 +3963,24 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, lo
         if _is_email_otp(state):
             if not otp_callback:
                 raise RuntimeError("ChatGPT 注册需要邮箱验证码但未提供 otp_callback")
+            if not _wait_for_visible_otp_input(page, timeout=15):
+                # The authorization URL is sometimes reached before the
+                # verification form's client-side render completes.  Reload
+                # the same authorized page once before consuming the mailbox
+                # code, so a delayed/empty DOM does not waste a fresh OTP.
+                log("验证码输入框尚未渲染，重新加载验证码页面后重试")
+                try:
+                    _reload_with_retry(
+                        page,
+                        wait_until="domcontentloaded",
+                        timeout=15000,
+                        attempts=1,
+                        log=log,
+                    )
+                except Exception as exc:
+                    log(f"验证码页面重新加载失败: {str(exc)[:160]}")
+                if not _wait_for_visible_otp_input(page, timeout=10):
+                    raise RuntimeError("验证码页未渲染可填写输入框，请检查代理节点或授权页面")
             log("等待 ChatGPT 验证码")
             code = otp_callback()
             if not code:
@@ -3697,11 +4034,19 @@ class ChatGPTBrowserRegister:
         otp_callback: Optional[Callable[[], str]] = None,
         log_fn: Callable[[str], None] = print,
         backend_config: Optional[BrowserBackendConfig] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        setup_security: bool = True,
     ):
         self.headless = headless
         self.proxy = proxy
         self.otp_callback = otp_callback
         self.log = log_fn
+        self.cancel_check = cancel_check or (lambda: False)
+        self.setup_security = bool(setup_security)
+        self._cancel_requested = threading.Event()
+        self._active_lock = threading.RLock()
+        self._active_browser = None
+        self._active_page = None
         # backend_config 为 None 时默认 Camoufox，跟老调用方一致。
         # BitBrowser 路径需要上层 plugin.py 显式传 backend_config。
         self.backend_config = backend_config or BrowserBackendConfig.camoufox(
@@ -3713,6 +4058,20 @@ class ChatGPTBrowserRegister:
                 f"(profile={self.backend_config.bit_profile_id}, "
                 f"window_mode={self.backend_config.window_mode})"
             )
+
+    def cancel(self) -> None:
+        """Close the active browser immediately when a task is cancelled."""
+        self._cancel_requested.set()
+        with self._active_lock:
+            page = self._active_page
+            browser = self._active_browser
+        for target in (page, browser):
+            if target is None:
+                continue
+            try:
+                target.close()
+            except Exception:
+                pass
 
     def _open_browser(self, launch_opts: dict):
         """与业务代码代期使用的 ``with Camoufox(**launch_opts) as browser:`` 接口
@@ -3728,6 +4087,8 @@ class ChatGPTBrowserRegister:
         )
 
     def run(self, email: str, password: str) -> dict:
+        if self.cancel_check() or self._cancel_requested.is_set():
+            raise RuntimeError("任务已取消")
         if self.backend_config.is_bitbrowser:
             # BitBrowser 路径：profile 已配代理/指纹，launch_opts 不传这些。
             launch_opts = {"headless": self.backend_config.is_headless}
@@ -3739,9 +4100,16 @@ class ChatGPTBrowserRegister:
                 launch_opts["geoip"] = True
 
         with self._open_browser(launch_opts) as browser:
+            with self._active_lock:
+                self._active_browser = browser
+            if self.cancel_check() or self._cancel_requested.is_set():
+                raise RuntimeError("任务已取消")
             page = browser.new_page()
+            with self._active_lock:
+                self._active_page = page
             self.log("启动浏览器上下文注册状态机")
             registration_email_codes: set[str] = set()
+            registration_email_identities: set[str] = set()
 
             registration_otp_callback = self.otp_callback
             if callable(registration_otp_callback):
@@ -3750,6 +4118,11 @@ class ChatGPTBrowserRegister:
                     normalized = str(code or "").strip()
                     if normalized:
                         registration_email_codes.add(normalized)
+                    identity = str(
+                        getattr(registration_otp_callback, "last_message_identity", "") or ""
+                    ).strip()
+                    if identity:
+                        registration_email_identities.add(identity)
                     return code
             else:
                 capture_registration_otp = None
@@ -3765,21 +4138,32 @@ class ChatGPTBrowserRegister:
             if registration_email_codes:
                 self.log("已记录注册阶段邮箱验证码，re-auth 将强制等待新的邮箱验证码")
 
-            # 原步骤 7、8 完成后，先执行用户脚本中的 TOTP -> 密码安全设置。
-            self.log("步骤 9: 设置密码+2FA")
-            security_info = _setup_chatgpt_password_and_totp(
-                page,
-                email=email,
-                password=password,
+            if self.setup_security:
+                # 原步骤 7、8 完成后，先执行用户脚本中的 TOTP -> 密码安全设置。
+                self.log("步骤 9: 设置密码+2FA")
+                security_info = _setup_chatgpt_password_and_totp(
+                    page,
+                    email=email,
+                    password=password,
                 otp_callback=self.otp_callback,
                 excluded_email_codes=registration_email_codes,
+                registration_email_identities=registration_email_identities,
                 log=self.log,
-            )
-            self.log(
-                "步骤 9 完成: "
-                f"password={'yes' if security_info.get('password_set') else 'no'}, "
-                f"totp={'yes' if security_info.get('totp_set') else 'no'}"
-            )
+                )
+                self.log(
+                    "步骤 9 完成: "
+                    f"password={'yes' if security_info.get('password_set') else 'no'}, "
+                    f"totp={'yes' if security_info.get('totp_set') else 'no'}"
+                )
+            else:
+                self.log("已跳过注册后的 TOTP+密码设置")
+                security_info = {
+                    "password_set": bool(password),
+                    "password_path": "registration",
+                    "totp_set": False,
+                    "totp_secret": "",
+                    "otpauth": "",
+                }
 
             # 原步骤 9：获取 session token 和 cookies（插入安全设置后顺延为步骤 10）。
             self.log("步骤 10: 获取 session")
@@ -3805,4 +4189,7 @@ class ChatGPTBrowserRegister:
                 "totp_secret": security_info.get("totp_secret", ""),
                 "otpauth": security_info.get("otpauth", ""),
             }
+            with self._active_lock:
+                self._active_page = None
+                self._active_browser = None
             return result

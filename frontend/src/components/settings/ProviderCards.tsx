@@ -239,7 +239,7 @@ function EditModal({
   }
 
   return (
-    <div className="dialog-backdrop" onClick={onClose}>
+    <div className="dialog-backdrop">
       <div className="dialog-panel dialog-panel-sm flex flex-col" onClick={e => e.stopPropagation()}>
         <div className="flex items-center justify-between border-b border-[var(--border)] px-5 py-4">
           <div>
@@ -340,6 +340,92 @@ function EditModal({
   )
 }
 
+function MailboxManagerModal({
+  setting,
+  onClose,
+}: {
+  setting: ProviderSetting
+  onClose: () => void
+}) {
+  const [items, setItems] = useState<Array<{ email: string; key: string; used: boolean; active: boolean; parent_email?: string; alias_index?: number }>>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [working, setWorking] = useState('')
+
+  const load = async () => {
+    setLoading(true)
+    setError('')
+    try {
+      const result = await apiFetch(`/provider-settings/${setting.id}/mailboxes`)
+      setItems(Array.isArray(result?.items) ? result.items : [])
+    } catch (e: any) {
+      setError(e?.message || '加载邮箱状态失败')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => { void load() }, [setting.id])
+
+  const reset = async (item: { email: string; key: string }) => {
+    setWorking(item.key)
+    setError('')
+    try {
+      const result = await apiFetch(`/provider-settings/${setting.id}/mailboxes/state`, {
+        method: 'POST',
+        body: JSON.stringify({ email: item.key || item.email, used: false }),
+      })
+      setItems(Array.isArray(result?.items) ? result.items : [])
+    } catch (e: any) {
+      setError(e?.message || '重置邮箱状态失败')
+    } finally {
+      setWorking('')
+    }
+  }
+
+  return (
+    <div className="dialog-backdrop">
+      <div className="dialog-panel dialog-panel-md flex max-h-[80vh] flex-col" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between border-b border-[var(--border)] px-5 py-4">
+          <div>
+            <h2 className="text-base font-semibold text-[var(--text-primary)]">邮箱管理</h2>
+            <p className="mt-0.5 text-xs text-[var(--text-muted)]">{setting.display_name || setting.provider_key}</p>
+          </div>
+          <button onClick={onClose} className="text-[var(--text-muted)] hover:text-[var(--text-primary)]"><X className="h-4 w-4" /></button>
+        </div>
+        <div className="min-h-0 flex-1 overflow-auto px-5 py-4">
+          {loading && <p className="text-sm text-[var(--text-muted)]">加载中...</p>}
+          {error && <p className="mb-3 rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-600">{error}</p>}
+          {!loading && !items.length && <p className="text-sm text-[var(--text-muted)]">没有解析到邮箱。</p>}
+          <div className="space-y-2">
+            {items.map(item => (
+              <div key={item.key} className="flex items-center gap-3 rounded-lg border border-[var(--border)] px-3 py-2">
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-sm text-[var(--text-primary)]">{item.email}</div>
+                  {item.parent_email && item.parent_email !== item.email && <div className="text-[11px] text-[var(--text-muted)]">母邮箱：{item.parent_email}</div>}
+                </div>
+                <span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] ${item.active ? 'bg-amber-500/10 text-amber-600' : item.used ? 'bg-blue-500/10 text-blue-600' : 'bg-emerald-500/10 text-emerald-600'}`}>
+                  {item.active ? '使用中' : item.used ? '已使用' : '未使用'}
+                </span>
+                <button
+                  onClick={() => reset(item)}
+                  disabled={!item.used || item.active || working === item.key}
+                  className="table-action-btn disabled:cursor-not-allowed disabled:opacity-30"
+                >
+                  {working === item.key ? '处理中...' : '设为未使用'}
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="flex justify-end border-t border-[var(--border)] px-5 py-3">
+          <Button variant="outline" onClick={onClose}>关闭</Button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 /* ------------------------------------------------------------------ */
 /*  Main                                                               */
 /* ------------------------------------------------------------------ */
@@ -357,6 +443,7 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
   const [loading, setLoading] = useState<Record<string, boolean>>({})
   const [testResults, setTestResults] = useState<Record<string, { ok: boolean; message?: string; error?: string }>>({})
   const [testingKeys, setTestingKeys] = useState<Record<string, boolean>>({})
+  const [mailboxManager, setMailboxManager] = useState<ProviderSetting | null>(null)
 
   const settingsMap: Record<string, ProviderSetting> = {}
   for (const s of settings) settingsMap[s.provider_key] = s
@@ -480,6 +567,15 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
               <Pencil className="h-3 w-3 mr-1" /> {t('providers.edit')}
             </button>
 
+            {providerType === 'mailbox' && (provider.driver_type === 'api_mailbox' || provider.driver_type === 'local_ms_pool') && isEnabled && setting && (
+              <button
+                onClick={() => setMailboxManager(setting)}
+                className="table-action-btn"
+              >
+                邮箱管理
+              </button>
+            )}
+
             <button
               onClick={() => isEnabled ? handleTestInline(provider) : undefined}
               disabled={!isEnabled || testingKeys[key]}
@@ -566,6 +662,7 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
           onSaved={onReload}
         />
       )}
+      {mailboxManager && <MailboxManagerModal setting={mailboxManager} onClose={() => setMailboxManager(null)} />}
     </>
   )
 }

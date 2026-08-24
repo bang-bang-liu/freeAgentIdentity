@@ -31,6 +31,7 @@ from core.base_mailbox import (
     BaseMailbox,
     MailboxAccount,
     _extract_verification_link,
+    _read_manual_code,
     _raise_if_cancelled,
     _sleep_with_cancel,
 )
@@ -235,6 +236,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
     """Use existing Outlook/Hotmail/Live accounts from a local text pool."""
 
     _lock = threading.Lock()
+    _active_by_state_file: dict[str, set[str]] = {}
 
     def __init__(
         self,
@@ -254,6 +256,13 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         self.allow_reuse = bool(allow_reuse)
         self.alias_count = _bounded_alias_count(alias_count)
         self.proxy = {"http": proxy, "https": proxy} if proxy else None
+        # ``allow_reuse`` applies after a worker releases its lease; active
+        # addresses are still excluded so concurrent registrations cannot
+        # receive the same mailbox.
+        state_key = str(self.state_file.expanduser().resolve())
+        with self._lock:
+            self._active = self._active_by_state_file.setdefault(state_key, set())
+        self._last_code_identity: dict[str, str] = {}
 
     @classmethod
     def from_config(cls, config: dict) -> "LocalMicrosoftMailboxPool":
@@ -330,8 +339,6 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         return candidates
 
     def _reserve(self, candidate: LocalMicrosoftMailboxCandidate) -> None:
-        if self.allow_reuse:
-            return
         state = self._state()
         used = dict(state.get("used") or {})
         used[candidate.key] = {
@@ -349,6 +356,8 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         state = self._state()
         used = set((state.get("used") or {}).keys())
         for candidate in candidates:
+            if candidate.key in self._active:
+                continue
             if self.allow_reuse or candidate.key not in used:
                 return candidate
         raise RuntimeError(f"本地微软邮箱池已用尽: total={len(candidates)}")
@@ -359,6 +368,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
     def get_email(self) -> MailboxAccount:
         with self._lock:
             candidate = self._available_candidate()
+            self._active.add(candidate.key)
             self._reserve(candidate)
 
         entry = candidate.entry
@@ -400,6 +410,60 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 },
             },
         )
+
+    def release_email(self, account: MailboxAccount | None) -> None:
+        if account is None:
+            return
+        key = str(getattr(account, "account_id", "") or "").strip().lower()
+        if key:
+            with self._lock:
+                self._active.discard(key)
+
+    def list_mailboxes(self) -> list[dict]:
+        used = dict(self._state().get("used") or {})
+        return [
+            {
+                "email": candidate.email,
+                "key": candidate.key,
+                "used": candidate.key in used,
+                "active": candidate.key in self._active,
+                "parent_email": candidate.entry.email,
+                "alias_index": candidate.alias_index,
+            }
+            for candidate in self._candidates()
+        ]
+
+    def set_mailbox_used(self, identifier: str, used: bool = False) -> bool:
+        normalized = str(identifier or "").strip().lower()
+        if not normalized:
+            raise ValueError("邮箱不能为空")
+        candidate = next(
+            (
+                item for item in self._candidates()
+                if item.key == normalized or item.email.strip().lower() == normalized
+            ),
+            None,
+        )
+        if candidate is None:
+            raise ValueError(f"本地微软邮箱池未找到账号: {identifier}")
+        with self._lock:
+            if not used and candidate.key in self._active:
+                raise ValueError(f"邮箱 {candidate.email} 当前使用中，不能重置")
+            state = self._state()
+            used_map = dict(state.get("used") or {})
+            if used:
+                used_map[candidate.key] = {
+                    "email": candidate.email,
+                    "parent_email": candidate.entry.email,
+                    "alias_index": candidate.alias_index,
+                    "reserved_at": datetime.now(timezone.utc).isoformat(),
+                    "source_id": self._source_id(),
+                }
+            else:
+                used_map.pop(candidate.key, None)
+            state["used"] = used_map
+            self._save_state(state)
+        return True
 
     def _entry_for_account(self, account: MailboxAccount) -> LocalMicrosoftMailboxEntry:
         account_email = str(getattr(account, "email", "") or "").strip().lower()
@@ -619,6 +683,9 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         except Exception:
             return set()
 
+    def get_last_code_identity(self, account: MailboxAccount) -> str | None:
+        return self._last_code_identity.get(str(account.email or "").strip().lower()) or None
+
     @staticmethod
     def _clean_search_text(text: str) -> str:
         cleaned = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.I | re.S)
@@ -635,14 +702,21 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         before_ids: set = None,
         code_pattern: str = None,
         cancel_check: Callable[[], bool] | None = None,
+        manual_code_check: Callable[[], str | None] | None = None,
     ) -> str:
         seen = set(before_ids or [])
         pattern = re.compile(code_pattern or r"(?<!#)(?<!\d)(\d{6})(?!\d)")
         start = time.time()
         while time.time() - start < timeout:
             _raise_if_cancelled(cancel_check)
+            manual_code = _read_manual_code(manual_code_check)
+            if manual_code:
+                return manual_code
             for mail in self._messages(account):
                 _raise_if_cancelled(cancel_check)
+                manual_code = _read_manual_code(manual_code_check)
+                if manual_code:
+                    return manual_code
                 if not self._message_is_for_account(mail, account):
                     continue
                 mid = self._message_id(mail)
@@ -655,8 +729,16 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                     continue
                 match = pattern.search(text)
                 if match:
-                    return match.group(1) if match.groups() else match.group(0)
-            _sleep_with_cancel(5, cancel_check)
+                    automatic_code = match.group(1) if match.groups() else match.group(0)
+                    if mid:
+                        self._last_code_identity[str(account.email or "").strip().lower()] = mid
+                    return _read_manual_code(manual_code_check) or automatic_code
+            manual_code = _sleep_with_cancel(5, cancel_check, manual_code_check)
+            if manual_code:
+                return manual_code
+        manual_code = _read_manual_code(manual_code_check)
+        if manual_code:
+            return manual_code
         raise TimeoutError(f"等待验证码超时 ({timeout}s)")
 
     def wait_for_link(

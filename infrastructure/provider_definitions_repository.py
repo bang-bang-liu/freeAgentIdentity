@@ -9,7 +9,12 @@ from core.db import ProviderDefinitionModel, ProviderSettingModel, engine
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_MAILBOX_PROVIDER_KEYS = ("local_ms_pool", "api_mailbox", "icloud_workbench")
+SUPPORTED_MAILBOX_PROVIDER_KEYS = (
+    "local_ms_pool",
+    "api_mailbox",
+    "icloud_workbench",
+    "domain_mailbox",
+)
 
 
 def _utcnow() -> datetime:
@@ -61,7 +66,7 @@ _BUILTIN_DEFINITIONS: list[dict] = [
                 "label": "允许重复使用邮箱",
                 "type": "toggle",
                 "category": "connection",
-                "hint": "测试时可开启；批量注册建议关闭。",
+                "hint": "允许重复使用历史上已用过的邮箱，但并发注册仍会为每个 worker 分配不同邮箱；可在邮箱管理中手动重置状态。",
             },
         ],
     },
@@ -111,7 +116,7 @@ _BUILTIN_DEFINITIONS: list[dict] = [
                 "label": "允许重复使用邮箱",
                 "type": "toggle",
                 "category": "connection",
-                "hint": "测试时可开启；批量注册建议关闭。",
+                "hint": "允许重复使用历史上已用过的邮箱，但并发注册仍会为每个 worker 分配不同邮箱；可在邮箱管理中手动重置状态。",
             },
         ],
     },
@@ -170,6 +175,106 @@ _BUILTIN_DEFINITIONS: list[dict] = [
             {
                 "key": "icloud_workbench_request_timeout",
                 "label": "单次请求超时秒",
+                "placeholder": "20",
+                "default_value": "20",
+                "category": "connection",
+            },
+        ],
+    },
+    {
+        "provider_type": "mailbox",
+        "provider_key": "domain_mailbox",
+        "label": "域名邮箱 (IMAP)",
+        "description": "为已配置 catch-all 收件的域名生成随机邮箱地址，或直接使用固定地址，并通过统一 IMAP 收件箱按原始收件人隔离验证码",
+        "driver_type": "domain_mailbox",
+        "default_auth_mode": "imap",
+        "enabled": True,
+        "category": "selfhost",
+        "auth_modes": [{"value": "imap", "label": "Catch-all + IMAP"}],
+        "fields": [
+            {
+                "key": "domain_mailbox_domain",
+                "label": "邮箱域名",
+                "placeholder": "example.com",
+                "category": "connection",
+                "hint": "只填写域名。请先将该域名的 MX 和 catch-all 配好，确保任意前缀邮件都会进入下方 IMAP 账号。",
+            },
+            {
+                "key": "domain_mailbox_fixed_email",
+                "label": "固定邮箱地址（可选）",
+                "placeholder": "user@example.com",
+                "category": "connection",
+                "hint": "填写后直接使用此地址，不再随机生成；固定地址适合单个注册任务，批量并发请留空。",
+            },
+            {
+                "key": "domain_mailbox_imap_host",
+                "label": "IMAP 服务器",
+                "placeholder": "imap.example.com",
+                "category": "connection",
+            },
+            {
+                "key": "domain_mailbox_imap_port",
+                "label": "IMAP 端口",
+                "placeholder": "993",
+                "default_value": "993",
+                "category": "connection",
+            },
+            {
+                "key": "domain_mailbox_imap_security",
+                "label": "IMAP 加密方式",
+                "type": "select",
+                "default_value": "ssl",
+                "category": "connection",
+                "options": [
+                    {"value": "ssl", "label": "SSL/TLS"},
+                    {"value": "starttls", "label": "STARTTLS"},
+                    {"value": "plain", "label": "明文（不推荐）"},
+                ],
+            },
+            {
+                "key": "domain_mailbox_imap_username",
+                "label": "IMAP 用户名",
+                "placeholder": "inbox@example.com",
+                "category": "auth",
+            },
+            {
+                "key": "domain_mailbox_imap_password",
+                "label": "IMAP 密码 / 应用专用密码",
+                "secret": True,
+                "category": "auth",
+            },
+            {
+                "key": "domain_mailbox_imap_folder",
+                "label": "收件目录",
+                "placeholder": "INBOX",
+                "default_value": "INBOX",
+                "category": "connection",
+            },
+            {
+                "key": "domain_mailbox_prefix",
+                "label": "随机邮箱固定前缀",
+                "placeholder": "fa",
+                "default_value": "fa",
+                "category": "connection",
+                "hint": "生成地址形如 fa-随机串@example.com；只支持小写字母、数字和连字符。",
+            },
+            {
+                "key": "domain_mailbox_prefix_length",
+                "label": "随机串长度",
+                "placeholder": "12",
+                "default_value": "12",
+                "category": "connection",
+            },
+            {
+                "key": "domain_mailbox_poll_interval",
+                "label": "收件轮询间隔秒",
+                "placeholder": "3",
+                "default_value": "3",
+                "category": "connection",
+            },
+            {
+                "key": "domain_mailbox_request_timeout",
+                "label": "单次 IMAP 超时秒",
                 "placeholder": "20",
                 "default_value": "20",
                 "category": "connection",
@@ -259,7 +364,7 @@ _BUILTIN_DEFINITIONS: list[dict] = [
         "category": "thirdparty",
         "auth_modes": [],
         "fields": [
-            {"key": "proxy_gateway_url", "label": "网关地址", "placeholder": "http://user:pass@gate.example.com:7777"},
+            {"key": "proxy_gateway_url", "label": "网关地址", "placeholder": "http://proxy.example.com:7777"},
         ],
     },
 ]

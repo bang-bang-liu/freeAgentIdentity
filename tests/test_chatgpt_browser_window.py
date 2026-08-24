@@ -4,8 +4,10 @@ from platforms._browser_backend import BrowserBackendConfig
 from platforms.chatgpt.browser_register import (
     _apply_camoufox_visible_window_limit,
     _build_totp_otpauth,
+    _complete_security_reauth,
     _generate_totp_code,
     _get_security_email_code,
+    _start_chatgpt_security_reauth,
     _resend_security_email_otp,
     _submit_security_password_api,
     _validate_security_email_otp,
@@ -78,7 +80,139 @@ def test_chatgpt_reauth_otp_rejects_registration_code_and_waits_for_new_code():
     ) == "987654"
     assert len(calls) == 2
     assert all("timeout_override" in call for call in calls)
-    assert any("忽略注册阶段已使用的邮箱验证码" in message for message in logs)
+    assert any("忽略此前同一封邮件已拒绝的邮箱验证码" in message for message in logs)
+
+
+def test_chatgpt_reauth_allows_repeated_registration_code_only_from_new_message():
+    returned = iter(["001454", "001454"])
+    identities = iter(["registration-message", "reauth-message"])
+
+    def callback(**_kwargs):
+        callback.last_message_identity = next(identities)
+        callback.last_message_manual = False
+        return next(returned)
+
+    callback.supports_timeout_override = True
+    assert _get_security_email_code(
+        callback,
+        excluded_codes=set(),
+        prior_codes={"001454"},
+        prior_identities={"registration-message"},
+        deadline=time.time() + 5,
+        log=lambda _message: None,
+    ) == "001454"
+
+
+def test_chatgpt_reauth_rejects_repeated_registration_code_without_message_identity():
+    def callback(**_kwargs):
+        callback.last_message_identity = None
+        callback.last_message_manual = False
+        return "001454"
+
+    callback.supports_timeout_override = True
+    started = time.time()
+    assert _get_security_email_code(
+        callback,
+        excluded_codes=set(),
+        prior_codes={"001454"},
+        prior_identities={"registration-message"},
+        deadline=started + 0.6,
+        log=lambda _message: None,
+    ) == ""
+    assert time.time() - started >= 0.5
+
+
+def test_chatgpt_reauth_accepts_rejected_numeric_code_from_a_new_message():
+    identities = iter(["rejected-message", "fresh-message"])
+
+    def callback(**_kwargs):
+        callback.last_message_identity = next(identities)
+        callback.last_message_manual = False
+        return "654321"
+
+    callback.supports_timeout_override = True
+    assert _get_security_email_code(
+        callback,
+        excluded_codes={"654321"},
+        excluded_identities={"rejected-message"},
+        deadline=time.time() + 5,
+        log=lambda _message: None,
+    ) == "654321"
+
+
+def test_chatgpt_invalid_auth_step_resends_without_restarting_reauth(monkeypatch):
+    page = type("Page", (), {"url": "https://auth.openai.com/email-verification"})()
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register.SECURITY_EMAIL_RESEND_MIN_INTERVAL",
+        0,
+    )
+    resend_calls = []
+    restart_calls = []
+    codes = iter(["111111", "222222"])
+    validations = iter(
+        [
+            {"ok": False, "status": 400, "data": {"error": "invalid_auth_step"}, "text": ""},
+            {
+                "ok": True,
+                "status": 200,
+                "data": {"continue_url": "https://auth.openai.com/reset-password/new-password"},
+                "text": "",
+            },
+        ]
+    )
+
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register._security_is_email_otp_page",
+        lambda current_page: "email-verification" in current_page.url,
+    )
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register._security_is_mfa_selection_page",
+        lambda _page: False,
+    )
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register._security_is_totp_page",
+        lambda _page, _secret: False,
+    )
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register._security_is_password_page",
+        lambda current_page: "new-password" in current_page.url,
+    )
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register._security_is_login_password_page",
+        lambda _page: False,
+    )
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register._resend_security_email_otp",
+        lambda _page, _log: resend_calls.append(True) or {"ok": True, "status": 200},
+    )
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register._get_security_email_code",
+        lambda *_args, **_kwargs: next(codes),
+    )
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register._validate_security_email_otp",
+        lambda *_args, **_kwargs: next(validations),
+    )
+
+    def fake_goto(_page, url, **_kwargs):
+        page.url = url
+
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register._goto_with_retry",
+        fake_goto,
+    )
+
+    assert _complete_security_reauth(
+        page,
+        password="test-password",
+        secret="",
+        otp_callback=lambda: "unused",
+        log=lambda _message: None,
+        expect_password_page=True,
+        restart_reauth=lambda: restart_calls.append(True),
+    ) is True
+    assert len(resend_calls) == 2
+    assert restart_calls == []
 
 
 def test_chatgpt_reauth_email_otp_uses_resend_and_validate_api(monkeypatch):
@@ -114,6 +248,51 @@ def test_chatgpt_reauth_email_otp_uses_resend_and_validate_api(monkeypatch):
     assert requests[1][1]["headers"]["OpenAI-Sentinel-Token"] == "email_otp_validate"
 
 
+def test_chatgpt_reauth_restart_returns_to_chatgpt_origin_before_csrf(monkeypatch):
+    calls = []
+    page = type("Page", (), {"url": "https://auth.openai.com/email-verification"})()
+
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register._get_browser_csrf_token",
+        lambda _page, log=None: calls.append(("csrf", _page.url)) or "csrf-token",
+    )
+
+    def fake_goto(_page, url, **_kwargs):
+        calls.append(("goto", url))
+        page.url = url
+
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register._goto_with_retry",
+        fake_goto,
+    )
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register._get_cookies",
+        lambda _page: {"oai-did": "device-id"},
+    )
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register._browser_fetch",
+        lambda _page, url, **_kwargs: {
+            "ok": True,
+            "status": 200,
+            "url": url,
+            "data": {"url": "https://auth.openai.com/email-verification"},
+            "text": "",
+        },
+    )
+
+    result = _start_chatgpt_security_reauth(
+        page,
+        "user@example.com",
+        {"reauth": "password"},
+        "https://chatgpt.com/?done=1",
+        lambda _message: None,
+    )
+
+    assert result == "https://auth.openai.com/email-verification"
+    assert calls[0] == ("goto", "https://chatgpt.com/")
+    assert calls[1] == ("csrf", "https://chatgpt.com/")
+
+
 def test_chatgpt_security_step_sets_totp_before_password(monkeypatch):
     calls = []
     logs = []
@@ -143,7 +322,7 @@ def test_chatgpt_security_step_sets_totp_before_password(monkeypatch):
     result = _setup_chatgpt_password_and_totp(
         object(),
         email="user@example.com",
-        password="StrongPass123!",
+        password="test-password",
         otp_callback=None,
         log=logs.append,
     )
@@ -151,7 +330,7 @@ def test_chatgpt_security_step_sets_totp_before_password(monkeypatch):
     assert calls == ["totp", "password"]
     assert result["password_set"] is True
     assert result["totp_set"] is True
-    assert "设置的密码: StrongPass123!" in logs
+    assert "设置的密码: test-password" in logs
 
 
 def test_chatgpt_password_reauths_before_dom_submit(monkeypatch):
@@ -183,7 +362,7 @@ def test_chatgpt_password_reauths_before_dom_submit(monkeypatch):
     result = _setup_chatgpt_password(
         page,
         email="user@example.com",
-        password="StrongPass123!",
+        password="test-password",
         secret="JBSWY3DPEHPK3PXP",
         otp_callback=lambda: "old-email-code",
         log=lambda _message: None,
@@ -224,7 +403,7 @@ def test_chatgpt_password_api_falls_back_from_add_to_reset(monkeypatch):
 
     result = _submit_security_password_api(
         object(),
-        "StrongPass123!",
+        "test-password",
         "add",
         lambda _message: None,
     )

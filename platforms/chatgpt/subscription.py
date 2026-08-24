@@ -19,6 +19,10 @@ PLUS_TRIAL_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+# When an account has no persisted country/region, use the UK checkout
+# variant.  This is intentionally a checkout default only; an explicit,
+# recognized account country still wins in ``_checkout_country`` below.
+DEFAULT_CHECKOUT_COUNTRY = "GB"
 CHECKOUT_SESSION_RE = re.compile(
     r"(?:cs_(?:live|test)_[A-Za-z0-9_]+|oaics_[A-Za-z0-9_]+)",
     re.I,
@@ -164,7 +168,7 @@ def _checkout_country(account) -> str:
         match = re.match(r"^([A-Z]{2})(?:[-_]|$)", normalized)
         if match and match.group(1) in CHECKOUT_CURRENCY_BY_COUNTRY:
             return match.group(1)
-    return "US"
+    return DEFAULT_CHECKOUT_COUNTRY
 
 
 def _extract_checkout_session_id(data) -> str:
@@ -239,7 +243,10 @@ def fetch_plus_trial_checkout_chain(account, proxy: Optional[str] = None) -> dic
         }
 
     country = _checkout_country(account)
-    currency = CHECKOUT_CURRENCY_BY_COUNTRY.get(country, "USD")
+    currency = CHECKOUT_CURRENCY_BY_COUNTRY.get(
+        country,
+        CHECKOUT_CURRENCY_BY_COUNTRY[DEFAULT_CHECKOUT_COUNTRY],
+    )
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
@@ -356,7 +363,12 @@ def _usage(account, proxy: Optional[str]) -> dict:
     return data
 
 
-def fetch_plus_trial_eligibility(account, proxy: Optional[str] = None) -> dict:
+def fetch_plus_trial_eligibility(
+    account,
+    proxy: Optional[str] = None,
+    *,
+    country: str | None = None,
+) -> dict:
     """Query ChatGPT's internal promotion endpoint for Plus trial eligibility.
 
     This endpoint is an enrichment of the normal account check.  Callers can
@@ -384,10 +396,20 @@ def fetch_plus_trial_eligibility(account, proxy: Optional[str] = None) -> dict:
     # The value in copied examples is often shown as a bare '-'.  The web
     # client sends the actual Date#getTimezoneOffset value, so try that first.
     # Some deployments accept the endpoint without the optional query at all.
-    request_variants: list[tuple[dict[str, str], bool]] = [
+    normalized_country = str(country or "").strip().upper()
+    country_params = {"timezone_offset_min": _timezone_offset_min()}
+    if normalized_country in CHECKOUT_CURRENCY_BY_COUNTRY:
+        # Newer deployments may use this hint to evaluate regional campaigns;
+        # older ones simply ignore/reject it, in which case the compatibility
+        # variants below are used.
+        country_params["country"] = normalized_country
+    request_variants: list[tuple[dict[str, str], bool]] = []
+    if "country" in country_params:
+        request_variants.append((country_params, False))
+    request_variants.extend([
         ({"timezone_offset_min": _timezone_offset_min()}, False),
         ({}, False),
-    ]
+    ])
     if cookie_map:
         request_variants.extend([
             ({"timezone_offset_min": _timezone_offset_min()}, True),
@@ -408,7 +430,8 @@ def fetch_plus_trial_eligibility(account, proxy: Optional[str] = None) -> dict:
         if with_cookies:
             request_kwargs["cookies"] = cookie_map
         response = requests.get(PLUS_TRIAL_CHECK_URL, **request_kwargs)
-        if int(getattr(response, "status_code", 0) or 0) == 403:
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        if status_code == 403 or ("country" in params and status_code in {400, 422}):
             last_response = response
             continue
         response.raise_for_status()
@@ -466,7 +489,12 @@ def _attach_plus_trial_eligibility(details: dict, account, proxy: Optional[str])
     return details
 
 
-def fetch_subscription_status_details(account, proxy: Optional[str] = None) -> dict:
+def fetch_subscription_status_details(
+    account,
+    proxy: Optional[str] = None,
+    *,
+    include_trial: bool = True,
+) -> dict:
     if not account.access_token:
         raise ValueError("account access_token is empty")
     try:
@@ -485,24 +513,53 @@ def fetch_subscription_status_details(account, proxy: Optional[str] = None) -> d
                 usage = _usage(account, proxy)
             except Exception as exc:
                 logger.info("usage enrichment failed: %s", exc)
-            return _attach_plus_trial_eligibility(
-                {"status": _status_from_me(data), "source": "backend-api/me", "me": data, "usage": usage},
-                account,
-                proxy,
-            )
+            details = {
+                "status": _status_from_me(data),
+                "source": "backend-api/me",
+                "me": data,
+                "usage": usage,
+            }
+            return _attach_plus_trial_eligibility(details, account, proxy) if include_trial else details
     except Exception as exc:
         logger.info("subscription status fallback to usage: %s", exc)
     usage = _usage(account, proxy)
-    return _attach_plus_trial_eligibility(
-        {
-            "status": _plan(usage.get("plan_type")),
-            "source": "backend-api/wham/usage",
-            "me": None,
-            "usage": usage,
-        },
-        account,
-        proxy,
-    )
+    details = {
+        "status": _plan(usage.get("plan_type")),
+        "source": "backend-api/wham/usage",
+        "me": None,
+        "usage": usage,
+    }
+    return _attach_plus_trial_eligibility(details, account, proxy) if include_trial else details
+
+
+def check_plus_trial(
+    account,
+    proxy: Optional[str] = None,
+    *,
+    country: str | None = None,
+    check_chain: bool = False,
+) -> dict:
+    """Check Plus trial eligibility, optionally probing the checkout chain.
+
+    The selected country controls the PH/JP/etc. checkout payload used for
+    the optional chain probe.  The promotion endpoint itself is account-level;
+    retaining the country in the result makes the regional query explicit and
+    auditable in the account overview.
+    """
+    selected_country = str(country or "").strip().upper()
+    if selected_country not in CHECKOUT_CURRENCY_BY_COUNTRY:
+        selected_country = DEFAULT_CHECKOUT_COUNTRY
+    selected_currency = CHECKOUT_CURRENCY_BY_COUNTRY[selected_country]
+    details = fetch_plus_trial_eligibility(account, proxy=proxy, country=selected_country)
+    details["plus_trial_country"] = selected_country
+    details["plus_trial_currency"] = selected_currency
+    if check_chain:
+        account.checkout_country = selected_country
+        account.checkout_with_promo = details.get("plus_trial_eligible") is True
+        checkout_details = fetch_plus_trial_checkout_chain(account, proxy=proxy)
+        if isinstance(checkout_details, dict):
+            details.update(checkout_details)
+    return details
 
 
 def check_subscription_status(account, proxy: Optional[str] = None) -> str:

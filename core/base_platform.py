@@ -137,41 +137,54 @@ class BasePlatform(ABC):
 
     def register(self, email: str = None, password: str = None) -> Account:
         resolved_password = self._prepare_registration_password(password)
-        identity = self._resolve_identity(email, require_email=self._should_require_identity_email())
-        ctx = RegistrationContext(
-            platform_name=self.name,
-            platform_display_name=self.display_name,
-            platform=self,
-            identity=identity,
-            config=self.config,
-            email=email,
-            password=resolved_password,
-            log_fn=self.log,
-        )
+        identity = None
+        try:
+            identity = self._resolve_identity(email, require_email=self._should_require_identity_email())
+            ctx = RegistrationContext(
+                platform_name=self.name,
+                platform_display_name=self.display_name,
+                platform=self,
+                identity=identity,
+                config=self.config,
+                email=email,
+                password=resolved_password,
+                log_fn=self.log,
+            )
 
-        if (self.config.executor_type or "") in ("headless", "headed"):
-            self.log(f"使用浏览器模式注册: {self._browser_registration_label(identity)}")
-            adapter = self.build_browser_registration_adapter()
-            if adapter is None:
-                raise NotImplementedError(f"{self.display_name} 未实现浏览器注册适配器")
-            result = BrowserRegistrationFlow(adapter).run(ctx)
-            return self._attach_identity_metadata(self._account_from_registration_result(result), identity)
+            if (self.config.executor_type or "") in ("headless", "headed"):
+                self.log(f"使用浏览器模式注册: {self._browser_registration_label(identity)}")
+                adapter = self.build_browser_registration_adapter()
+                if adapter is None:
+                    raise NotImplementedError(f"{self.display_name} 未实现浏览器注册适配器")
+                result = BrowserRegistrationFlow(adapter).run(ctx)
+            elif getattr(identity, "identity_provider", "") == "oauth_browser":
+                adapter = self.build_protocol_oauth_adapter()
+                if adapter is None:
+                    raise RuntimeError(
+                        f"{self.display_name} 当前仅浏览器模式支持 oauth_browser，请使用受支持的浏览器执行器"
+                    )
+                result = ProtocolOAuthFlow(adapter).run(ctx)
+            else:
+                self.log(f"邮箱: {identity.email}")
+                adapter = self.build_protocol_mailbox_adapter()
+                if adapter is None:
+                    raise NotImplementedError(f"{self.display_name} 未实现协议邮箱注册适配器")
+                result = ProtocolMailboxFlow(adapter).run(ctx)
+            account = self._account_from_registration_result(result)
+            self._release_identity_mailbox(identity)
+            return self._attach_identity_metadata(account, identity)
+        except Exception:
+            self._release_identity_mailbox(identity)
+            raise
 
-        if getattr(identity, "identity_provider", "") == "oauth_browser":
-            adapter = self.build_protocol_oauth_adapter()
-            if adapter is None:
-                raise RuntimeError(
-                    f"{self.display_name} 当前仅浏览器模式支持 oauth_browser，请使用受支持的浏览器执行器"
-                )
-            result = ProtocolOAuthFlow(adapter).run(ctx)
-            return self._attach_identity_metadata(self._account_from_registration_result(result), identity)
-
-        self.log(f"邮箱: {identity.email}")
-        adapter = self.build_protocol_mailbox_adapter()
-        if adapter is None:
-            raise NotImplementedError(f"{self.display_name} 未实现协议邮箱注册适配器")
-        result = ProtocolMailboxFlow(adapter).run(ctx)
-        return self._attach_identity_metadata(self._account_from_registration_result(result), identity)
+    def _release_identity_mailbox(self, identity) -> None:
+        mailbox_account = getattr(identity, "mailbox_account", None) if identity else None
+        mailbox = getattr(self, "mailbox", None)
+        if mailbox_account is not None and mailbox is not None:
+            try:
+                mailbox.release_email(mailbox_account)
+            except Exception:
+                self.log("邮箱租约释放失败，已忽略")
 
     @abstractmethod
     def check_valid(self, account: Account) -> bool:

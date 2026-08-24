@@ -82,13 +82,33 @@ class MailboxIdentityProvider(BaseIdentityProvider):
             return IdentityMaterial(identity_provider=self.identity_provider, email=requested_email)
 
         mail_acct = self.mailbox.get_email()
-        email = getattr(mail_acct, "email", "") or ""
-        if not requested_email and not email:
-            provider_name = getattr(self.mailbox, "__class__", type(self.mailbox)).__name__
-            raise ValueError(f"{provider_name} 未返回可用邮箱，请检查 mailbox provider 配置或服务状态")
-        if requested_email and email and requested_email != email:
-            raise ValueError(f"传入邮箱 {requested_email} 与当前邮箱 provider 返回的 {email} 不一致")
-        before_ids = self.mailbox.get_current_ids(mail_acct) if mail_acct else set()
+        try:
+            email = getattr(mail_acct, "email", "") or ""
+            if not requested_email and not email:
+                provider_name = getattr(self.mailbox, "__class__", type(self.mailbox)).__name__
+                raise ValueError(f"{provider_name} 未返回可用邮箱，请检查 mailbox provider 配置或服务状态")
+            if requested_email and email and requested_email != email:
+                raise ValueError(f"传入邮箱 {requested_email} 与当前邮箱 provider 返回的 {email} 不一致")
+            try:
+                before_ids = self.mailbox.get_current_ids(mail_acct) if mail_acct else set()
+            except Exception as exc:
+                # Registration tasks expose a volatile manual-OTP channel.
+                # If the optional automatic mailbox baseline cannot be read
+                # (for example, some Coremail services reject EXAMINE with
+                # ``Unsafe Login``),
+                # keep the fixed address and let the operator submit the code
+                # manually.  Direct callers without that channel still get the
+                # original configuration error.
+                manual_handle = self.extra.get("_manual_otp_handle")
+                if not callable(getattr(manual_handle, "open_request", None)):
+                    raise
+                before_ids = set()
+        except Exception:
+            try:
+                self.mailbox.release_email(mail_acct)
+            except Exception:
+                pass
+            raise
         return IdentityMaterial(
             identity_provider=self.identity_provider,
             email=requested_email or email,

@@ -28,6 +28,27 @@ def _generate_chatgpt_registration_password(length: int = 16) -> str:
     return "".join(required)
 
 
+def _security_setup_enabled(extra: dict) -> bool:
+    """Read the post-registration 2FA+password switch safely.
+
+    Older callers do not send the field, so the historical behavior remains
+    enabled by default.  String values are accepted for API/legacy callers
+    that serialize booleans as text.
+    """
+    raw = (extra or {}).get("enable_2fa_password", True)
+    if isinstance(raw, str):
+        return raw.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(raw)
+
+
+def _bool_param(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
 @register
 class ChatGPTPlatform(BasePlatform):
     name = "chatgpt"
@@ -40,6 +61,7 @@ class ChatGPTPlatform(BasePlatform):
     # Declarative capabilities
     capabilities = [
         "query_state",      # Query account state/quota
+        "check_trial",      # Query Plus trial eligibility
         "upload_cpa",       # Upload to CPA system
     ]
 
@@ -49,6 +71,9 @@ class ChatGPTPlatform(BasePlatform):
 
     def check_valid(self, account: Account) -> bool:
         self._last_check_overview = {}
+        runtime_extra = dict((self.config.extra if self.config else {}) or {})
+        include_trial = _bool_param(runtime_extra.get("check_trial"), True)
+        check_chain = _bool_param(runtime_extra.get("check_checkout_chain"), True)
         try:
             from platforms.chatgpt.subscription import (
                 fetch_plus_trial_checkout_chain,
@@ -74,13 +99,30 @@ class ChatGPTPlatform(BasePlatform):
                 pooled_proxy = proxy_pool.get_next(region=region)
                 if pooled_proxy:
                     proxy_candidates.append((pooled_proxy, "project_proxy", True))
-            proxy_candidates.append((None, "direct", False))
+                proxy_candidates.append((None, "direct", False))
 
             last_error = ""
             last_network_path = "direct"
             for proxy, network_path, should_report in proxy_candidates:
                 try:
-                    details = fetch_subscription_status_details(a, proxy=proxy)
+                    try:
+                        details = fetch_subscription_status_details(
+                            a,
+                            proxy=proxy,
+                            include_trial=include_trial,
+                        )
+                    except TypeError as exc:
+                        # Keep compatibility with protocol/test seams that
+                        # still expose the original two-argument callable.
+                        if "include_trial" not in str(exc):
+                            raise
+                        details = fetch_subscription_status_details(a, proxy=proxy)
+                    if not include_trial:
+                        details = {
+                            key: value
+                            for key, value in (details or {}).items()
+                            if not str(key).startswith("plus_trial")
+                        }
                     if should_report and proxy:
                         proxy_pool.report_success(proxy)
                     status = details.get("status")
@@ -101,6 +143,22 @@ class ChatGPTPlatform(BasePlatform):
                     else:
                         plan_state = "unknown"
                         chips = []
+                    previous_overview = extra.get("account_overview") if isinstance(extra, dict) else {}
+                    if isinstance(previous_overview, dict):
+                        previous_chips = {
+                            str(chip or "").strip().lower()
+                            for chip in previous_overview.get("chips") or []
+                        }
+                        gcash_known = (
+                            previous_overview.get("gcash_eligible") is True
+                            or previous_overview.get("gcash_qualified") is True
+                            or previous_overview.get("gcash_available") is True
+                            or "gcash" in previous_chips
+                        )
+                        if gcash_known:
+                            chips.append("GCash")
+                        if previous_overview.get("plus_trial_eligible") is True or "带plus试用" in previous_chips:
+                            chips.append("带Plus试用")
                     overview = {
                         "plan": status,
                         "plan_name": status,
@@ -119,7 +177,7 @@ class ChatGPTPlatform(BasePlatform):
                     if details.get("plus_trial_eligible") is True:
                         overview["chips"].append("带Plus试用")
                     can_checkout = status not in ("expired", "invalid", "banned", None)
-                    if can_checkout:
+                    if can_checkout and check_chain:
                         # Checkout-chain detection is intentionally
                         # independent from the promotion-eligibility result.
                         # Use the promo payload only when eligibility is
@@ -145,7 +203,7 @@ class ChatGPTPlatform(BasePlatform):
                             "unavailable",
                         )
                         overview["plus_trial_checkout_error"] = checkout_details.get("plus_trial_checkout_error")
-                    else:
+                    elif check_chain:
                         overview["plus_trial_checkout_chain"] = None
                         overview["plus_trial_checkout_state"] = "unavailable"
                         overview["plus_trial_checkout_error"] = "account status is not eligible for checkout detection"
@@ -167,14 +225,19 @@ class ChatGPTPlatform(BasePlatform):
             "check_error": last_error or "State check did not reach ChatGPT",
             "network_path": last_network_path,
             "chips": ["检测失败"],
-            # Explicitly clear enrichment fields so a failed refresh cannot
-            # leave a stale promotion/checkout chain visible in the UI.
-            "plus_trial_eligible": None,
-            "plus_trial_check_state": "unavailable",
-            "plus_trial_checkout_chain": None,
-            "plus_trial_checkout_state": "unavailable",
-            "plus_trial_checkout_error": last_error or "State check did not reach ChatGPT",
         }
+        if include_trial:
+            self._last_check_overview.update({
+                "plus_trial_eligible": None,
+                "plus_trial_check_state": "unavailable",
+                "plus_trial_error": last_error or "State check did not reach ChatGPT",
+            })
+        if check_chain:
+            self._last_check_overview.update({
+                "plus_trial_checkout_chain": None,
+                "plus_trial_checkout_state": "unavailable",
+                "plus_trial_checkout_error": last_error or "State check did not reach ChatGPT",
+            })
         return False
 
     def get_last_check_overview(self) -> dict:
@@ -220,13 +283,19 @@ class ChatGPTPlatform(BasePlatform):
         def _build_browser_worker(ctx, artifacts):
             from platforms.chatgpt.browser_register import ChatGPTBrowserRegister
 
-            return ChatGPTBrowserRegister(
+            worker = ChatGPTBrowserRegister(
                 headless=(ctx.executor_type == "headless"),
                 proxy=ctx.proxy,
                 otp_callback=artifacts.otp_callback,
                 log_fn=ctx.log,
                 backend_config=(ctx.extra or {}).get("_reuse_backend_config"),
+                cancel_check=ctx.platform.is_cancel_requested,
+                setup_security=_security_setup_enabled(ctx.extra),
             )
+            register_cancel = (ctx.extra or {}).get("_register_cancel_callback")
+            if callable(register_cancel):
+                register_cancel(worker.cancel)
+            return worker
 
         return BrowserRegistrationAdapter(
             result_mapper=lambda ctx, result: self._map_chatgpt_result(result),
@@ -242,12 +311,17 @@ class ChatGPTPlatform(BasePlatform):
         def _build_protocol_worker(ctx, artifacts):
             from platforms.chatgpt.protocol_register import ChatGPTProtocolRegister
 
-            return ChatGPTProtocolRegister(
+            worker = ChatGPTProtocolRegister(
                 proxy=ctx.proxy,
                 otp_callback=artifacts.otp_callback,
                 log_fn=ctx.log,
                 cancel_check=ctx.platform.is_cancel_requested,
+                setup_security=_security_setup_enabled(ctx.extra),
             )
+            register_cancel = (ctx.extra or {}).get("_register_cancel_callback")
+            if callable(register_cancel):
+                register_cancel(worker.close)
+            return worker
 
         return ProtocolMailboxAdapter(
             result_mapper=lambda ctx, result: self._map_chatgpt_result(
@@ -283,8 +357,34 @@ class ChatGPTPlatform(BasePlatform):
                         "http://127.0.0.1:7897",
                         "http://127.0.0.1:7890",
                     ],
-                    "placeholder": "http://user:pass@host:port",
+                    "placeholder": "http://proxy.example.com:8080",
                     "required": True,
+                },
+            ]},
+            {"id": "check_trial", "label": "查询试用资格", "params": [
+                {
+                    "key": "country",
+                    "label": "查询国家/地区",
+                    "type": "country",
+                    "options": ["PH", "JP", "GB", "US", "TH", "VN", "BR", "CA", "AU", "DE", "FR", "SG"],
+                    "required": True,
+                },
+                {
+                    "key": "proxy",
+                    "label": "查询代理",
+                    "type": "proxy",
+                    "options": [
+                        "http://127.0.0.1:7897",
+                        "http://127.0.0.1:7890",
+                    ],
+                    "placeholder": "http://proxy.example.com:8080",
+                    "required": True,
+                },
+                {
+                    "key": "check_chain",
+                    "label": "同时检测 cs/oaics Checkout 链路",
+                    "type": "checkbox",
+                    "required": False,
                 },
             ]},
             {"id": "upload_cpa", "label": "上传 CPA",
@@ -299,7 +399,10 @@ class ChatGPTPlatform(BasePlatform):
         aliases = {
             "get_account_state": "query_state",
         }
-        return super().execute_action(aliases.get(action_id, action_id), account, params)
+        normalized_action = aliases.get(action_id, action_id)
+        if normalized_action == "check_trial":
+            return self._handle_check_trial(account, params)
+        return super().execute_action(normalized_action, account, params)
 
     def _execute_platform_action(self, action_id: str, account: Account, params: dict) -> dict:
         """Handle ChatGPT-specific actions."""
@@ -328,6 +431,33 @@ class ChatGPTPlatform(BasePlatform):
 
         raise NotImplementedError(f"Unknown action: {action_id}")
 
+    def _handle_check_trial(self, account: Account, params: dict) -> dict:
+        from platforms.chatgpt.subscription import CHECKOUT_CURRENCY_BY_COUNTRY, check_plus_trial
+
+        extra = account.extra or {}
+        class _A: pass
+        a = _A()
+        a.access_token = extra.get("access_token") or account.token
+        a.cookies = extra.get("cookies", "")
+        a.id_token = extra.get("id_token", "")
+        a.extra = extra
+        a.account_id = account.user_id or extra.get("account_id", "")
+        a.region = account.region or extra.get("region", "")
+        proxy = str((params or {}).get("proxy") or "").strip() or None
+        if not proxy:
+            raise ValueError("查询试用需要填写代理")
+        country = str((params or {}).get("country") or "PH").strip().upper()
+        if country not in CHECKOUT_CURRENCY_BY_COUNTRY:
+            raise ValueError("国家/地区代码不支持")
+        check_chain = _bool_param((params or {}).get("check_chain"), False)
+        details = check_plus_trial(
+            a,
+            proxy=proxy,
+            country=country,
+            check_chain=check_chain,
+        )
+        return {"ok": True, "data": details}
+
     # Override specific capability handlers
     def _handle_query_state(self, account: Account, params: dict) -> dict:
         """Handle query_state capability for ChatGPT."""
@@ -348,6 +478,13 @@ class ChatGPTPlatform(BasePlatform):
         # Keep the configured/project-pool behavior as a fallback when the
         # field is left blank, and never persist the manually entered value.
         manual_proxy = str((params or {}).get("proxy") or "").strip()
+        check_chain = _bool_param(
+            (params or {}).get("check_chain"),
+            # Old callers did not send this switch; retain their historical
+            # chain probe while the new UI sends an explicit false by default.
+            True if "check_chain" not in (params or {}) else False,
+        )
+        include_trial = "check_chain" not in (params or {})
         configured_proxy = manual_proxy or (self.config.proxy if self.config else None)
         region = str(getattr(account, "region", "") or extra.get("region", "") or "").strip()
         a.region = region
@@ -372,6 +509,7 @@ class ChatGPTPlatform(BasePlatform):
                 session_token=a.session_token,
                 cookies=a.cookies,
                 proxy=proxy,
+                include_trial=include_trial,
             )
             candidate["network_path"] = network_path
             if self._state_query_is_terminal(candidate):
@@ -402,7 +540,11 @@ class ChatGPTPlatform(BasePlatform):
         else:
             data["check_state"] = "valid"
 
-        if data.get("check_state") == "valid":
+        if not include_trial:
+            for key in ("plus_trial_eligible", "plus_trial_check_state", "plus_trial_error"):
+                data.pop(key, None)
+
+        if data.get("check_state") == "valid" and check_chain:
             from platforms.chatgpt.subscription import fetch_plus_trial_checkout_chain
 
             # A positive eligibility result gets the promotional payload; all
@@ -427,7 +569,7 @@ class ChatGPTPlatform(BasePlatform):
                 "unavailable",
             )
             data["plus_trial_checkout_error"] = checkout_details.get("plus_trial_checkout_error")
-        else:
+        elif check_chain:
             data["plus_trial_checkout_chain"] = None
             data["plus_trial_checkout_state"] = "unavailable"
             data["plus_trial_checkout_error"] = (
@@ -435,6 +577,13 @@ class ChatGPTPlatform(BasePlatform):
                 or data.get("check_error")
                 or "Plus trial eligibility is unavailable"
             )
+        else:
+            for key in (
+                "plus_trial_checkout_chain",
+                "plus_trial_checkout_state",
+                "plus_trial_checkout_error",
+            ):
+                data.pop(key, None)
 
         return {"ok": True, "data": data}
 

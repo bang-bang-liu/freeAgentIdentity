@@ -22,6 +22,7 @@ from core.db import AccountModel, TaskEventModel, TaskModel, engine, save_accoun
 from core.platform_accounts import build_platform_account
 from core.registry import get
 from infrastructure.platform_runtime import PlatformRuntime
+from application.manual_otp import ManualOtpHandle, manual_otp_registry
 
 
 def create_mailbox(*args, **kwargs):
@@ -32,6 +33,8 @@ def create_mailbox(*args, **kwargs):
 
 TASK_TYPE_REGISTER = "register"
 TASK_TYPE_ACCOUNT_CHECK_ALL = "account_check_all"
+TASK_TYPE_GCASH_CHECK_ALL = "gcash_check_all"
+TASK_TYPE_TRIAL_CHECK_ALL = "trial_check_all"
 TASK_TYPE_PLATFORM_ACTION = "platform_action"
 
 TASK_STATUS_PENDING = "pending"
@@ -62,6 +65,76 @@ ACTIVE_TASK_STATUSES = {
 
 _task_locks: dict[str, threading.Lock] = {}
 _task_locks_guard = threading.Lock()
+
+# Cancellation is deliberately kept in memory as well as in the task row.
+# The API must be able to signal a running worker without waiting for its next
+# database poll, and active protocol/browser workers need a callback so their
+# network session or browser can be closed immediately.
+_task_cancel_events: dict[str, threading.Event] = {}
+_task_cancel_callbacks: dict[str, set[Callable[[], None]]] = {}
+_task_cancel_guard = threading.RLock()
+
+
+def _task_cancel_event(task_id: str) -> threading.Event:
+    with _task_cancel_guard:
+        event = _task_cancel_events.get(task_id)
+        if event is None:
+            event = threading.Event()
+            _task_cancel_events[task_id] = event
+        return event
+
+
+def register_task_cancel_callback(task_id: str, callback: Callable[[], None] | None) -> None:
+    if not task_id or not callable(callback):
+        return
+    should_trigger = False
+    with _task_cancel_guard:
+        _task_cancel_callbacks.setdefault(task_id, set()).add(callback)
+        event = _task_cancel_events.get(task_id)
+        should_trigger = bool(event and event.is_set())
+    if should_trigger:
+        _invoke_cancel_callback(callback)
+
+
+def unregister_task_cancel_callback(task_id: str, callback: Callable[[], None] | None) -> None:
+    if not task_id or not callable(callback):
+        return
+    with _task_cancel_guard:
+        callbacks = _task_cancel_callbacks.get(task_id)
+        if not callbacks:
+            return
+        callbacks.discard(callback)
+        if not callbacks:
+            _task_cancel_callbacks.pop(task_id, None)
+
+
+def clear_task_cancel_callbacks(task_id: str) -> None:
+    if not task_id:
+        return
+    with _task_cancel_guard:
+        _task_cancel_callbacks.pop(task_id, None)
+        _task_cancel_events.pop(task_id, None)
+
+
+def _invoke_cancel_callback(callback: Callable[[], None]) -> None:
+    # Closing a browser or a network session should never block the HTTP
+    # cancel endpoint.  A callback is therefore isolated in a tiny daemon
+    # thread and exceptions are intentionally ignored.
+    def _run() -> None:
+        try:
+            callback()
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, name="task-cancel-callback", daemon=True).start()
+
+
+def _trigger_task_cancel(task_id: str) -> None:
+    with _task_cancel_guard:
+        _task_cancel_event(task_id).set()
+        callbacks = list(_task_cancel_callbacks.get(task_id, set()))
+    for callback in callbacks:
+        _invoke_cancel_callback(callback)
 
 # Sub2API Admin keys are intentionally volatile.  The browser submits them
 # when creating a task, but they are never put in task payloads, the SQLite
@@ -242,12 +315,105 @@ def create_register_task(payload: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def create_account_check_all_task(platform: str = "", limit: int = 50) -> dict[str, Any]:
+def create_account_check_all_task(
+    platform: str = "",
+    limit: int | None = None,
+    account_ids: list[int] | None = None,
+    proxy: str | None = None,
+    check_chain: bool | None = None,
+) -> dict[str, Any]:
+    """Create a status/subscription check task.
+
+    The old task accepted a ``limit`` and defaulted to the newest 50 rows.
+    ``limit`` remains available for scheduled/legacy callers, while new calls
+    scan the complete platform or the explicitly selected account IDs.
+    """
+
+    normalized_ids: list[int] = []
+    for raw_id in account_ids or []:
+        try:
+            account_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if account_id > 0 and account_id not in normalized_ids:
+            normalized_ids.append(account_id)
+
+    payload: dict[str, Any] = {"platform": platform}
+    if account_ids is not None:
+        payload["ids"] = normalized_ids
+    normalized_proxy = str(proxy or "").strip()
+    if normalized_proxy:
+        payload["proxy"] = normalized_proxy
+    if check_chain is not None:
+        payload["check_chain"] = bool(check_chain)
+    progress_total = len(normalized_ids)
+    if limit is not None:
+        bounded_limit = max(int(limit or 1), 1)
+        payload["limit"] = bounded_limit
+        if not progress_total:
+            progress_total = bounded_limit
     return create_task(
         task_type=TASK_TYPE_ACCOUNT_CHECK_ALL,
         platform=platform,
-        payload={"platform": platform, "limit": int(limit or 50)},
-        progress_total=max(int(limit or 50), 1),
+        payload=payload,
+        progress_total=progress_total,
+    )
+
+
+def create_gcash_check_all_task(
+    platform: str = "chatgpt",
+    account_ids: list[int] | None = None,
+    proxy: str | None = None,
+) -> dict[str, Any]:
+    normalized_ids: list[int] = []
+    for raw_id in account_ids or []:
+        try:
+            account_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if account_id > 0 and account_id not in normalized_ids:
+            normalized_ids.append(account_id)
+    normalized_proxy = str(proxy or "").strip()
+    payload = {
+        "platform": str(platform or "chatgpt").strip() or "chatgpt",
+        "ids": normalized_ids,
+        "proxy": normalized_proxy,
+    }
+    return create_task(
+        task_type=TASK_TYPE_GCASH_CHECK_ALL,
+        platform=payload["platform"],
+        payload=payload,
+        progress_total=len(normalized_ids),
+    )
+
+
+def create_trial_check_all_task(
+    platform: str = "chatgpt",
+    account_ids: list[int] | None = None,
+    proxy: str | None = None,
+    country: str = "PH",
+    check_chain: bool = False,
+) -> dict[str, Any]:
+    normalized_ids: list[int] = []
+    for raw_id in account_ids or []:
+        try:
+            account_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if account_id > 0 and account_id not in normalized_ids:
+            normalized_ids.append(account_id)
+    payload = {
+        "platform": str(platform or "chatgpt").strip() or "chatgpt",
+        "ids": normalized_ids,
+        "proxy": str(proxy or "").strip(),
+        "country": str(country or "PH").strip().upper(),
+        "check_chain": bool(check_chain),
+    }
+    return create_task(
+        task_type=TASK_TYPE_TRIAL_CHECK_ALL,
+        platform=payload["platform"],
+        payload=payload,
+        progress_total=len(normalized_ids),
     )
 
 
@@ -320,6 +486,15 @@ def mark_incomplete_tasks_interrupted() -> None:
 
 
 def request_cancel(task_id: str) -> Optional[dict[str, Any]]:
+    # Signal in memory before touching SQLite so currently running workers
+    # observe cancellation even if their next DB read has not happened yet.
+    with Session(engine) as session:
+        existing = session.get(TaskModel, task_id)
+    if not existing:
+        return None
+    if existing.status in TERMINAL_TASK_STATUSES:
+        return serialize_task(existing)
+    _trigger_task_cancel(task_id)
     task = _mutate_task(
         task_id,
         lambda model: _request_cancel_mutation(model),
@@ -333,12 +508,13 @@ def request_cancel(task_id: str) -> Optional[dict[str, Any]]:
 def _request_cancel_mutation(task: TaskModel) -> None:
     if task.status in TERMINAL_TASK_STATUSES:
         return
-    if task.status == TASK_STATUS_PENDING:
-        task.status = TASK_STATUS_CANCELLED
-        task.finished_at = _utcnow()
-        task.error = task.error or "任务在开始前被取消"
-    else:
-        task.status = TASK_STATUS_CANCEL_REQUESTED
+    # Cancellation is a user-stop command, not a deferred request.  Mark the
+    # task terminal immediately; running workers are independently signalled
+    # through the in-memory event/callback registry and will clean themselves
+    # up without keeping the UI in a waiting state.
+    task.status = TASK_STATUS_CANCELLED
+    task.finished_at = task.finished_at or _utcnow()
+    task.error = task.error or "任务已取消"
 
 
 def claim_next_runnable_task(
@@ -426,16 +602,29 @@ class TaskLogger:
 
     def mark_running(self) -> None:
         def _update(task: TaskModel) -> None:
+            if task.status in TERMINAL_TASK_STATUSES or task.status == TASK_STATUS_CANCEL_REQUESTED:
+                return
             task.status = TASK_STATUS_RUNNING
             task.started_at = task.started_at or _utcnow()
 
-        _mutate_task(self.task_id, _update)
-        self.log("任务已开始执行", event_type="state")
+        updated = _mutate_task(self.task_id, _update)
+        if updated and updated.status == TASK_STATUS_RUNNING:
+            self.log("任务已开始执行", event_type="state")
 
     def is_cancel_requested(self) -> bool:
+        with _task_cancel_guard:
+            event = _task_cancel_events.get(self.task_id)
+            if event is not None and event.is_set():
+                return True
         with Session(engine) as session:
             task = session.get(TaskModel, self.task_id)
-            return bool(task and task.status == TASK_STATUS_CANCEL_REQUESTED)
+            return bool(task and task.status in {TASK_STATUS_CANCEL_REQUESTED, TASK_STATUS_CANCELLED})
+
+    def register_cancel_callback(self, callback: Callable[[], None] | None) -> None:
+        register_task_cancel_callback(self.task_id, callback)
+
+    def unregister_cancel_callback(self, callback: Callable[[], None] | None) -> None:
+        unregister_task_cancel_callback(self.task_id, callback)
 
     def set_progress(self, current: int, total: Optional[int] = None) -> None:
         current = max(int(current), 0)
@@ -484,6 +673,10 @@ class TaskLogger:
 
     def finish(self, status: str, *, error: str = "") -> None:
         def _update(task: TaskModel) -> None:
+            # A worker that returns after the user has cancelled must not
+            # overwrite the terminal cancelled state with succeeded/failed.
+            if task.status == TASK_STATUS_CANCELLED and status != TASK_STATUS_CANCELLED:
+                return
             task.status = status
             task.finished_at = _utcnow()
             if error:
@@ -505,6 +698,20 @@ def _build_platform_instance(platform_name: str, payload: dict[str, Any], logger
     executor_type = str(payload.get("executor_type", "headless") or "headless")
     captcha_solver = str(payload.get("captcha_solver", "auto") or "auto")
     extra = dict(payload.get("extra") or {})
+    subtask_getter = getattr(logger, "_current_subtask", None)
+    subtask_id, subtask_label = subtask_getter() if callable(subtask_getter) else ("", "")
+    task_id = str(getattr(logger, "task_id", "") or "")
+    if task_id:
+        extra["_manual_otp_handle"] = ManualOtpHandle(
+            task_id=task_id,
+            worker_id=subtask_id or "main",
+            worker_label=subtask_label or subtask_id or "Main",
+        )
+        # Platform adapters use this volatile hook to register the concrete
+        # protocol session/browser close callback once the worker is built.
+        register_cancel_callback = getattr(logger, "register_cancel_callback", None)
+        if callable(register_cancel_callback):
+            extra["_register_cancel_callback"] = register_cancel_callback
     config = RegisterConfig(
         executor_type=executor_type,
         captcha_solver=captcha_solver,
@@ -539,12 +746,21 @@ def _build_platform_instance(platform_name: str, payload: dict[str, Any], logger
     return platform
 
 
-def _run_single_account_check(account_id: int, logger: TaskLogger | None = None) -> tuple[bool, dict[str, Any]]:
+def _run_single_account_check(
+    account_id: int,
+    logger: TaskLogger | None = None,
+    *,
+    proxy: str | None = None,
+    check_chain: bool | None = None,
+) -> tuple[bool, dict[str, Any]]:
     with Session(engine) as session:
         model = session.get(AccountModel, account_id)
         if not model:
             raise ValueError("账号不存在")
-        plugin = get(model.platform)(config=RegisterConfig())
+        config_extra = {"check_trial": False}
+        if check_chain is not None:
+            config_extra["check_checkout_chain"] = bool(check_chain)
+        plugin = get(model.platform)(config=RegisterConfig(proxy=proxy, extra=config_extra))
         account = build_platform_account(session, model)
 
     valid = plugin.check_valid(account)
@@ -606,11 +822,15 @@ def execute_task(task_id: str) -> None:
         logger.finish(TASK_STATUS_CANCELLED, error="任务在启动后立即被取消")
         if task_type == TASK_TYPE_REGISTER:
             clear_register_sub2api_upload_config(task_id)
+            manual_otp_registry.clear_task(task_id)
+        clear_task_cancel_callbacks(task_id)
         return
 
     handlers: dict[str, Callable[[dict[str, Any], TaskLogger], None]] = {
         TASK_TYPE_REGISTER: _execute_register_task,
         TASK_TYPE_ACCOUNT_CHECK_ALL: _execute_account_check_all_task,
+        TASK_TYPE_GCASH_CHECK_ALL: _execute_gcash_check_all_task,
+        TASK_TYPE_TRIAL_CHECK_ALL: _execute_trial_check_all_task,
         TASK_TYPE_PLATFORM_ACTION: _execute_platform_action_task,
     }
     handler = handlers.get(task_type)
@@ -622,6 +842,8 @@ def execute_task(task_id: str) -> None:
     finally:
         if task_type == TASK_TYPE_REGISTER:
             clear_register_sub2api_upload_config(task_id)
+            manual_otp_registry.clear_task(task_id)
+        clear_task_cancel_callbacks(task_id)
 
 
 def _resolve_registration_proxy_for_platform(
@@ -740,15 +962,25 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 resolved_proxy=resolved_proxy,
                 shared_mailbox=shared_mailbox,
             )
+            if logger.is_cancel_requested():
+                return "__cancel_requested__"
             logger.log(f"开始注册第 {index + 1}/{count} 个账号")
             if resolved_proxy:
                 logger.log(f"使用代理: {resolved_proxy}")
             account = platform.register(email=email, password=password)
+            # A registration may return at the same moment the user presses
+            # cancel.  Never persist a late result after cancellation.
+            if logger.is_cancel_requested():
+                return "__cancel_requested__"
             saved_account = save_account(account)
             saved_account_id = int(saved_account.id)
+            if logger.is_cancel_requested():
+                return "__cancel_requested__"
             if resolved_proxy:
                 proxy_pool.report_success(resolved_proxy)
             if sub2api_upload_config:
+                if logger.is_cancel_requested():
+                    return "__cancel_requested__"
                 logger.log(f"正在上传 {account.email} 的 Agent Identity 到 Sub2API")
                 try:
                     _upload_registered_chatgpt_account_to_sub2api(
@@ -788,23 +1020,46 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     errors: list[str] = []
     registered_accounts: list[dict[str, Any]] = []
     completed = 0
+    pool: ThreadPoolExecutor | None = None
+    cancelled = False
     try:
-        with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            pending = {pool.submit(_do_one, index) for index in range(count)}
-            while pending:
-                done, pending = wait(pending, return_when=FIRST_COMPLETED)
-                for future in done:
-                    result = future.result()
-                    completed += 1
-                    if isinstance(result, dict):
-                        success += 1
-                        registered_accounts.append(result)
-                    elif result != "__cancel_requested__":
-                        errors.append(str(result))
-                    logger.set_progress(completed, count)
+        pool = ThreadPoolExecutor(max_workers=concurrency)
+        pending = {pool.submit(_do_one, index) for index in range(count)}
+        while pending:
+            # A short timeout makes the dispatcher responsive to the cancel
+            # event even while every registration is blocked in network I/O.
+            done, pending = wait(
+                pending,
+                timeout=0.1,
+                return_when=FIRST_COMPLETED,
+            )
+            if logger.is_cancel_requested():
+                cancelled = True
+                for future in pending:
+                    future.cancel()
+                break
+            for future in done:
+                result = future.result()
+                completed += 1
+                if isinstance(result, dict):
+                    success += 1
+                    registered_accounts.append(result)
+                elif result != "__cancel_requested__":
+                    errors.append(str(result))
+                logger.set_progress(completed, count)
     except Exception as exc:
         logger.log(f"致命错误: {exc}", level="error")
         logger.finish(TASK_STATUS_FAILED, error=str(exc))
+        return
+    finally:
+        if pool is not None:
+            # Do not hold the task worker open for in-flight registrations.
+            # Their platform/browser/session has already received the cancel
+            # callback and will exit cooperatively in its own worker thread.
+            pool.shutdown(wait=not cancelled, cancel_futures=True)
+
+    if cancelled:
+        logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
         return
 
     result_data = {
@@ -867,37 +1122,92 @@ def _execute_platform_action_task(payload: dict[str, Any], logger: TaskLogger) -
 
 def _execute_account_check_all_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     platform = str(payload.get("platform", "") or "")
-    limit = max(int(payload.get("limit", 50) or 50), 1)
+    proxy = str(payload.get("proxy") or "").strip() or None
+    check_chain = payload.get("check_chain")
+    check_chain = True if check_chain is None else bool(check_chain)
+    # Keep the result shape of tasks created by the pre-batch-check API.  New
+    # API-created tasks always carry ``ids`` (possibly an empty list), so they
+    # receive the richer summary below without breaking old callers/tests.
+    legacy_result_shape = (
+        "limit" in payload
+        and "ids" not in payload
+        and "account_ids" not in payload
+    )
+    raw_ids = payload.get("ids")
+    if raw_ids is None:
+        # ``account_ids`` was used by an early internal caller; accept it so
+        # tasks created during an upgrade can still be resumed.
+        raw_ids = payload.get("account_ids")
+    account_ids: list[int] = []
+    for raw_id in raw_ids or []:
+        try:
+            account_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if account_id > 0 and account_id not in account_ids:
+            account_ids.append(account_id)
+
+    raw_limit = payload.get("limit")
+    limit: int | None = None
+    if raw_limit not in (None, ""):
+        limit = max(int(raw_limit or 1), 1)
 
     with Session(engine) as session:
         q = select(AccountModel)
         if platform:
             q = q.where(AccountModel.platform == platform)
+        if account_ids:
+            q = q.where(AccountModel.id.in_(account_ids))
         q = q.order_by(AccountModel.created_at.desc(), AccountModel.id.desc())
-        accounts = session.exec(q.limit(limit)).all()
+        if limit is not None:
+            q = q.limit(limit)
+        accounts = session.exec(q).all()
 
     total = len(accounts)
     logger.set_progress(0, total)
+    results = {
+        "total": total,
+        "checked": 0,
+        "valid": 0,
+        "invalid": 0,
+        "error": 0,
+    }
+
+    def publish_results() -> None:
+        logger.set_result_data(
+            {key: results[key] for key in ("valid", "invalid", "error")}
+            if legacy_result_shape
+            else results
+        )
+
     if total == 0:
-        logger.set_result_data({"valid": 0, "invalid": 0, "error": 0})
+        publish_results()
         logger.finish(TASK_STATUS_SUCCEEDED)
         return
 
-    results = {"valid": 0, "invalid": 0, "error": 0}
     completed = 0
     for model in accounts:
         if logger.is_cancel_requested():
+            results["checked"] = completed
+            publish_results()
             logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
             return
         try:
-            valid, result = _run_single_account_check(int(model.id or 0), logger)
+            valid, result = _run_single_account_check(
+                int(model.id or 0),
+                logger,
+                proxy=proxy,
+                check_chain=check_chain,
+            )
             if valid:
                 results["valid"] += 1
+                logger.record_success()
             elif str(result.get("check_state") or "").lower() in {
                 "unavailable", "unknown", "credential_missing", "credential_invalid",
             }:
                 results["error"] += 1
                 logger.log(f"{model.email}: 检测失败", level="error")
+                logger.record_error(f"{model.email}: 检测失败")
             else:
                 results["invalid"] += 1
         except Exception as exc:
@@ -905,6 +1215,254 @@ def _execute_account_check_all_task(payload: dict[str, Any], logger: TaskLogger)
             logger.record_error(str(exc))
             logger.log(f"{model.email}: 检测异常 {exc}", level="error")
         completed += 1
+        results["checked"] = completed
         logger.set_progress(completed, total)
+    publish_results()
+    logger.log(
+        f"批量检测完成: 共 {total} 个，已检查 {completed} 个，"
+        f"有效 {results['valid']}，失效 {results['invalid']}，异常 {results['error']}",
+        event_type="summary",
+    )
+    logger.finish(TASK_STATUS_SUCCEEDED)
+
+
+def _run_single_gcash_check(
+    account_id: int,
+    logger: TaskLogger | None = None,
+    *,
+    proxy: str,
+    context: Any,
+) -> dict[str, Any]:
+    from platforms.chatgpt.gcash import check_gcash
+
+    with Session(engine) as session:
+        model = session.get(AccountModel, account_id)
+        if not model:
+            raise ValueError("账号不存在")
+        account = build_platform_account(session, model)
+        email = str(model.email or "")
+
+    result = check_gcash(account, proxy=proxy, context=context)
+    updates = dict(result or {})
+    updates["gcash_checked_at"] = _utcnow_iso()
+    with Session(engine) as session:
+        model = session.get(AccountModel, account_id)
+        if model:
+            model.updated_at = _utcnow()
+            current_graph = load_account_graphs(session, [account_id]).get(account_id, {})
+            current_overview = dict(current_graph.get("overview") or {})
+            chips = [
+                str(chip)
+                for chip in current_overview.get("chips") or []
+                if str(chip or "").strip().lower() != "gcash"
+            ]
+            if result.get("gcash_eligible"):
+                chips.append("GCash")
+            updates["chips"] = chips
+            patch_account_graph(session, model, summary_updates=updates)
+            session.add(model)
+            session.commit()
+    if logger:
+        logger.log(f"{email}: {'有 GCash 资格' if result.get('gcash_eligible') else '无 GCash 资格'}")
+    return {
+        "account_id": account_id,
+        "email": email,
+        "gcash_eligible": bool(result.get("gcash_eligible")),
+    }
+
+
+def _execute_gcash_check_all_task(payload: dict[str, Any], logger: TaskLogger) -> None:
+    platform = str(payload.get("platform", "chatgpt") or "chatgpt")
+    proxy = str(payload.get("proxy") or "").strip()
+    raw_ids = payload.get("ids")
+    account_ids: list[int] = []
+    for raw_id in raw_ids or []:
+        try:
+            account_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if account_id > 0 and account_id not in account_ids:
+            account_ids.append(account_id)
+
+    with Session(engine) as session:
+        q = select(AccountModel).where(AccountModel.platform == platform)
+        if account_ids:
+            q = q.where(AccountModel.id.in_(account_ids))
+        q = q.order_by(AccountModel.created_at.desc(), AccountModel.id.desc())
+        accounts = session.exec(q).all()
+
+    total = len(accounts)
+    results = {"total": total, "checked": 0, "qualified": 0, "not_qualified": 0, "error": 0}
+    logger.set_progress(0, total)
+    if total == 0:
+        logger.set_result_data(results)
+        logger.finish(TASK_STATUS_SUCCEEDED)
+        return
+
+    context = None
+    try:
+        from platforms.chatgpt.gcash import GCashCheckContext
+        context = GCashCheckContext(proxy)
+        logger.register_cancel_callback(context.close)
+        for model in accounts:
+            if logger.is_cancel_requested():
+                logger.set_result_data(results)
+                logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
+                return
+            try:
+                result = _run_single_gcash_check(
+                    int(model.id or 0), logger, proxy=proxy, context=context
+                )
+                if result["gcash_eligible"]:
+                    results["qualified"] += 1
+                    logger.record_success()
+                else:
+                    results["not_qualified"] += 1
+            except Exception as exc:
+                results["error"] += 1
+                logger.record_error(f"{model.email}: {exc}")
+                logger.log(f"{model.email}: GCash 检测失败 {exc}", level="error")
+            results["checked"] += 1
+            logger.set_progress(results["checked"], total)
+    except Exception as exc:
+        logger.record_error(str(exc))
+        logger.log(f"GCash 检测任务初始化失败: {exc}", level="error")
+        logger.set_result_data(results)
+        logger.finish(TASK_STATUS_FAILED, error=str(exc))
+        return
+    finally:
+        if context is not None:
+            logger.unregister_cancel_callback(context.close)
+            try:
+                context.close()
+            except Exception:
+                pass
+
     logger.set_result_data(results)
+    logger.log(
+        f"GCash 检测完成: 共 {total} 个，已检查 {results['checked']} 个，"
+        f"有资格 {results['qualified']}，无资格 {results['not_qualified']}，异常 {results['error']}",
+        event_type="summary",
+    )
+    logger.finish(TASK_STATUS_SUCCEEDED)
+
+
+def _run_single_trial_check(
+    account_id: int,
+    logger: TaskLogger | None = None,
+    *,
+    proxy: str,
+    country: str,
+    check_chain: bool,
+) -> dict[str, Any]:
+    from platforms.chatgpt.subscription import check_plus_trial
+
+    with Session(engine) as session:
+        model = session.get(AccountModel, account_id)
+        if not model:
+            raise ValueError("账号不存在")
+        if model.platform != "chatgpt":
+            raise ValueError("试用资格检测目前仅支持 ChatGPT")
+        account = build_platform_account(session, model)
+        email = str(model.email or "")
+
+    class _A:
+        pass
+
+    a = _A()
+    a.access_token = getattr(account, "access_token", "") or getattr(account, "token", "")
+    a.cookies = getattr(account, "cookies", "")
+    a.id_token = getattr(account, "id_token", "")
+    a.extra = getattr(account, "extra", {}) or {}
+    a.account_id = getattr(account, "account_id", "") or getattr(account, "user_id", "")
+    a.region = getattr(account, "region", "")
+    result = check_plus_trial(
+        a,
+        proxy=proxy,
+        country=country,
+        check_chain=check_chain,
+    )
+    updates = dict(result or {})
+    updates["plus_trial_checked_at"] = _utcnow_iso()
+    with Session(engine) as session:
+        model = session.get(AccountModel, account_id)
+        if model:
+            model.updated_at = _utcnow()
+            current_graph = load_account_graphs(session, [account_id]).get(account_id, {})
+            current_overview = dict(current_graph.get("overview") or {})
+            chips = [
+                str(chip)
+                for chip in current_overview.get("chips") or []
+                if str(chip or "").strip() not in {"带Plus试用", "Plus trial eligible"}
+            ]
+            if result.get("plus_trial_eligible") is True:
+                chips.append("带Plus试用")
+            updates["chips"] = chips
+            patch_account_graph(session, model, summary_updates=updates)
+            session.add(model)
+            session.commit()
+    if logger:
+        logger.log(f"{email}: {'有试用资格' if result.get('plus_trial_eligible') else '无试用资格'}")
+    return {
+        "account_id": account_id,
+        "email": email,
+        "plus_trial_eligible": result.get("plus_trial_eligible"),
+    }
+
+
+def _execute_trial_check_all_task(payload: dict[str, Any], logger: TaskLogger) -> None:
+    platform = str(payload.get("platform", "chatgpt") or "chatgpt")
+    proxy = str(payload.get("proxy") or "").strip()
+    country = str(payload.get("country") or "PH").strip().upper()
+    check_chain = bool(payload.get("check_chain"))
+    raw_ids = payload.get("ids")
+    account_ids: list[int] = []
+    for raw_id in raw_ids or []:
+        try:
+            account_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if account_id > 0 and account_id not in account_ids:
+            account_ids.append(account_id)
+    with Session(engine) as session:
+        q = select(AccountModel).where(AccountModel.platform == platform)
+        if account_ids:
+            q = q.where(AccountModel.id.in_(account_ids))
+        q = q.order_by(AccountModel.created_at.desc(), AccountModel.id.desc())
+        accounts = session.exec(q).all()
+
+    total = len(accounts)
+    results = {"total": total, "checked": 0, "qualified": 0, "not_qualified": 0, "error": 0}
+    logger.set_progress(0, total)
+    for model in accounts:
+        if logger.is_cancel_requested():
+            logger.set_result_data(results)
+            logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
+            return
+        try:
+            result = _run_single_trial_check(
+                int(model.id or 0),
+                logger,
+                proxy=proxy,
+                country=country,
+                check_chain=check_chain,
+            )
+            if result.get("plus_trial_eligible") is True:
+                results["qualified"] += 1
+                logger.record_success()
+            else:
+                results["not_qualified"] += 1
+        except Exception as exc:
+            results["error"] += 1
+            logger.record_error(f"{model.email}: {exc}")
+            logger.log(f"{model.email}: 试用检测失败 {exc}", level="error")
+        results["checked"] += 1
+        logger.set_progress(results["checked"], total)
+
+    logger.set_result_data(results)
+    logger.log(
+        f"试用检测完成: 共 {total} 个，已检查 {results['checked']} 个，"
+        f"有资格 {results['qualified']}，无资格 {results['not_qualified']}，异常 {results['error']}",
+        event_type="summary",
+    )
     logger.finish(TASK_STATUS_SUCCEEDED)

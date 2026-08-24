@@ -476,6 +476,32 @@ def test_chatgpt_plus_trial_checkout_reports_oaics_chain(monkeypatch):
     assert result["plus_trial_checkout_chain"] == "oaics"
 
 
+def test_chatgpt_checkout_defaults_to_gb_gbp_when_country_is_missing(monkeypatch):
+    captured: dict = {}
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"checkout_session_id": "cs_live_default_gb"}
+
+    def _fake_post(_url, **kwargs):
+        captured.update(kwargs)
+        return _Resp()
+
+    monkeypatch.setattr(subscription.requests, "post", _fake_post)
+    account = type("AccountStub", (), {"access_token": "token", "extra": {}})()
+
+    result = subscription.fetch_plus_trial_checkout_chain(account)
+
+    assert result["plus_trial_checkout_chain"] == "cs"
+    assert captured["json"]["billing_details"] == {
+        "country": "GB",
+        "currency": "GBP",
+    }
+
+
 def test_chatgpt_plus_trial_failure_does_not_fail_subscription_status(monkeypatch):
     class _Resp:
         status_code = 200
