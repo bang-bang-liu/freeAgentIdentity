@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from sqlalchemy import func
 from sqlmodel import Session, select
 
 from core.account_display import build_account_display_summary
@@ -87,6 +88,7 @@ def _to_record(model: AccountModel, graph: dict | None = None) -> AccountRecord:
         provider_accounts=list(graph.get("provider_accounts") or []),
         provider_resources=provider_resources,
         created_at=model.created_at,
+        registered_at=model.last_registered_at or model.created_at,
         updated_at=model.updated_at,
     )
 
@@ -113,7 +115,14 @@ class AccountsRepository:
                 statement = statement.where(AccountModel.platform == query.platform)
             if query.email:
                 statement = statement.where(AccountModel.email.contains(query.email))
-            statement = statement.order_by(AccountModel.created_at.desc(), AccountModel.id.desc())
+            # A successful registration can update an existing row when the
+            # same platform/email already exists. Use the dedicated latest
+            # registration timestamp so background checks do not reorder the
+            # registration list.
+            statement = statement.order_by(
+                func.coalesce(AccountModel.last_registered_at, AccountModel.created_at).desc(),
+                AccountModel.id.desc(),
+            )
             models = session.exec(statement).all()
             records = self._load_records(session, models)
             if query.status:
@@ -145,7 +154,10 @@ class AccountsRepository:
                 statement = statement.where(AccountModel.email.contains(selection.search_filter))
             if not selection.select_all and selection.ids:
                 statement = statement.where(AccountModel.id.in_(selection.ids))
-            statement = statement.order_by(AccountModel.created_at.desc(), AccountModel.id.desc())
+            statement = statement.order_by(
+                func.coalesce(AccountModel.last_registered_at, AccountModel.created_at).desc(),
+                AccountModel.id.desc(),
+            )
             models = session.exec(statement).all()
             records = self._load_records(session, models)
         if selection.status_filter:

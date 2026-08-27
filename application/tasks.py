@@ -757,7 +757,10 @@ def _run_single_account_check(
         model = session.get(AccountModel, account_id)
         if not model:
             raise ValueError("账号不存在")
-        config_extra = {"check_trial": False}
+        # Status checks should also enrich the account overview with Plus
+        # trial eligibility.  The standalone trial action and the status
+        # action must use the same eligibility signal.
+        config_extra = {"check_trial": True}
         if check_chain is not None:
             config_extra["check_checkout_chain"] = bool(check_chain)
         plugin = get(model.platform)(config=RegisterConfig(proxy=proxy, extra=config_extra))
@@ -946,8 +949,10 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         return
 
     upload_lock = threading.Lock()
+    failure_lock = threading.Lock()
     uploaded_count = 0
     upload_failures: list[str] = []
+    failed_accounts: list[dict[str, Any]] = []
 
     def _do_one(index: int) -> dict[str, Any] | str:
         nonlocal uploaded_count
@@ -1010,8 +1015,21 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             if resolved_proxy:
                 proxy_pool.report_fail(resolved_proxy)
             error = str(exc)
+            failed_email = str(
+                getattr(exc, "registration_email", "") or email or ""
+            ).strip()
+            failure_detail = {
+                "index": index,
+                "email": failed_email,
+                "error": error,
+            }
+            with failure_lock:
+                failed_accounts.append(failure_detail)
             logger.record_error(error)
-            logger.log(f"注册失败: {error}", level="error")
+            logger.log(
+                f"注册失败: {failed_email + ' - ' if failed_email else ''}{error}",
+                level="error",
+            )
             return error
         finally:
             logger.clear_subtask()
@@ -1075,13 +1093,35 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             "failed": len(upload_failures),
             "errors": upload_failures,
         }
+    if failed_accounts:
+        ordered_failures = sorted(failed_accounts, key=lambda item: int(item["index"]))
+        result_data["failed_accounts"] = [
+            {"email": item["email"], "error": item["error"]}
+            for item in ordered_failures
+        ]
+        result_data["failed_emails"] = [
+            item["email"] or "未知邮箱"
+            for item in ordered_failures
+        ]
     logger.set_result_data(result_data)
-    logger.log(f"完成: 成功 {success} 个, 失败 {len(errors)} 个", event_type="summary")
+    summary = f"完成: 成功 {success} 个, 失败 {len(errors)} 个"
+    if failed_accounts:
+        failed_emails = [
+            item["email"] or "未知邮箱"
+            for item in sorted(failed_accounts, key=lambda item: int(item["index"]))
+        ]
+        summary += f"；失败邮箱: {'、'.join(failed_emails)}"
+    logger.log(summary, event_type="summary")
     if logger.is_cancel_requested():
         logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
         return
     final_status = TASK_STATUS_FAILED if errors and success == 0 else TASK_STATUS_SUCCEEDED
-    logger.finish(final_status, error=errors[0] if final_status == TASK_STATUS_FAILED else "")
+    final_error = errors[0] if final_status == TASK_STATUS_FAILED else ""
+    if final_status == TASK_STATUS_FAILED and failed_accounts:
+        first_failure = min(failed_accounts, key=lambda item: int(item["index"]))
+        if first_failure["email"]:
+            final_error = f"{first_failure['email']}: {final_error}"
+    logger.finish(final_status, error=final_error)
 
 
 def _execute_platform_action_task(payload: dict[str, Any], logger: TaskLogger) -> None:

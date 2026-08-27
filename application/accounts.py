@@ -94,5 +94,6 @@ class AccountsService:
             "provider_accounts": item.provider_accounts,
             "provider_resources": item.provider_resources,
             "created_at": serialize_datetime(item.created_at),
+            "registered_at": serialize_datetime(item.registered_at),
             "updated_at": serialize_datetime(item.updated_at),
         }

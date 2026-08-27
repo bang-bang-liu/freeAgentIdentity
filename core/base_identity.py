@@ -103,7 +103,16 @@ class MailboxIdentityProvider(BaseIdentityProvider):
                 if not callable(getattr(manual_handle, "open_request", None)):
                     raise
                 before_ids = set()
-        except Exception:
+        except Exception as exc:
+            # Keep the allocated address attached to the exception so the
+            # registration task can identify which mailbox failed even when
+            # identity setup aborts before IdentityMaterial is returned.
+            failed_email = str(getattr(mail_acct, "email", "") or "").strip()
+            if failed_email:
+                try:
+                    setattr(exc, "registration_email", failed_email)
+                except Exception:
+                    pass
             try:
                 self.mailbox.release_email(mail_acct)
             except Exception:

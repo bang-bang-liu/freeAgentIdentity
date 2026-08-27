@@ -145,6 +145,12 @@ function getCheckoutChainChip(acc: unknown): { label: 'cs' | 'oaics'; tone: 'sky
   return null
 }
 
+function getPlusTrialChip(acc: unknown): { label: string; tone: 'violet'; title: string } | null {
+  const overview = getAccountOverview(acc)
+  if (overview?.plus_trial_eligible !== true) return null
+  return { label: '优惠', tone: 'violet', title: 'Plus 1 个月免费优惠' }
+}
+
 function getGCashChip(acc: unknown): { label: 'GCash'; tone: 'emerald'; title: string } | null {
   const overview = getAccountOverview(acc)
   const chips = Array.isArray(overview?.chips) ? overview.chips : []
@@ -163,7 +169,6 @@ function isTrialAccount(acc: any): boolean {
     getPlanState(acc) === 'trial' ||
     getPlanState(acc) === 'eligible' ||
     getLifecycleStatus(acc) === 'trial' ||
-    overview?.plus_trial_eligible === true ||
     Boolean(overview?.trial_end_time)
   )
 }
@@ -391,7 +396,7 @@ function RegisterModal({
   const [configLoading, setConfigLoading] = useState(true)
   const [regCount, setRegCount] = useState(1)
   const [concurrency, setConcurrency] = useState(1)
-  const [dynamicProxy, setDynamicProxy] = useState('')
+  const [dynamicProxy, setDynamicProxy] = useState('http://127.0.0.1:7897')
   const [outlookPoolText, setOutlookPoolText] = useState('')
   const [enableTwoFactorPassword, setEnableTwoFactorPassword] = useState(true)
   const [autoUploadSub2Api, setAutoUploadSub2Api] = useState(false)
@@ -774,7 +779,7 @@ function RegisterModal({
                       type="text"
                       value={dynamicProxy}
                       onChange={(e) => setDynamicProxy(e.target.value)}
-                      placeholder="http://proxy.example.com:8080"
+                      placeholder="http://127.0.0.1:7897"
                       spellCheck={false}
                       className="control-surface control-surface-compact w-full font-mono text-xs"
                     />
@@ -1494,6 +1499,18 @@ function ActionMenu({
       })
   }
 
+  const startAction = (action: any) => {
+    if (!action) return
+    if (Array.isArray(action.params) && action.params.length > 0) {
+      setPendingAction({
+        action,
+        params: buildActionParamDraft(action, acc),
+      })
+      return
+    }
+    runAction(action, {})
+  }
+
   const updateMenuPosition = useCallback(() => {
     const trigger = triggerRef.current
     if (!trigger) return
@@ -1613,7 +1630,7 @@ function ActionMenu({
   }
 
   return (
-    <div className="relative flex min-w-[136px] items-center justify-end gap-1.5 whitespace-nowrap">
+    <div className="relative flex w-full min-w-0 flex-wrap items-center justify-end gap-0.5 whitespace-nowrap">
       {toast && (
         <div
           className="fixed top-5 right-5 z-[9999] flex items-center gap-2.5 rounded-xl border px-4 py-3 text-[13px] font-medium shadow-lg  cursor-pointer transition-all"
@@ -1665,6 +1682,16 @@ function ActionMenu({
         AT
       </button>
       <button onClick={onDetail} className="table-action-btn">详情</button>
+      {actions.some(action => action.id === 'rebind_email') && (
+        <button
+          onClick={() => startAction(actions.find(action => action.id === 'rebind_email'))}
+          disabled={!!running}
+          className="table-action-btn"
+          title="换绑邮箱"
+        >
+          {running === 'rebind_email' ? '换绑中...' : '换绑'}
+        </button>
+      )}
       {actions.length > 0 && (
         <div className="relative">
           <button ref={triggerRef} onClick={() => setOpen(o => !o)}
@@ -1679,14 +1706,7 @@ function ActionMenu({
                 <button key={a.id}
                   onClick={() => {
                     setOpen(false)
-                    if (Array.isArray(a.params) && a.params.length > 0) {
-                      setPendingAction({
-                        action: a,
-                        params: buildActionParamDraft(a, acc),
-                      })
-                      return
-                    }
-                    runAction(a, {})
+                    startAction(a)
                   }}
                   disabled={!!running}
                   className="w-full px-3 py-2 text-left text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] disabled:opacity-50">
@@ -2552,15 +2572,15 @@ export default function Accounts() {
       <Card className="min-h-0 flex-1 overflow-hidden p-0 border border-[var(--border)] shadow-sm">
         <div className="flex h-full min-h-0 flex-col">
           <div className="glass-table-wrap min-h-0 flex-1 overflow-auto">
-        <table className="table-fixed w-full min-w-[900px] text-sm">
+        <table className="table-fixed w-full min-w-[980px] text-sm">
           <colgroup>
             <col className="w-10" />
-            <col className="w-[30%]" />
-            <col className="w-[12%]" />
             <col className="w-[26%]" />
+            <col className="w-[10%]" />
+            <col className="w-[22%]" />
             <col className="w-[8%]" />
             <col className="w-[12%]" />
-            <col className="w-[12%]" />
+            <col className="w-[22%]" />
           </colgroup>
           <thead className="sticky top-0 z-10  bg-[var(--bg-pane)]/80">
             <tr className="border-b border-[var(--border)] text-xs uppercase tracking-wider font-medium text-[var(--text-muted)]">
@@ -2672,9 +2692,10 @@ export default function Accounts() {
                       const planChip = getPlanChip(acc)
                       const validityChip = getValidityChip(acc)
                       const checkoutChainChip = getCheckoutChainChip(acc)
+                      const plusTrialChip = getPlusTrialChip(acc)
                       const gcashChip = getGCashChip(acc)
                       const trialActive = isTrialAccount(acc) && getDisplayStatus(acc) !== 'trial'
-                      if (!planChip && !validityChip && !checkoutChainChip && !gcashChip && !trialActive) return null
+                      if (!planChip && !validityChip && !checkoutChainChip && !plusTrialChip && !gcashChip && !trialActive) return null
                       return (
                         <div className="flex max-w-full flex-wrap items-center gap-1">
                           {planChip && <StatusIconChip {...planChip} />}
@@ -2685,6 +2706,7 @@ export default function Accounts() {
                             />
                           )}
                           {checkoutChainChip && <StatusIconChip {...checkoutChainChip} />}
+                          {plusTrialChip && <StatusIconChip {...plusTrialChip} />}
                           {gcashChip && <StatusIconChip {...gcashChip} />}
                           {trialActive && (
                             <StatusIconChip
@@ -2719,7 +2741,7 @@ export default function Accounts() {
                   </span>
                 </td>
                 <td className="px-3 py-2.5 font-mono text-xs text-[var(--text-muted)] whitespace-nowrap align-top">
-                  {acc.created_at ? formatDateTime(acc.created_at, language, { 
+                  {(acc.registered_at || acc.created_at) ? formatDateTime(acc.registered_at || acc.created_at, language, { 
                     month: '2-digit', day: '2-digit',
                     hour: '2-digit', minute: '2-digit',
                     hour12: false 

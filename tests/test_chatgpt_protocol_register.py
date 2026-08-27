@@ -190,6 +190,44 @@ def test_protocol_register_can_skip_post_registration_security_setup():
     assert session.password_add_body == {}
 
 
+def test_protocol_register_keeps_account_when_post_registration_security_setup_fails():
+    session = _FakeSession()
+    logs = []
+    worker = ChatGPTProtocolRegister(
+        session=session,
+        otp_callback=lambda **_kwargs: "123456",
+        log_fn=logs.append,
+        sentinel_runtime=False,
+    )
+
+    def fail_security_setup(**_kwargs):
+        raise RuntimeError("安全设置验证码失败")
+
+    worker._setup_password_and_totp_protocol = fail_security_setup
+    original_session_result = worker._session_result
+    session_reads = [0]
+
+    def session_result_with_post_security_failure(email, password):
+        session_reads[0] += 1
+        if session_reads[0] == 1:
+            return original_session_result(email, password)
+        raise RuntimeError("安全设置后 session 不可用")
+
+    worker._session_result = session_result_with_post_security_failure
+
+    result = worker.run(email="user@example.com", password="test-password")
+
+    assert result["email"] == "user@example.com"
+    assert result["account_id"] == "account-123"
+    assert result["access_token"] == "header.payload.signature"
+    assert result["security_setup_ok"] is False
+    assert result["security_setup_error"] == "安全设置验证码失败"
+    assert result["password_set"] is True
+    assert result["totp_set"] is False
+    assert any("账号已注册成功，将继续保存账号" in line for line in logs)
+    assert any("回退到注册后的 access token 快照" in line for line in logs)
+
+
 def test_protocol_reauth_submits_repeated_registration_code_once_before_blocking_it(monkeypatch):
     worker = ChatGPTProtocolRegister(
         session=_FakeSession(),
@@ -385,9 +423,7 @@ def test_sentinel_runtime_uses_camoufox_and_releases_it(monkeypatch):
     assert _Camoufox.options["config"]["navigator.userAgent"] == FIREFOX_UA
     assert _Camoufox.options["config"]["headers.Accept-Language"] == FIREFOX_ACCEPT_LANGUAGE
     assert _Camoufox.options["proxy"] == {
-        "server": "http://127.0.0.1:8080",
-        "username": "name",
-        "password": "pass",
+        "server": "http://proxy.example.com:8080",
     }
 
     runtime.close()

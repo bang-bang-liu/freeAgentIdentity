@@ -1705,16 +1705,45 @@ class ChatGPTProtocolRegister:
                     headers=self._navigation_headers(),
                     allow_redirects=True,
                 )
+            pre_security_session_result = None
+            if self.setup_security:
+                try:
+                    # Capture the access token before security re-auth can
+                    # invalidate or otherwise disturb the current session.
+                    pre_security_session_result = self._session_result(email, password)
+                    self.log("已在安全设置前保存 ChatGPT access token 快照")
+                except Exception as exc:
+                    self.log(f"安全设置前获取 access token 快照失败: {exc}")
+
             if self.setup_security:
                 self.log("注册流程完成，开始设置 TOTP+密码")
-                security_info = self._setup_password_and_totp_protocol(
-                    email=email,
-                    password=password,
-                    excluded_codes=registration_email_codes,
-                    registration_email_identities=registration_email_identities,
-                )
+                security_setup_error = ""
+                try:
+                    security_info = self._setup_password_and_totp_protocol(
+                        email=email,
+                        password=password,
+                        excluded_codes=registration_email_codes,
+                        registration_email_identities=registration_email_identities,
+                    )
+                except Exception as exc:
+                    # Account creation already succeeded above.  A failure in
+                    # the optional post-registration security steps must not
+                    # discard the usable account or prevent it from being
+                    # saved by the registration task.
+                    security_setup_error = str(exc)
+                    self.log(
+                        f"TOTP+密码设置失败，但账号已注册成功，将继续保存账号: {security_setup_error}"
+                    )
+                    security_info = {
+                        "password_set": bool(password),
+                        "password_path": "registration",
+                        "totp_set": False,
+                        "totp_secret": "",
+                        "otpauth": "",
+                    }
             else:
                 self.log("已跳过注册后的 TOTP+密码设置")
+                security_setup_error = ""
                 security_info = {
                     "password_set": bool(password),
                     "password_path": "registration",
@@ -1722,7 +1751,16 @@ class ChatGPTProtocolRegister:
                     "totp_secret": "",
                     "otpauth": "",
                 }
-            result = self._session_result(email, password)
+            try:
+                result = self._session_result(email, password)
+            except Exception as exc:
+                if pre_security_session_result:
+                    self.log(
+                        f"安全设置后 session 获取失败，回退到注册后的 access token 快照: {exc}"
+                    )
+                    result = pre_security_session_result
+                else:
+                    raise
             result.update(
                 {
                     "password_set": bool(security_info.get("password_set")),
@@ -1730,6 +1768,8 @@ class ChatGPTProtocolRegister:
                     "totp_set": bool(security_info.get("totp_set")),
                     "totp_secret": security_info.get("totp_secret", ""),
                     "otpauth": security_info.get("otpauth", ""),
+                    "security_setup_ok": not security_setup_error,
+                    "security_setup_error": security_setup_error,
                 }
             )
             self.log("ChatGPT 协议注册完成并已获取 session")

@@ -1,6 +1,7 @@
 from core.base_platform import Account
 from core.proxy_pool import proxy_pool
 from platforms.chatgpt.plugin import ChatGPTPlatform
+from rebind_core.pipeline import RebindResult
 
 
 def test_chatgpt_actions_use_capability_ids():
@@ -13,6 +14,7 @@ def test_chatgpt_actions_use_capability_ids():
     assert "upload_tm" not in action_ids
     assert "get_account_state" not in action_ids
     assert "switch_account" not in action_ids
+    assert "rebind_email" in action_ids
     query_action = next(item for item in actions if item["id"] == "query_state")
     assert query_action["params"] == [{
         "key": "proxy",
@@ -22,9 +24,84 @@ def test_chatgpt_actions_use_capability_ids():
             "http://127.0.0.1:7897",
             "http://127.0.0.1:7890",
         ],
-        "placeholder": "http://user:pass@host:port",
+        "placeholder": "http://proxy.example.com:8080",
         "required": True,
     }]
+
+
+def test_chatgpt_rebind_action_uses_totp_and_masks_result(monkeypatch):
+    calls = {}
+
+    def fake_rebind(**kwargs):
+        calls.update(kwargs)
+        return RebindResult(
+            ok=True,
+            new_email="new@example.com",
+            access_token="at-sensitive-placeholder",
+            session_token="session-sensitive-placeholder",
+        )
+
+    monkeypatch.setattr("rebind_core.pipeline.run_rebind_email", fake_rebind)
+    platform = ChatGPTPlatform()
+    account = Account(
+        platform="chatgpt",
+        email="old@example.com",
+        password="test-password",
+        extra={"otpauth": "otpauth://totp/OpenAI:test@example.com?secret=TESTSECRET"},
+    )
+
+    result = platform.execute_action(
+        "rebind_email",
+        account,
+        {
+            "new_email": "new@example.com",
+            "mail_api": "https://mail-api.example.com/messages?token=placeholder",
+            "proxy": "",
+        },
+    )
+
+    assert calls["old_email"] == "old@example.com"
+    assert calls["totp_secret"] == "TESTSECRET"
+    assert calls["proxy"] == "http://127.0.0.1:7897"
+    assert calls["write_artifacts"] is False
+    assert result["data"]["old_email"] == "o***d@e***m"
+    assert result["data"]["new_email"] == "n***w@e***m"
+    assert "at-sensitive-placeholder" in result["data"]["_credential_updates"]["access_token"]
+
+
+def test_chatgpt_rebind_failure_redacts_sensitive_inputs(monkeypatch):
+    monkeypatch.setattr(
+        "rebind_core.pipeline.run_rebind_email",
+        lambda **kwargs: RebindResult(
+            ok=False,
+            code="MAIL_TIMEOUT",
+            message=(
+                "failed test-password TESTSECRET "
+                "https://mail-api.example.com/messages?token=placeholder"
+            ),
+        ),
+    )
+    account = Account(
+        platform="chatgpt",
+        email="old@example.com",
+        password="test-password",
+        extra={"totp_secret": "TESTSECRET"},
+    )
+
+    result = ChatGPTPlatform().execute_action(
+        "rebind_email",
+        account,
+        {
+            "new_email": "new@example.com",
+            "mail_api": "https://mail-api.example.com/messages?token=placeholder",
+            "proxy": "http://proxy.example.com:8080",
+        },
+    )
+
+    assert result["ok"] is False
+    assert "test-password" not in result["error"]
+    assert "TESTSECRET" not in result["error"]
+    assert "mail-api.example.com" not in result["error"]
 
 
 def test_chatgpt_legacy_get_account_state_routes_to_query_state(monkeypatch):
@@ -111,6 +188,36 @@ def test_chatgpt_query_state_uses_manual_proxy_without_fallback(monkeypatch):
     assert proxy_events == []
     assert result["data"]["network_path"] == "manual_proxy"
     assert result["data"]["check_state"] == "valid"
+
+
+def test_chatgpt_query_state_keeps_trial_lookup_when_checkout_chain_is_disabled(monkeypatch):
+    from platforms.chatgpt import switch
+
+    seen = {}
+    platform = ChatGPTPlatform()
+    account = Account(platform="chatgpt", email="user@example.com", password="secret")
+    account.extra = {"access_token": "token"}
+
+    def fake_state(**kwargs):
+        seen.update(kwargs)
+        return {
+            "valid": True,
+            "plus_trial_eligible": True,
+            "plus_trial_check_state": "available",
+        }
+
+    monkeypatch.setattr(switch, "fetch_chatgpt_account_state", fake_state)
+    monkeypatch.setattr(proxy_pool, "get_next", lambda region="": None)
+
+    result = platform.execute_action(
+        "query_state",
+        account,
+        {"proxy": "http://127.0.0.1:7897", "check_chain": "false"},
+    )
+
+    assert seen["include_trial"] is True
+    assert result["data"]["plus_trial_eligible"] is True
+    assert "plus_trial_checkout_state" not in result["data"]
 
 
 def test_chatgpt_query_state_checks_eligible_checkout_with_same_proxy(monkeypatch):

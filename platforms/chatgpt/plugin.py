@@ -1,5 +1,7 @@
 """ChatGPT / Codex CLI 平台插件"""
 import secrets
+from urllib.parse import parse_qs, urlparse
+
 from core.base_platform import BasePlatform, Account, AccountStatus, RegisterConfig
 from core.base_mailbox import BaseMailbox
 from core.registration import BrowserRegistrationAdapter, OtpSpec, ProtocolMailboxAdapter, RegistrationResult
@@ -47,6 +49,47 @@ def _bool_param(value, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _mask_email(value: str) -> str:
+    text = str(value or "").strip()
+    if "@" not in text:
+        return "***"
+    local, domain = text.split("@", 1)
+    local_masked = "*" * len(local) if len(local) <= 2 else f"{local[:1]}***{local[-1:]}"
+    domain_masked = f"{domain[:1]}***{domain[-1:]}" if len(domain) > 1 else "*"
+    return f"{local_masked}@{domain_masked}"
+
+
+def _extract_totp_secret(extra: dict) -> str:
+    """Read the persisted TOTP secret without requiring one legacy key name."""
+
+    candidates = [
+        extra.get("totp_secret"),
+        extra.get("totp"),
+        extra.get("mfa_secret"),
+        extra.get("two_factor"),
+        extra.get("otpauth"),
+    ]
+    for value in candidates:
+        if isinstance(value, dict):
+            value = value.get("secret") or value.get("totp_secret") or value.get("otpauth_uri")
+        text = str(value or "").strip()
+        if text.lower().startswith("otpauth://"):
+            text = str(parse_qs(urlparse(text).query).get("secret", [""])[0] or "")
+        text = text.replace(" ", "").strip()
+        if text:
+            return text.upper()
+    return ""
+
+
+def _redact_rebind_message(message: str, *secrets_to_hide: str) -> str:
+    text = str(message or "")
+    for secret in secrets_to_hide:
+        secret = str(secret or "")
+        if secret:
+            text = text.replace(secret, "[已脱敏]")
+    return text
 
 
 @register
@@ -276,6 +319,8 @@ class ChatGPTPlatform(BasePlatform):
                 "totp_set": bool(result.get("totp_set")),
                 "totp_secret": result.get("totp_secret", ""),
                 "otpauth": result.get("otpauth", ""),
+                "security_setup_ok": result.get("security_setup_ok", True),
+                "security_setup_error": result.get("security_setup_error", ""),
             },
         )
 
@@ -392,6 +437,33 @@ class ChatGPTPlatform(BasePlatform):
                  {"key": "api_url", "label": "CPA API URL", "type": "text"},
                  {"key": "api_key", "label": "CPA API Key", "type": "text"},
              ]},
+            {"id": "rebind_email", "label": "换绑邮箱", "params": [
+                {
+                    "key": "new_email",
+                    "label": "新邮箱",
+                    "type": "text",
+                    "placeholder": "new@example.com",
+                    "required": True,
+                },
+                {
+                    "key": "mail_api",
+                    "label": "新邮箱收信 API",
+                    "type": "text",
+                    "placeholder": "https://mail-api.example.com/messages",
+                    "required": True,
+                },
+                {
+                    "key": "proxy",
+                    "label": "换绑代理",
+                    "type": "proxy",
+                    "options": [
+                        "http://127.0.0.1:7897",
+                        "http://127.0.0.1:7890",
+                    ],
+                    "placeholder": "http://proxy.example.com:8080",
+                    "required": True,
+                },
+            ]},
         ]
 
     def execute_action(self, action_id: str, account: Account, params: dict) -> dict:
@@ -402,7 +474,89 @@ class ChatGPTPlatform(BasePlatform):
         normalized_action = aliases.get(action_id, action_id)
         if normalized_action == "check_trial":
             return self._handle_check_trial(account, params)
+        if normalized_action == "rebind_email":
+            return self._handle_rebind_email(account, params)
         return super().execute_action(normalized_action, account, params)
+
+    def _handle_rebind_email(self, account: Account, params: dict) -> dict:
+        from rebind_core.pipeline import run_rebind_email
+
+        params = dict(params or {})
+        new_email = str(params.get("new_email") or "").strip()
+        mail_api = str(params.get("mail_api") or "").strip()
+        if not new_email:
+            raise ValueError("换绑需要填写新邮箱")
+        if not mail_api:
+            raise ValueError("换绑需要填写新邮箱收信 API")
+
+        extra = dict(account.extra or {})
+        totp_secret = _extract_totp_secret(extra)
+        if not totp_secret:
+            raise ValueError("账号缺少 TOTP 密钥，无法执行换绑")
+        password = str(account.password or "")
+        if not password:
+            raise ValueError("账号缺少密码，无法执行换绑")
+
+        proxy = str(params.get("proxy") or "").strip() or "http://127.0.0.1:7897"
+        try:
+            mail_timeout = float(params.get("mail_timeout") or 120)
+        except (TypeError, ValueError):
+            mail_timeout = 120.0
+        mail_timeout = min(600.0, max(15.0, mail_timeout))
+
+        result = run_rebind_email(
+            old_email=account.email,
+            password=password,
+            totp_secret=totp_secret,
+            new_email=new_email,
+            mail_api=mail_api,
+            proxy=proxy,
+            mail_timeout=mail_timeout,
+            log_fn=self.log,
+            cancel_check=self.is_cancel_requested,
+            # The backend persists the new session directly into the account
+            # graph. Never write a plaintext bundle into the workspace.
+            write_artifacts=False,
+        )
+        public_data = {
+            "message": (
+                f"换绑成功：{_mask_email(account.email)} → {_mask_email(new_email)}"
+                if result.ok
+                else f"换绑失败：{result.code}"
+            ),
+            "old_email": _mask_email(account.email),
+            "new_email": _mask_email(new_email),
+            "access_token_updated": bool(result.access_token),
+            "session_token_updated": bool(result.session_token),
+        }
+        if not result.ok:
+            error = _redact_rebind_message(
+                result.message,
+                password,
+                totp_secret,
+                mail_api,
+                proxy,
+                account.email,
+                new_email,
+            )
+            return {"ok": False, "data": public_data, "error": f"{result.code}: {error}"}
+
+        credential_updates = {
+            key: value
+            for key, value in {
+                "access_token": result.access_token,
+                "session_token": result.session_token,
+                "id_token": result.id_token,
+                "refresh_token": result.refresh_token,
+                "cookies": result.cookie_header,
+                "auth_session_json": result.auth_session_json,
+                "device_id": result.device_id,
+            }.items()
+            if value
+        }
+        public_data["_credential_updates"] = credential_updates
+        public_data["_account_updates"] = {"email": new_email}
+        return {"ok": True, "data": public_data}
 
     def _execute_platform_action(self, action_id: str, account: Account, params: dict) -> dict:
         """Handle ChatGPT-specific actions."""
@@ -484,7 +638,10 @@ class ChatGPTPlatform(BasePlatform):
             # chain probe while the new UI sends an explicit false by default.
             True if "check_chain" not in (params or {}) else False,
         )
-        include_trial = "check_chain" not in (params or {})
+        # ``check_chain`` only controls the optional cs/oaics checkout probe.
+        # The regular account-state query must still fetch promotion
+        # eligibility; the UI always sends check_chain=false explicitly.
+        include_trial = True
         configured_proxy = manual_proxy or (self.config.proxy if self.config else None)
         region = str(getattr(account, "region", "") or extra.get("region", "") or "").strip()
         a.region = region

@@ -26,6 +26,7 @@ class AccountRecord:
     provider_accounts: list[dict] = field(default_factory=list)
     provider_resources: list[dict] = field(default_factory=list)
     created_at: Optional[datetime] = None
+    registered_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
 

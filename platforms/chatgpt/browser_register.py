@@ -4138,25 +4138,58 @@ class ChatGPTBrowserRegister:
             if registration_email_codes:
                 self.log("已记录注册阶段邮箱验证码，re-auth 将强制等待新的邮箱验证码")
 
+            pre_security_session_info = None
+            if self.setup_security:
+                try:
+                    # Capture the access token before security re-auth can
+                    # invalidate or otherwise disturb the current session.
+                    pre_security_cookies = _get_cookies(page)
+                    pre_security_session_info = _fetch_chatgpt_session_from_page(
+                        page,
+                        pre_security_cookies,
+                        self.log,
+                    )
+                    self.log("已在安全设置前保存 ChatGPT access token 快照")
+                except Exception as exc:
+                    self.log(f"安全设置前获取 access token 快照失败: {exc}")
+
             if self.setup_security:
                 # 原步骤 7、8 完成后，先执行用户脚本中的 TOTP -> 密码安全设置。
                 self.log("步骤 9: 设置密码+2FA")
-                security_info = _setup_chatgpt_password_and_totp(
-                    page,
-                    email=email,
-                    password=password,
-                otp_callback=self.otp_callback,
-                excluded_email_codes=registration_email_codes,
-                registration_email_identities=registration_email_identities,
-                log=self.log,
-                )
-                self.log(
-                    "步骤 9 完成: "
-                    f"password={'yes' if security_info.get('password_set') else 'no'}, "
-                    f"totp={'yes' if security_info.get('totp_set') else 'no'}"
-                )
+                security_setup_error = ""
+                try:
+                    security_info = _setup_chatgpt_password_and_totp(
+                        page,
+                        email=email,
+                        password=password,
+                        otp_callback=self.otp_callback,
+                        excluded_email_codes=registration_email_codes,
+                        registration_email_identities=registration_email_identities,
+                        log=self.log,
+                    )
+                    self.log(
+                        "步骤 9 完成: "
+                        f"password={'yes' if security_info.get('password_set') else 'no'}, "
+                        f"totp={'yes' if security_info.get('totp_set') else 'no'}"
+                    )
+                except Exception as exc:
+                    # The signup flow has already completed.  Keep going to
+                    # collect the session so the account can still be saved;
+                    # the security failure is stored in the account metadata.
+                    security_setup_error = str(exc)
+                    self.log(
+                        f"TOTP+密码设置失败，但账号已注册成功，将继续保存账号: {security_setup_error}"
+                    )
+                    security_info = {
+                        "password_set": bool(password),
+                        "password_path": "registration",
+                        "totp_set": False,
+                        "totp_secret": "",
+                        "otpauth": "",
+                    }
             else:
                 self.log("已跳过注册后的 TOTP+密码设置")
+                security_setup_error = ""
                 security_info = {
                     "password_set": bool(password),
                     "password_path": "registration",
@@ -4167,8 +4200,18 @@ class ChatGPTBrowserRegister:
 
             # 原步骤 9：获取 session token 和 cookies（插入安全设置后顺延为步骤 10）。
             self.log("步骤 10: 获取 session")
-            cookies_dict = _get_cookies(page)
-            session_info = _fetch_chatgpt_session_from_page(page, cookies_dict, self.log)
+            cookies_dict = {}
+            try:
+                cookies_dict = _get_cookies(page)
+                session_info = _fetch_chatgpt_session_from_page(page, cookies_dict, self.log)
+            except Exception as exc:
+                if pre_security_session_info:
+                    self.log(
+                        f"安全设置后 session 获取失败，回退到注册后的 access token 快照: {exc}"
+                    )
+                    session_info = pre_security_session_info
+                else:
+                    raise
             result = {
                 "email": email,
                 "password": password,
@@ -4188,6 +4231,8 @@ class ChatGPTBrowserRegister:
                 "totp_set": bool(security_info.get("totp_set")),
                 "totp_secret": security_info.get("totp_secret", ""),
                 "otpauth": security_info.get("otpauth", ""),
+                "security_setup_ok": not security_setup_error,
+                "security_setup_error": security_setup_error,
             }
             with self._active_lock:
                 self._active_page = None

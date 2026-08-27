@@ -46,6 +46,33 @@ class _UnavailablePlatform:
         }
 
 
+def test_single_account_check_enables_plus_trial_enrichment(monkeypatch):
+    account_id = _create_account()
+    seen = {}
+
+    class _Platform:
+        def __init__(self, config: RegisterConfig | None = None):
+            seen["config"] = config
+
+        def check_valid(self, account) -> bool:
+            return True
+
+        def get_last_check_overview(self) -> dict:
+            return {
+                "check_state": "valid",
+                "plus_trial_eligible": True,
+                "plus_trial_check_state": "available",
+            }
+
+    monkeypatch.setattr("application.tasks.get", lambda _platform: _Platform)
+
+    valid, _ = _run_single_account_check(account_id)
+
+    assert valid is True
+    assert seen["config"].extra["check_trial"] is True
+    assert _overview(account_id).get_summary()["plus_trial_eligible"] is True
+
+
 def test_chatgpt_unavailable_check_clears_checkout_chain(monkeypatch):
     def _network_failure(account, proxy=None):
         raise RuntimeError("network down")

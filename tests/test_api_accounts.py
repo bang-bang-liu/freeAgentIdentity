@@ -7,9 +7,10 @@ from datetime import datetime, timedelta, timezone
 
 from application.account_exports import AccountExportsService
 from core.base_platform import Account
-from core.db import save_account
+from core.db import AccountModel, engine, save_account
 from domain.accounts import AccountExportSelection, AccountQuery
 from infrastructure.accounts_repository import AccountsRepository
+from sqlmodel import Session
 
 
 def _make_jwt(payload: dict) -> str:
@@ -60,6 +61,54 @@ def test_save_account_returns_model_with_loaded_attributes_after_session_close()
     assert int(updated.id) == created_id
     assert updated.email == "detached-model@test.com"
     assert updated.password == "SecondPass123!"
+
+
+def test_re_registered_account_is_sorted_by_latest_save():
+    existing = save_account(
+        Account(
+            platform="chatgpt",
+            email="existing-registration@example.com",
+            password="FirstPass123!",
+        )
+    )
+    other = save_account(
+        Account(
+            platform="chatgpt",
+            email="other-registration@example.com",
+            password="OtherPass123!",
+        )
+    )
+
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        existing_model = session.get(AccountModel, int(existing.id))
+        other_model = session.get(AccountModel, int(other.id))
+        assert existing_model is not None
+        assert other_model is not None
+        existing_model.created_at = now - timedelta(days=2)
+        existing_model.updated_at = now - timedelta(days=2)
+        other_model.created_at = now - timedelta(days=1)
+        other_model.updated_at = now - timedelta(days=1)
+        session.add(existing_model)
+        session.add(other_model)
+        session.commit()
+
+    # Registration uses the same platform/email as an existing row, so the
+    # save is an update. The account should still be visible as the newest
+    # successful registration in the list.
+    save_account(
+        Account(
+            platform="chatgpt",
+            email="existing-registration@example.com",
+            password="SecondPass123!",
+        )
+    )
+
+    _, records = AccountsRepository().list(
+        AccountQuery(platform="chatgpt", page=1, page_size=10)
+    )
+    assert [record.id for record in records] == [int(existing.id), int(other.id)]
+    assert records[0].registered_at is not None
 
 
 def test_list_accounts_empty(client):

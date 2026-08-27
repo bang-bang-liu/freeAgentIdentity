@@ -31,6 +31,10 @@ class AccountModel(SQLModel, table=True):
     password: str
     user_id: str = ""
     created_at: datetime = Field(default_factory=_utcnow)
+    # The latest successful registration/save time. This is intentionally
+    # separate from ``updated_at`` because status checks and lifecycle jobs
+    # also update that field.
+    last_registered_at: Optional[datetime] = None
     updated_at: datetime = Field(default_factory=_utcnow)
 
 
@@ -274,6 +278,7 @@ def save_account(account) -> 'AccountModel':
     from core.account_graph import sync_platform_account_graph
 
     with Session(engine) as session:
+        saved_at = _utcnow()
         existing = session.exec(
             select(AccountModel)
             .where(AccountModel.platform == account.platform)
@@ -282,6 +287,7 @@ def save_account(account) -> 'AccountModel':
         if existing:
             existing.password = account.password
             existing.user_id = account.user_id or ""
+            existing.last_registered_at = saved_at
             existing.updated_at = _utcnow()
             session.add(existing)
             session.commit()
@@ -298,6 +304,7 @@ def save_account(account) -> 'AccountModel':
             email=account.email,
             password=account.password,
             user_id=account.user_id or "",
+            last_registered_at=saved_at,
         )
         session.add(m)
         session.commit()
@@ -408,6 +415,7 @@ def init_db():
 
     _migrate_legacy_accounts_schema()
     _ensure_column("provider_definitions", "category", "TEXT DEFAULT ''")
+    _ensure_column("accounts", "last_registered_at", "DATETIME")
     SQLModel.metadata.create_all(engine)
 
     with Session(engine) as session:
@@ -415,6 +423,7 @@ def init_db():
         _migrate_legacy_provider_keys()
         _cleanup_non_real_providers()
         _cleanup_empty_provider_settings()
+        _backfill_last_registered_at(session)
         sync_all_account_graphs(session)
         session.commit()
 
@@ -431,6 +440,52 @@ def _ensure_column(table: str, column: str, col_type: str):
     with engine.begin() as conn:
         conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
     print(f"[DB] 已添加列 {table}.{column}")
+
+
+def _backfill_last_registered_at(session: Session) -> None:
+    """Recover registration timestamps for rows created before the column.
+
+    Successful registration tasks already persist the account IDs they saved.
+    Use only those IDs and the task completion time to restore the new field;
+    this avoids treating status checks or lifecycle updates as registrations.
+    """
+    latest_by_account: dict[int, datetime] = {}
+    tasks = session.exec(
+        select(TaskModel)
+        .where(TaskModel.type == "register")
+        .where(TaskModel.status == "succeeded")
+    ).all()
+    for task in tasks:
+        finished_at = task.finished_at
+        if not finished_at:
+            continue
+        data = (task.get_result() or {}).get("data") or {}
+        if not isinstance(data, dict):
+            continue
+        for raw_id in data.get("account_ids") or []:
+            try:
+                account_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if account_id <= 0:
+                continue
+            previous = latest_by_account.get(account_id)
+            if previous is None or finished_at > previous:
+                latest_by_account[account_id] = finished_at
+
+    if not latest_by_account:
+        return
+
+    models = session.exec(
+        select(AccountModel).where(AccountModel.id.in_(list(latest_by_account)))
+    ).all()
+    for model in models:
+        candidate = latest_by_account.get(int(model.id or 0))
+        if candidate is None:
+            continue
+        if model.last_registered_at is None or candidate > model.last_registered_at:
+            model.last_registered_at = candidate
+            session.add(model)
 
 
 def _cleanup_empty_provider_settings():

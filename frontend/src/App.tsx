@@ -85,7 +85,7 @@ function Sidebar({
     <aside
       className={cn(
         "flex h-screen flex-col border-r border-[var(--border)] bg-[var(--bg-surface)] transition-[width] duration-200",
-        collapsed ? "w-16" : "w-[220px]",
+        collapsed ? "w-16" : "w-[190px]",
       )}
     >
       {/* Header */}

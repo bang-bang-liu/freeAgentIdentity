@@ -41,9 +41,13 @@ PERSISTED_ACTION_DATA_KEYS = {
     "orgId",
     "auth_token",
     "authToken",
+    "cookies",
+    "cookie_header",
+    "auth_session_json",
+    "device_id",
 }
 
-STATEFUL_ACTION_IDS = {"get_account_state", "query_state"}
+STATEFUL_ACTION_IDS = {"get_account_state", "query_state", "check_trial"}
 
 
 def _utcnow_iso() -> str:
@@ -300,21 +304,39 @@ class PlatformRuntime:
 
             result_data = result.get("data")
             if isinstance(result_data, dict):
-                data = result_data
+                # Platform actions may return private credential material for
+                # persistence. Strip it before task APIs/frontend receive the
+                # result, so AT/session/cookie values never enter logs/UI.
+                data = dict(result_data)
+                private_credential_updates = data.pop("_credential_updates", {})
+                account_updates = data.pop("_account_updates", {})
                 needs_save = False
                 action_ok = bool(result.get("ok"))
                 credential_updates = {}
                 if action_ok:
-                    credential_updates = {
+                    if isinstance(private_credential_updates, dict):
+                        credential_updates.update({
+                            str(key): value
+                            for key, value in private_credential_updates.items()
+                            if value not in (None, "")
+                        })
+                    credential_updates.update({
                         key: value
                         for key, value in data.items()
                         if key in PERSISTED_ACTION_DATA_KEYS and value not in (None, "")
-                    }
+                    })
                 summary_updates: dict[str, Any] = {}
                 if action_ok and command.action_id in STATEFUL_ACTION_IDS:
                     overview = _build_account_overview(command.platform, data)
                     if overview:
                         summary_updates.update(overview)
+                        needs_save = True
+                if action_ok and isinstance(account_updates, dict):
+                    next_email = str(account_updates.get("email") or "").strip()
+                    if next_email:
+                        model.email = next_email
+                        summary_updates["remote_email"] = next_email
+                        summary_updates["rebind_at"] = _utcnow_iso()
                         needs_save = True
                 if credential_updates:
                     needs_save = True
@@ -330,6 +352,6 @@ class PlatformRuntime:
                     session.commit()
             return ActionExecutionResult(
                 ok=bool(result.get("ok")),
-                data=result_data,
+                data=(data if isinstance(result_data, dict) else result_data),
                 error=str(result.get("error", "")),
             )

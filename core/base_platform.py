@@ -173,7 +173,16 @@ class BasePlatform(ABC):
             account = self._account_from_registration_result(result)
             self._release_identity_mailbox(identity)
             return self._attach_identity_metadata(account, identity)
-        except Exception:
+        except Exception as exc:
+            # Preserve the resolved registration address for task-level
+            # failure summaries.  This is especially important for mailbox
+            # providers that allocate a dynamic address internally.
+            failed_email = str(getattr(identity, "email", "") or "").strip()
+            if failed_email:
+                try:
+                    setattr(exc, "registration_email", failed_email)
+                except Exception:
+                    pass
             self._release_identity_mailbox(identity)
             raise
 

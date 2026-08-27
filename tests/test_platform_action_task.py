@@ -64,6 +64,69 @@ def test_account_overview_persists_chatgpt_checkout_chain():
     assert overview["plus_trial_checkout_error"] is None
 
 
+def test_trial_action_persists_plus_trial_result(monkeypatch):
+    captured = {}
+    model = type("Model", (), {"id": 123, "platform": "chatgpt", "email": "trial@example.com"})()
+
+    class FakeSession:
+        def __init__(self, engine):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, model_cls, account_id):
+            return model
+
+        def add(self, value):
+            captured["added"] = value
+
+        def commit(self):
+            captured["committed"] = True
+
+    class FakePlatform:
+        def __init__(self, config=None):
+            pass
+
+        def set_logger(self, logger):
+            pass
+
+        def execute_action(self, action_id, account, params):
+            return {
+                "ok": True,
+                "data": {
+                    "plus_trial_eligible": True,
+                    "plus_trial_check_state": "available",
+                },
+            }
+
+    def fake_patch(session, db_model, **kwargs):
+        captured["patch"] = kwargs
+
+    monkeypatch.setattr(runtime_module, "Session", FakeSession)
+    monkeypatch.setattr(runtime_module, "load_all", lambda: None)
+    monkeypatch.setattr(runtime_module, "get", lambda platform: FakePlatform)
+    monkeypatch.setattr(runtime_module, "build_platform_account", lambda session, db_model: object())
+    monkeypatch.setattr(runtime_module, "patch_account_graph", fake_patch)
+
+    result = runtime_module.PlatformRuntime().execute_action(
+        ActionExecutionCommand(
+            platform="chatgpt",
+            account_id=123,
+            action_id="check_trial",
+            params={},
+        ),
+        cancel_check=lambda: False,
+    )
+
+    assert result.ok is True
+    assert captured["patch"]["summary_updates"]["plus_trial_eligible"] is True
+    assert "带Plus试用" in captured["patch"]["summary_updates"]["chips"]
+
+
 def test_platform_action_task_passes_task_logger_to_runtime(monkeypatch):
     seen = {}
 
@@ -195,6 +258,50 @@ def test_chatgpt_register_task_succeeds_after_successful_registration(monkeypatc
         "cannot access local variable 'extra'" in str(event)
         for event in logger.events
     )
+
+
+def test_chatgpt_register_task_reports_failed_email_in_summary(monkeypatch):
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            error = RuntimeError("验证码获取失败")
+            error.registration_email = "failed@example.com"
+            raise error
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
+    monkeypatch.setattr(
+        tasks_module,
+        "_resolve_registration_proxy_for_platform",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda *args, **kwargs: FakePlatform(),
+    )
+    monkeypatch.setattr("core.base_mailbox.create_mailbox", lambda *args, **kwargs: object())
+
+    logger = _FakeLogger()
+    tasks_module._execute_register_task(
+        {
+            "platform": "chatgpt",
+            "count": 1,
+            "concurrency": 1,
+            "email": "failed@example.com",
+            "extra": {"identity_provider": "mailbox"},
+        },
+        logger,
+    )
+
+    assert logger.result_data["failed_emails"] == ["failed@example.com"]
+    assert logger.result_data["failed_accounts"] == [
+        {"email": "failed@example.com", "error": "验证码获取失败"},
+    ]
+    assert any(
+        event[0] == "log"
+        and "失败邮箱: failed@example.com" in event[1]
+        for event in logger.events
+    )
+    assert logger.finished == (tasks_module.TASK_STATUS_FAILED, "failed@example.com: 验证码获取失败")
 
 
 def test_browser_registration_platform_receives_task_cancel_checker(monkeypatch):
@@ -596,3 +703,80 @@ def test_platform_runtime_wires_log_fn_to_platform(monkeypatch):
     assert result.ok is True
     assert logs == ["runtime platform log"]
     assert seen["cancel_check"]() is False
+
+
+def test_platform_runtime_persists_rebind_credentials_without_returning_them(monkeypatch):
+    captured = {}
+    model = type("Model", (), {"id": 123, "platform": "chatgpt", "email": "old@example.com"})()
+
+    class FakeSession:
+        def __init__(self, engine):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, model_cls, account_id):
+            return model
+
+        def add(self, value):
+            captured["added"] = value
+
+        def commit(self):
+            captured["committed"] = True
+
+    class FakePlatform:
+        def __init__(self, config=None):
+            pass
+
+        def set_logger(self, logger):
+            pass
+
+        def set_cancel_checker(self, checker):
+            pass
+
+        def execute_action(self, action_id, account, params):
+            return {
+                "ok": True,
+                "data": {
+                    "message": "rebind success",
+                    "_credential_updates": {
+                        "access_token": "at-sensitive-placeholder",
+                        "session_token": "session-sensitive-placeholder",
+                        "cookies": "cookie-sensitive-placeholder",
+                    },
+                    "_account_updates": {"email": "new@example.com"},
+                },
+            }
+
+    def fake_patch(session, db_model, **kwargs):
+        captured["patch"] = kwargs
+
+    monkeypatch.setattr(runtime_module, "Session", FakeSession)
+    monkeypatch.setattr(runtime_module, "load_all", lambda: None)
+    monkeypatch.setattr(runtime_module, "get", lambda platform: FakePlatform)
+    monkeypatch.setattr(runtime_module, "build_platform_account", lambda session, db_model: object())
+    monkeypatch.setattr(runtime_module, "patch_account_graph", fake_patch)
+
+    result = runtime_module.PlatformRuntime().execute_action(
+        ActionExecutionCommand(
+            platform="chatgpt",
+            account_id=123,
+            action_id="rebind_email",
+            params={},
+        ),
+        cancel_check=lambda: False,
+    )
+
+    assert result.ok is True
+    assert result.data == {"message": "rebind success"}
+    assert model.email == "new@example.com"
+    assert captured["patch"]["credential_updates"] == {
+        "access_token": "at-sensitive-placeholder",
+        "session_token": "session-sensitive-placeholder",
+        "cookies": "cookie-sensitive-placeholder",
+    }
+    assert captured["patch"]["summary_updates"]["remote_email"] == "new@example.com"
