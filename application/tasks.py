@@ -36,6 +36,7 @@ TASK_TYPE_ACCOUNT_CHECK_ALL = "account_check_all"
 TASK_TYPE_GCASH_CHECK_ALL = "gcash_check_all"
 TASK_TYPE_TRIAL_CHECK_ALL = "trial_check_all"
 TASK_TYPE_PLATFORM_ACTION = "platform_action"
+TASK_TYPE_LOGIN_REFRESH = "login_refresh"
 
 TASK_STATUS_PENDING = "pending"
 TASK_STATUS_CLAIMED = "claimed"
@@ -229,6 +230,10 @@ def _task_account_keys(task_type: str, payload: dict[str, Any]) -> list[str]:
         account_id = int(payload.get("account_id", 0) or 0)
         if account_id > 0:
             return [f"account:{account_id}"]
+    if task_type == TASK_TYPE_LOGIN_REFRESH:
+        account_ids = payload.get("account_ids", [])
+        if isinstance(account_ids, list):
+            return [f"account:{aid}" for aid in account_ids if isinstance(aid, int) and aid > 0]
     return []
 
 
@@ -829,12 +834,18 @@ def execute_task(task_id: str) -> None:
         clear_task_cancel_callbacks(task_id)
         return
 
+    # ``login_refresh`` 的执行器住在 ``application.login_refresh``，而那个模块
+    # 需要从本模块导入 create_task/TaskLogger。顶层互相导入会成环，所以在这里
+    # 惰性导入，与 ``create_mailbox`` 的处理方式一致。
+    from application.login_refresh import _execute_login_refresh_task
+
     handlers: dict[str, Callable[[dict[str, Any], TaskLogger], None]] = {
         TASK_TYPE_REGISTER: _execute_register_task,
         TASK_TYPE_ACCOUNT_CHECK_ALL: _execute_account_check_all_task,
         TASK_TYPE_GCASH_CHECK_ALL: _execute_gcash_check_all_task,
         TASK_TYPE_TRIAL_CHECK_ALL: _execute_trial_check_all_task,
         TASK_TYPE_PLATFORM_ACTION: _execute_platform_action_task,
+        TASK_TYPE_LOGIN_REFRESH: _execute_login_refresh_task,
     }
     handler = handlers.get(task_type)
     if not handler:
@@ -1158,6 +1169,11 @@ def _execute_platform_action_task(payload: dict[str, Any], logger: TaskLogger) -
         logger.log(message, event_type="summary")
     logger.set_progress(1, 1)
     logger.finish(TASK_STATUS_SUCCEEDED)
+
+
+def _execute_login_refresh_task(payload: dict[str, Any], logger: TaskLogger) -> None:
+    from application.login_refresh import _execute_login_refresh_task as impl
+    impl(payload=payload, logger=logger)
 
 
 def _execute_account_check_all_task(payload: dict[str, Any], logger: TaskLogger) -> None:

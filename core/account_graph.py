@@ -67,9 +67,7 @@ TRANSIENT_CHECK_STATES = {"unavailable", "unknown", "credential_missing"}
 DEFINITIVE_CHECK_STATES = {"invalid", "credential_invalid"}
 
 PRIMARY_TOKEN_WRITE_KEYS: dict[str, str] = {
-    "cursor": "session_token",
     "chatgpt": "access_token",
-    "kiro": "accessToken",
     "trae": "legacy_token",
     "blink": "firebase_refresh_token",
     "openblocklabs": "wos_session",

@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react'
 import { apiFetch } from '@/lib/utils'
 import { translateAccountStatus } from '@/lib/i18n'
 import { useI18n } from '@/lib/i18n-context'
-import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Users, CheckCircle, Clock, XCircle, RefreshCw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -29,11 +28,15 @@ export default function Dashboard() {
   const { t, language } = useI18n()
   const [stats, setStats] = useState<any>(null)
   const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
 
   const load = async () => {
     setLoading(true)
     try {
       setStats(await apiFetch('/accounts/stats'))
+      setError('')
+    } catch (error) {
+      setError(error instanceof Error ? error.message : String(error))
     } finally {
       setLoading(false)
     }
@@ -53,28 +56,39 @@ export default function Dashboard() {
   const renderStatusGroup = (title: string, values: Record<string, number> | undefined, emptyCopy = t('dashboard.noData')) => (
     <div className="space-y-2">
       <div className="px-1 text-sm font-medium text-[var(--text-primary)]">{title}</div>
-      {values && Object.keys(values).length > 0 ? Object.entries(values).map(([status, count]) => (
-        <div key={status} className="flex items-center justify-between rounded-lg border border-[var(--border-soft)] bg-[var(--bg-pane)]/45 px-3 py-2.5">
-          <Badge variant={STATUS_VARIANT[status] || 'secondary'}>{translateAccountStatus(status, language)}</Badge>
-          <span className="text-sm text-[var(--text-secondary)]">{count}</span>
+      {values && Object.keys(values).length > 0 ? (
+        <div>
+          {Object.entries(values).map(([status, count]) => (
+            <div key={status} className="status-row">
+              <Badge variant={STATUS_VARIANT[status] || 'secondary'}>{translateAccountStatus(status, language)}</Badge>
+              <span className="text-sm tabular-nums text-[var(--text-secondary)]">{count}</span>
+            </div>
+          ))}
         </div>
-      )) : (
+      ) : (
         <div className="empty-state-panel">{emptyCopy}</div>
       )}
     </div>
   )
 
   return (
-    <div className="space-y-4">
-      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+    <div className="dashboard-workspace" aria-busy={loading}>
+      <div className="page-heading">
+        <h1>{t('nav.dashboard')}</h1>
+        <Button variant="outline" size="sm" onClick={load} disabled={loading}>
+          <RefreshCw className={`mr-2 h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />{t('common.refresh')}
+        </Button>
+      </div>
+      {error && <div className="inline-error mb-6" role="alert">{error}</div>}
+      <div className="metric-strip">
         {statCards.map(({ label, value, icon: Icon, color }) => (
-          <div key={label} className="rounded-lg border border-[var(--border-soft)] bg-[var(--bg-pane)]/45 px-3 py-3">
+          <div key={label}>
             <div className="flex items-center justify-between gap-3">
               <div>
-                <p className="text-[11px] tracking-[0.16em] text-[var(--text-muted)]">{label}</p>
-                <p className="mt-1 text-xl font-semibold tracking-[-0.03em] text-[var(--text-primary)]">{value}</p>
+                <p className="metric-label">{label}</p>
+                <p className="metric-value">{loading && !stats ? <span className="skeleton w-20 h-10" /> : value}</p>
               </div>
-              <div className="flex h-9 w-9 items-center justify-center rounded-md border border-[var(--border-soft)] bg-[var(--chip-bg)]">
+              <div className="flex h-9 w-9 items-center justify-center">
                 <Icon className={`h-4.5 w-4.5 ${color} opacity-90`} />
               </div>
             </div>
@@ -82,20 +96,15 @@ export default function Dashboard() {
         ))}
       </div>
 
-      <Card>
-        <CardHeader className="flex-row items-center justify-between space-y-0">
-          <CardTitle>{t('dashboard.platformDistribution')}</CardTitle>
-          <Button variant="outline" size="sm" onClick={load} disabled={loading}>
-            <RefreshCw className={`mr-1 h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
-            {t('common.refresh')}
-          </Button>
-        </CardHeader>
-        <CardContent className="space-y-3">
+      <div className="dashboard-layout">
+      <section className="data-section">
+        <h2 className="section-heading">{t('dashboard.platformDistribution')}</h2>
+        <div className="space-y-3">
           {platformEntries.length > 0 ? platformEntries.map(([platform, count]) => {
             const countValue = Number(count) || 0
             const ratio = totalCount > 0 ? Math.round((countValue / totalCount) * 100) : 0
             return (
-              <div key={platform} className="rounded-lg border border-[var(--border-soft)] bg-[var(--bg-pane)]/45 px-3 py-2.5">
+              <div key={platform} className="py-3">
                 <div className="flex items-center justify-between gap-3">
                   <span className={`text-sm font-medium ${PLATFORM_COLORS[platform] || 'text-[var(--text-secondary)]'}`}>
                     {platform}
@@ -110,17 +119,18 @@ export default function Dashboard() {
           }) : (
             <div className="empty-state-panel">{stats ? t('dashboard.noPlatformData') : t('dashboard.loadingStats')}</div>
           )}
-        </CardContent>
-      </Card>
+        </div>
+      </section>
 
-      <Card>
-        <CardHeader><CardTitle>{t('dashboard.statusDistribution')}</CardTitle></CardHeader>
-        <CardContent className="grid gap-4 xl:grid-cols-3">
+      <section className="data-section">
+        <h2 className="section-heading">{t('dashboard.statusDistribution')}</h2>
+        <div className="status-columns">
           {renderStatusGroup(t('dashboard.plan'), stats?.by_plan_state, t('dashboard.noPlanData'))}
           {renderStatusGroup(t('dashboard.lifecycle'), stats?.by_lifecycle_status, t('dashboard.noLifecycleData'))}
           {renderStatusGroup(t('dashboard.validity'), stats?.by_validity_status, t('dashboard.noValidityData'))}
-        </CardContent>
-      </Card>
+        </div>
+      </section>
+      </div>
     </div>
   )
 }

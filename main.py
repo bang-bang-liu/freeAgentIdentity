@@ -68,6 +68,7 @@ from api.auth import router as auth_router
 from api.config import router as config_router
 from core.auth import AuthMiddleware
 from api.health import router as health_router
+from api.login_refresh import router as login_refresh_router
 from api.platforms import router as platforms_router
 from api.provider_definitions import router as provider_definitions_router
 from api.provider_settings import router as provider_settings_router
@@ -122,6 +123,7 @@ app.include_router(actions_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
 app.include_router(config_router, prefix="/api")
 app.include_router(health_router, prefix="/api")
+app.include_router(login_refresh_router, prefix="/api")
 app.include_router(platforms_router, prefix="/api")
 app.include_router(provider_definitions_router, prefix="/api")
 app.include_router(provider_settings_router, prefix="/api")

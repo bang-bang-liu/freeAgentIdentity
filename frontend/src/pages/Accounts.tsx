@@ -1,5 +1,7 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
 import { createPortal } from 'react-dom'
+import { useSearchParams } from 'react-router-dom'
+import { Search } from 'lucide-react'
 import { getConfigOptions, getPlatforms } from '@/lib/app-data'
 import type { ConfigOptionsResponse } from '@/lib/config-options'
 import { getCaptchaStrategyLabel } from '@/lib/config-options'
@@ -12,7 +14,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { getTaskStatusText, TASK_STATUS_VARIANTS } from '@/lib/tasks'
-import { RefreshCw, Copy, Download, Upload, Plus, X, Mail, Trash2, UserCheck, FlaskConical, Crown, Clock, CircleX, Sparkles, BadgeCheck, Gift, Circle } from 'lucide-react'
+import { RefreshCw, Copy, Download, Upload, Plus, X, Mail, Trash2, UserCheck, FlaskConical, Crown, Clock, CircleX, Sparkles, BadgeCheck, Gift, Circle, ChevronLeft, ChevronRight, LogIn } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 
 const STATUS_VARIANT: Record<string, any> = {
@@ -578,20 +580,20 @@ function RegisterModal({
 
   const dialog = (
     <div className="dialog-backdrop">
-      <div className="dialog-panel dialog-panel-md flex flex-col"
-           onClick={e => e.stopPropagation()} style={{maxHeight: '88vh'}}>
+      <div className="dialog-panel register-dialog flex flex-col"
+           role="dialog" aria-modal="true" aria-label={t('accounts.autoRegister')}
+           onClick={e => e.stopPropagation()}>
         <div className="flex items-center justify-between px-6 py-4 border-b border-[var(--border)]">
           <h2 className="text-base font-semibold text-[var(--text-primary)]">{t('accounts.autoRegister')} {platformMeta?.display_name || 'ChatGPT'}</h2>
           <button onClick={onClose} className="text-[var(--text-muted)] hover:text-[var(--text-primary)]"><X className="h-4 w-4" /></button>
         </div>
-        <div className="px-6 py-4 flex-1 overflow-y-auto flex flex-col gap-5">
+        <div className="register-content px-6 py-5 flex-1 overflow-y-auto flex flex-col gap-6">
           {!taskId ? (
             configLoading ? (
               <div className="text-sm text-[var(--text-muted)]">{t('accounts.loadingRegistrationConfig')}</div>
             ) : (
               <>
                 <div>
-                  <div className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Step 1</div>
                   <div className="mt-1 text-sm font-semibold text-[var(--text-primary)]">{t('accounts.selectIdentity')}</div>
                   <div className="mt-1 text-xs text-[var(--text-muted)]">{t('accounts.selectIdentityDesc')}</div>
                   <div className="mt-3 grid gap-3 md:grid-cols-2">
@@ -601,11 +603,12 @@ function RegisterModal({
                         <button
                           key={option.key}
                           type="button"
+                          aria-pressed={active}
                           onClick={() => setSelection(current => ({
                             ...current,
                             identityProvider: option.identityProvider,
                           }))}
-                          className={`rounded-xl border px-4 py-3 text-left transition-colors ${
+                          className={`registration-choice border px-4 py-3 text-left transition-colors ${
                             active
                               ? 'border-[var(--accent)] bg-[var(--accent-soft)]'
                               : 'border-[var(--border)] bg-[var(--bg-pane)]/45 hover:border-[var(--accent)]/60'
@@ -623,7 +626,6 @@ function RegisterModal({
                 </div>
 
                 <div>
-                  <div className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Step 2</div>
                   <div className="mt-1 text-sm font-semibold text-[var(--text-primary)]">{t('accounts.selectExecutor')}</div>
                   <div className="mt-1 text-xs text-[var(--text-muted)]">{t('accounts.selectExecutorDesc')}</div>
                   <div className="mt-3 grid gap-3 md:grid-cols-3">
@@ -633,9 +635,10 @@ function RegisterModal({
                         <button
                           key={option.value}
                           type="button"
+                          aria-pressed={active}
                           disabled={option.disabled}
                           onClick={() => !option.disabled && setSelection(current => ({ ...current, executorType: option.value }))}
-                          className={`rounded-xl border px-4 py-3 text-left transition-colors ${
+                          className={`registration-choice border px-4 py-3 text-left transition-colors ${
                             option.disabled
                               ? 'cursor-not-allowed border-[var(--border)] bg-[var(--bg-hover)] opacity-50'
                               : active
@@ -1633,7 +1636,7 @@ function ActionMenu({
     <div className="relative flex w-full min-w-0 flex-wrap items-center justify-end gap-0.5 whitespace-nowrap">
       {toast && (
         <div
-          className="fixed top-5 right-5 z-[9999] flex items-center gap-2.5 rounded-xl border px-4 py-3 text-[13px] font-medium shadow-lg  cursor-pointer transition-all"
+          className="fixed top-5 right-5 z-[70] flex items-center gap-2.5 rounded-xl border px-4 py-3 text-[13px] font-medium shadow-lg  cursor-pointer transition-all"
           style={{
             background: toast.type === 'success' ? 'rgba(16,185,129,0.12)' : 'rgba(239,68,68,0.12)',
             borderColor: toast.type === 'success' ? 'rgba(16,185,129,0.25)' : 'rgba(239,68,68,0.25)',
@@ -1699,7 +1702,7 @@ function ActionMenu({
           {open && typeof document !== 'undefined' && createPortal(
             <div
               ref={menuRef}
-              className="fixed z-[9999] w-[220px] overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--bg-card)]/96 py-1.5 shadow-[var(--shadow-soft)] "
+              className="fixed z-[60] w-[220px] overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--bg-card)]/96 py-1.5 shadow-[var(--shadow-soft)] "
               style={{ top: menuPosition.top, left: menuPosition.left, maxHeight: menuPosition.maxHeight }}
             >
               {actions.map(a => (
@@ -2146,9 +2149,170 @@ function ExportMenu({
   )
 }
 
+function LoginRefreshMenu({
+  total,
+  statusFilter,
+  searchFilter,
+  selectedIds,
+  onTaskCreated,
+}: {
+  total: number
+  statusFilter: string
+  searchFilter: string
+  selectedIds: number[]
+  onTaskCreated?: (taskId: string, title: string) => void
+}) {
+  const { t } = useI18n()
+  const [showPreview, setShowPreview] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [preview, setPreview] = useState<any>(null)
+  const [proxy, setProxy] = useState('http://127.0.0.1:7897')
+  const hasSelection = selectedIds.length > 0
+
+  const openPreview = async () => {
+    setLoading(true)
+    try {
+      const data = await apiFetch('/login-refresh/preview', {
+        method: 'POST',
+        body: JSON.stringify({
+          platform: 'chatgpt',
+          ids: hasSelection ? selectedIds : [],
+          select_all: !hasSelection,
+          status_filter: !hasSelection ? statusFilter || null : null,
+          search_filter: !hasSelection ? searchFilter || null : null,
+          proxy: proxy,
+        }),
+      })
+      setPreview(data)
+      setShowPreview(true)
+    } catch (e: any) {
+      window.alert(e?.message || t('accounts.loginRefreshStartFailed'))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const startRefresh = async () => {
+    setLoading(true)
+    try {
+      const result = await apiFetch('/login-refresh/create', {
+        method: 'POST',
+        body: JSON.stringify({
+          platform: 'chatgpt',
+          ids: hasSelection ? selectedIds : [],
+          select_all: !hasSelection,
+          status_filter: !hasSelection ? statusFilter || null : null,
+          search_filter: !hasSelection ? searchFilter || null : null,
+          proxy: proxy,
+        }),
+      })
+      setShowPreview(false)
+      setPreview(null)
+      if (result?.task_id && onTaskCreated) {
+        const title = hasSelection
+          ? t('accounts.loginRefreshSelected', { count: selectedIds.length })
+          : t('accounts.loginRefresh')
+        onTaskCreated(result.task_id, title)
+      }
+    } catch (e: any) {
+      window.alert(e?.message || t('accounts.loginRefreshStartFailed'))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <>
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={openPreview}
+        disabled={total === 0 || loading}
+        className={ACCOUNT_TOOL_BUTTON_CLASS}
+      >
+        <LogIn className="h-4 w-4 mr-1 shrink-0" />
+        {loading ? t('accounts.loginRefreshing') : hasSelection ? t('accounts.loginRefreshSelected', { count: selectedIds.length }) : t('accounts.loginRefresh')}
+      </Button>
+
+      {showPreview && createPortal(
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+          <div className="relative w-full max-w-2xl rounded-xl border border-[var(--border)] bg-[var(--bg-card)] shadow-2xl">
+            <div className="flex items-center justify-between border-b border-[var(--border)] px-6 py-4">
+              <h2 className="text-lg font-semibold text-[var(--text-primary)]">{t('accounts.loginRefreshPreviewTitle')}</h2>
+              <button
+                onClick={() => setShowPreview(false)}
+                className="rounded-lg p-1 text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+            <div className="max-h-[60vh] overflow-y-auto px-6 py-4">
+              <div className="mb-4">
+                <label className="block text-sm font-medium text-[var(--text-primary)] mb-2">
+                  {t('accounts.loginRefreshProxy')}
+                </label>
+                <input
+                  type="text"
+                  value={proxy}
+                  onChange={(e) => setProxy(e.target.value)}
+                  placeholder="http://127.0.0.1:7897"
+                  className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-pane)] px-3 py-2 text-sm text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:ring-2 focus:ring-[var(--accent)]"
+                />
+              </div>
+              <p className="mb-4 text-sm text-[var(--text-secondary)]">{t('accounts.loginRefreshPreviewDesc')}</p>
+              {preview?.accounts && preview.accounts.length > 0 ? (
+                <div className="space-y-2">
+                  {preview.accounts.map((acc: any, idx: number) => (
+                    <div key={idx} className="rounded-lg border border-[var(--border)] bg-[var(--bg-pane)] px-4 py-2.5 text-sm">
+                      <div className="font-medium text-[var(--text-primary)]">{acc.email}</div>
+                      {acc.can_refresh === false && (
+                        <div className="mt-1 text-xs text-amber-500">{acc.reason || '无本地凭证'}</div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-pane)] px-4 py-8 text-center text-sm text-[var(--text-muted)]">
+                  暂无可刷新的账号
+                </div>
+              )}
+            </div>
+            <div className="flex items-center justify-end gap-3 border-t border-[var(--border)] px-6 py-4">
+              <Button variant="outline" size="sm" onClick={() => setShowPreview(false)} disabled={loading}>
+                取消
+              </Button>
+              <Button
+                size="sm"
+                onClick={startRefresh}
+                disabled={loading || !preview?.accounts || preview.accounts.length === 0}
+              >
+                {loading ? t('accounts.loginRefreshing') : t('accounts.loginRefreshStart')}
+              </Button>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+    </>
+  )
+}
+
+function getPageItems(current: number, totalPages: number): (number | 'ellipsis')[] {
+  if (totalPages <= 7) return Array.from({ length: totalPages }, (_, i) => i + 1)
+  const items: (number | 'ellipsis')[] = [1]
+  const start = Math.max(2, current - 1)
+  const end = Math.min(totalPages - 1, current + 1)
+  if (start > 2) items.push('ellipsis')
+  for (let i = start; i <= end; i++) items.push(i)
+  if (end < totalPages - 1) items.push('ellipsis')
+  items.push(totalPages)
+  return items
+}
+
 // ── Main ────────────────────────────────────────────────────
 export default function Accounts() {
   const { t, language } = useI18n()
+  const [searchParams, setSearchParams] = useSearchParams()
   const tab = 'chatgpt'
 
   const [accounts, setAccounts] = useState<any[]>([])
@@ -2160,7 +2324,17 @@ export default function Accounts() {
   const [filterStatus, setFilterStatus] = useState('')
   const [detail, setDetail] = useState<any | null>(null)
   const [showImport, setShowImport] = useState(false)
-  const [showRegister, setShowRegister] = useState(false)
+  const [registerOpen, setRegisterOpen] = useState(false)
+  const showRegister = registerOpen || searchParams.get('register') === '1'
+  const setShowRegister = (open: boolean) => {
+    setRegisterOpen(open)
+    if (!open && searchParams.has('register')) {
+      const next = new URLSearchParams(searchParams)
+      next.delete('register')
+      setSearchParams(next, { replace: true })
+    }
+  }
+  const [loadError, setLoadError] = useState('')
   const [platformsMap, setPlatformsMap] = useState<Record<string, any>>({})
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [actionResult, setActionResult] = useState<{ title: string; payload: any } | null>(null)
@@ -2174,6 +2348,11 @@ export default function Accounts() {
   const [trialCheckStarting, setTrialCheckStarting] = useState(false)
   const [batchTask, setBatchTask] = useState<{ taskId: string; title: string } | null>(null)
   const [batchTaskStatus, setBatchTaskStatus] = useState<string | null>(null)
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(20)
+  const tableWrapRef = useRef<HTMLDivElement>(null)
+  const loadSeqRef = useRef(0)
+  const userPinnedSizeRef = useRef(false)
 
   useEffect(() => {
     getPlatforms().then((list: any[]) => {
@@ -2197,18 +2376,70 @@ export default function Accounts() {
     setSelectedIds(new Set())
   }, [tab, filterStatus, debouncedSearch])
 
+  useEffect(() => {
+    setPage(1)
+  }, [tab, filterStatus, debouncedSearch, pageSize])
+
   const load = useCallback(async (p = tab, s = debouncedSearch, fs = filterStatus) => {
+    const seq = ++loadSeqRef.current
     setLoading(true)
     try {
-      const params = new URLSearchParams({ platform: p, page: '1', page_size: '100' })
+      const params = new URLSearchParams({ platform: p, page: String(page), page_size: String(pageSize) })
       if (s) params.set('email', s)
       if (fs) params.set('status', fs)
       const data = await apiFetch(`/accounts?${params}`)
+      if (seq !== loadSeqRef.current) return
       setAccounts(data.items); setTotal(data.total)
-    } finally { setLoading(false) }
-  }, [tab, debouncedSearch, filterStatus])
+      setLoadError('')
+      const maxPage = Math.max(1, Math.ceil((data.total || 0) / pageSize))
+      if (page > maxPage) setPage(maxPage)
+    } catch (error) {
+      if (seq === loadSeqRef.current) setLoadError(error instanceof Error ? error.message : String(error))
+    } finally {
+      if (seq === loadSeqRef.current) setLoading(false)
+    }
+  }, [tab, debouncedSearch, filterStatus, page, pageSize])
 
-  useEffect(() => { load(tab, debouncedSearch, filterStatus) }, [tab, debouncedSearch, filterStatus])
+  useEffect(() => { load(tab, debouncedSearch, filterStatus) }, [load])
+
+  useEffect(() => {
+    tableWrapRef.current?.closest('main')?.scrollTo({ top: 0 })
+  }, [page, pageSize])
+
+  // 自动适配：按表格可视高度估算每页行数，让一页刚好铺满、无需内部滚动
+  const fitRowsToViewport = useCallback(() => {
+    const wrap = tableWrapRef.current
+    if (!wrap || userPinnedSizeRef.current) return
+    const head = wrap.querySelector('thead')
+    const rows = wrap.querySelectorAll<HTMLElement>('tbody tr')
+    if (!head || rows.length === 0) return
+    let total = 0
+    const sample = Math.min(rows.length, 8)
+    for (let i = 0; i < sample; i++) total += rows[i].offsetHeight
+    const rowHeight = total / sample
+    const usable = wrap.clientHeight - head.offsetHeight - 8
+    const fit = Math.floor(usable / rowHeight)
+    if (fit >= 5 && fit <= 200 && fit !== pageSize) setPageSize(fit)
+  }, [pageSize])
+
+  useEffect(() => {
+    if (loading || accounts.length === 0) return
+    const frame = requestAnimationFrame(fitRowsToViewport)
+    return () => cancelAnimationFrame(frame)
+  }, [loading, accounts, fitRowsToViewport])
+
+  useEffect(() => {
+    let timer: number | undefined
+    const onResize = () => {
+      window.clearTimeout(timer)
+      timer = window.setTimeout(fitRowsToViewport, 200)
+    }
+    window.addEventListener('resize', onResize)
+    return () => {
+      window.clearTimeout(timer)
+      window.removeEventListener('resize', onResize)
+    }
+  }, [fitRowsToViewport])
 
   useEffect(() => {
     setSelectedIds(prev => {
@@ -2234,6 +2465,7 @@ export default function Accounts() {
     triggerBrowserDownload(blob, `${tab}_accounts.csv`)
   }
 
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
   const pageIds = accounts.map(acc => acc.id)
   const allSelectedOnPage = pageIds.length > 0 && pageIds.every(id => selectedIds.has(id))
   const selectedCount = selectedIds.size
@@ -2280,7 +2512,7 @@ export default function Accounts() {
   const visibleInvalid = accounts.filter(acc => getValidityStatus(acc) === 'invalid' || getLifecycleStatus(acc) === 'invalid').length
 
   return (
-    <div className="flex h-full min-h-0 flex-col gap-4 overflow-hidden">
+    <div className="accounts-workspace flex min-h-0 flex-1 flex-col gap-4 overflow-hidden">
       {detail && <DetailModal acc={detail} onClose={() => setDetail(null)} onSave={() => { setDetail(null); load() }} />}
       {showImport && <ImportModal onClose={() => setShowImport(false)} onDone={() => { setShowImport(false); load() }} />}
       {showRegister && <RegisterModal platformMeta={platformsMap[tab]} onClose={() => setShowRegister(false)} onDone={() => load()} />}
@@ -2413,8 +2645,9 @@ export default function Accounts() {
           }}
         />
       )}
-      <Card className="shrink-0 bg-[var(--bg-pane)]/40 border border-[var(--border)] shadow-sm">
-        <div className="flex flex-col gap-3 px-5 py-4 border-b border-[var(--border)]/50 lg:flex-row lg:items-start lg:justify-between">
+      {loadError && <div className="inline-error" role="alert">{loadError}</div>}
+      <Card className="accounts-panel flex min-h-0 flex-1 flex-col overflow-hidden p-0">
+        <div className="accounts-header">
           <div className="flex min-w-0 shrink-0 flex-wrap items-center gap-3">
             <h1 className="shrink-0 text-lg font-semibold tracking-tight text-[var(--text-primary)]">
               {platformLabel}
@@ -2439,12 +2672,24 @@ export default function Accounts() {
               {t('accounts.import')}
             </Button>
             {tab === 'chatgpt' ? (
-              <ExportMenu
-                total={total}
-                statusFilter={filterStatus}
-                searchFilter={debouncedSearch}
-                selectedIds={[...selectedIds]}
-              />
+              <>
+                <LoginRefreshMenu
+                  total={total}
+                  statusFilter={filterStatus}
+                  searchFilter={debouncedSearch}
+                  selectedIds={[...selectedIds]}
+                  onTaskCreated={(taskId, title) => {
+                    setBatchTask({ taskId, title })
+                    setBatchTaskStatus(null)
+                  }}
+                />
+                <ExportMenu
+                  total={total}
+                  statusFilter={filterStatus}
+                  searchFilter={debouncedSearch}
+                  selectedIds={[...selectedIds]}
+                />
+              </>
             ) : (
               <Button size="sm" variant="outline" onClick={exportCsv} disabled={accounts.length === 0} className={ACCOUNT_TOOL_BUTTON_CLASS}>
                 <Download className="mr-1.5 h-3.5 w-3.5 shrink-0" />
@@ -2455,15 +2700,16 @@ export default function Accounts() {
         </div>
         
         {/* Search & Filter Toolbar */}
-        <div className="flex items-center justify-between gap-4 px-5 py-2.5 bg-[var(--bg-pane)]/20">
-          <div className="flex flex-1 items-center gap-3">
+        <div className="accounts-toolbar">
+          <div className="account-filters">
             <div className="relative flex-1 max-w-sm">
               <div className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-2.5 text-[var(--text-muted)]">
-                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>
+                <Search size={14} />
               </div>
               <input
                 type="text"
                 placeholder={t('accounts.searchPlaceholder')}
+                aria-label={t('accounts.searchPlaceholder')}
                 value={search}
                 onChange={e => setSearch(e.target.value)}
                 className="w-full rounded-md border border-[var(--border)] bg-transparent py-1.5 pl-8 pr-3 text-sm text-[var(--text-primary)] transition-colors placeholder:text-[var(--text-muted)] focus:border-[var(--text-primary)] focus:outline-none focus:ring-1 focus:ring-[var(--text-primary)]"
@@ -2471,9 +2717,9 @@ export default function Accounts() {
             </div>
             <select
               value={filterStatus}
+              aria-label={t('common.status')}
               onChange={e => setFilterStatus(e.target.value)}
-              className="rounded-md border border-[var(--border)] bg-transparent py-1.5 pl-3 pr-8 text-sm text-[var(--text-primary)] transition-colors focus:border-[var(--text-primary)] focus:outline-none focus:ring-1 focus:ring-[var(--text-primary)] appearance-none"
-              style={{ backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E")`, backgroundPosition: 'right 8px center', backgroundRepeat: 'no-repeat' }}
+              className="rounded-md border border-[var(--border)] bg-[var(--bg-input)] py-1.5 px-3 text-sm text-[var(--text-primary)]"
             >
               <option value="">{t('accounts.allStatuses')}</option>
               <option value="registered">{translateAccountStatus('registered', language)}</option>
@@ -2486,7 +2732,7 @@ export default function Accounts() {
             </select>
           </div>
           
-          <div className="flex items-center gap-2">
+          <div className="account-tools">
             <Button
               variant="ghost"
               size="sm"
@@ -2538,7 +2784,7 @@ export default function Accounts() {
                   ? t('accounts.trialCheckSelected', { count: selectedCount })
                   : t('accounts.trialCheck')}
             </Button>
-            <Button variant="ghost" size="sm" onClick={() => load()} disabled={loading} className="h-7 w-7 p-0 text-[var(--text-muted)] hover:text-[var(--text-primary)]">
+            <Button variant="ghost" size="sm" onClick={() => load()} disabled={loading} title={t('common.refresh')} aria-label={t('common.refresh')} className="h-7 w-7 p-0 text-[var(--text-muted)] hover:text-[var(--text-primary)]">
               <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
             </Button>
             {selectedCount > 0 && (
@@ -2567,11 +2813,7 @@ export default function Accounts() {
             )}
           </div>
         </div>
-      </Card>
-
-      <Card className="min-h-0 flex-1 overflow-hidden p-0 border border-[var(--border)] shadow-sm">
-        <div className="flex h-full min-h-0 flex-col">
-          <div className="glass-table-wrap min-h-0 flex-1 overflow-auto">
+          <div ref={tableWrapRef} className="accounts-table glass-table-wrap min-h-0 flex-1 overflow-auto" aria-busy={loading}>
         <table className="table-fixed w-full min-w-[980px] text-sm">
           <colgroup>
             <col className="w-10" />
@@ -2582,7 +2824,7 @@ export default function Accounts() {
             <col className="w-[12%]" />
             <col className="w-[22%]" />
           </colgroup>
-          <thead className="sticky top-0 z-10  bg-[var(--bg-pane)]/80">
+          <thead className="sticky top-0 z-10 bg-[var(--bg-pane)]/85 shadow-[0_1px_0_var(--border)] backdrop-blur-sm">
             <tr className="border-b border-[var(--border)] text-xs uppercase tracking-wider font-medium text-[var(--text-muted)]">
               <th className="w-10 px-3 py-2 text-left">
                 <input
@@ -2601,7 +2843,10 @@ export default function Accounts() {
             </tr>
           </thead>
           <tbody>
-            {accounts.length === 0 && (
+            {loading && accounts.length === 0 && Array.from({ length: 5 }, (_, index) => (
+              <tr key={`loading-${index}`} aria-hidden="true">{Array.from({ length: 7 }, (_, cell) => <td key={cell}><span className="skeleton" /></td>)}</tr>
+            ))}
+            {!loading && accounts.length === 0 && (
               <tr>
                 <td colSpan={7} className="px-4 py-24 text-center">
                   <div className="flex flex-col items-center justify-center space-y-3">
@@ -2764,6 +3009,59 @@ export default function Accounts() {
             ))}
           </tbody>
         </table>
+          </div>
+        {/* Pagination */}
+        <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-[var(--border)]/50 px-5 py-3">
+          <div className="flex items-center gap-3 text-xs text-[var(--text-muted)]">
+            <span>{t('accounts.pageSummary', { page, pages: totalPages, count: total })}</span>
+            <select
+              value={pageSize}
+              onChange={e => {
+                userPinnedSizeRef.current = true
+                setPageSize(Number(e.target.value))
+              }}
+              className="rounded-md border border-[var(--border)] bg-transparent py-1 pl-2 pr-7 text-xs text-[var(--text-primary)] appearance-none focus:border-[var(--text-primary)] focus:outline-none focus:ring-1 focus:ring-[var(--text-primary)]"
+              style={{ backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E")`, backgroundPosition: 'right 6px center', backgroundRepeat: 'no-repeat' }}
+            >
+              {[...new Set([10, 20, 50, 100, 200, pageSize])].sort((a, b) => a - b).map(size => (
+                <option key={size} value={size}>{t('accounts.pageSizeOption', { size })}</option>
+              ))}
+            </select>
+          </div>
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              title={t('accounts.prevPage')}
+              disabled={page <= 1 || loading}
+              onClick={() => setPage(p => Math.max(1, p - 1))}
+              className="table-action-btn h-7 w-7 p-0"
+            >
+              <ChevronLeft className="h-3.5 w-3.5" />
+            </button>
+            {getPageItems(page, totalPages).map((item, index) =>
+              item === 'ellipsis' ? (
+                <span key={`ellipsis-${index}`} className="px-1 text-xs text-[var(--text-muted)]">…</span>
+              ) : (
+                <button
+                  key={`page-${item}`}
+                  type="button"
+                  disabled={loading}
+                  onClick={() => setPage(item)}
+                  className={`table-action-btn h-7 min-w-[28px] ${item === page ? 'border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--text-primary)]' : ''}`}
+                >
+                  {item}
+                </button>
+              ),
+            )}
+            <button
+              type="button"
+              title={t('accounts.nextPage')}
+              disabled={page >= totalPages || loading}
+              onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+              className="table-action-btn h-7 w-7 p-0"
+            >
+              <ChevronRight className="h-3.5 w-3.5" />
+            </button>
           </div>
         </div>
       </Card>

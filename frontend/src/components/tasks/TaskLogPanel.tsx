@@ -38,9 +38,9 @@ type OtpRequest = {
 const MAIN_GROUP_ID = "__main__";
 
 function classifyLine(line: string): string {
-  if (line.includes("✓") || line.includes("成功")) return "text-emerald-400";
+  if (line.includes("✓") || line.includes("成功")) return "text-[var(--status-success)]";
   if (line.includes("✗") || line.includes("失败") || line.includes("错误"))
-    return "text-red-400";
+    return "text-[var(--status-danger)]";
   return "text-[var(--text-secondary)]";
 }
 
@@ -269,12 +269,12 @@ export function TaskLogPanel({
     task?.error || (Array.isArray(task?.errors) ? task.errors[0] : "");
   const statusTone =
     currentStatus === "succeeded"
-      ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-200"
+      ? "border-emerald-400/40 bg-emerald-400/10 text-[var(--status-success)]"
       : currentStatus === "failed"
-        ? "border-red-400/40 bg-red-400/10 text-red-200"
+        ? "border-red-400/40 bg-red-400/10 text-[var(--status-danger)]"
         : currentStatus === "cancelled" || currentStatus === "interrupted"
-          ? "border-amber-400/40 bg-amber-400/10 text-amber-200"
-          : "border-sky-400/40 bg-sky-400/10 text-sky-200";
+          ? "border-amber-400/40 bg-amber-400/10 text-[var(--status-warning)]"
+          : "border-sky-400/40 bg-sky-400/10 text-[var(--text-accent)]";
 
   const copyLogs = () => {
     navigator.clipboard
@@ -328,26 +328,26 @@ export function TaskLogPanel({
   };
 
   return (
-    <div className="flex h-full flex-col gap-4">
-      <div className="grid gap-3 md:grid-cols-3">
-        <div className={`rounded-2xl border px-4 py-3 ${statusTone}`}>
-          <div className="text-[11px] uppercase tracking-[0.18em] opacity-70">
+    <div className="task-log flex h-full flex-col gap-4">
+      <div className="task-summary">
+        <div className={`rounded-lg border px-4 py-3 ${statusTone}`}>
+          <div className="text-[11px]  opacity-70">
             {t("taskLog.status")}
           </div>
           <div className="mt-1 text-sm font-semibold">
             {getTaskStatusText(currentStatus, language)}
           </div>
         </div>
-        <div className="rounded-2xl border border-[var(--border)] bg-[var(--bg-hover)] px-4 py-3">
-          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--text-muted)]">
+        <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-hover)] px-4 py-3">
+          <div className="text-[11px]  text-[var(--text-muted)]">
             {t("taskLog.progress")}
           </div>
           <div className="mt-1 text-sm font-semibold text-[var(--text-primary)]">
             {progress.label || task?.progress || "0/0"}
           </div>
         </div>
-        <div className="rounded-2xl border border-[var(--border)] bg-[var(--bg-hover)] px-4 py-3">
-          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--text-muted)]">
+        <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-hover)] px-4 py-3">
+          <div className="text-[11px]  text-[var(--text-muted)]">
             {t("taskLog.events")}
           </div>
           <div className="mt-1 text-sm font-semibold text-[var(--text-primary)]">
@@ -356,7 +356,7 @@ export function TaskLogPanel({
         </div>
       </div>
 
-      <div className="h-2 overflow-hidden rounded-full bg-[var(--bg-hover)] ring-1 ring-[var(--border)]">
+      <div className="progress-track" role="progressbar" aria-label={t("taskLog.progress")} aria-valuenow={progressPercent} aria-valuemin={0} aria-valuemax={100}>
         <div
           className={`h-full rounded-full transition-all duration-500 ${
             currentStatus === "failed"
@@ -372,16 +372,16 @@ export function TaskLogPanel({
       </div>
 
       {errorText ? (
-        <div className="rounded-2xl border border-red-400/35 bg-red-500/10 px-4 py-3 text-sm text-red-100">
+        <div className="rounded-lg border border-red-400/35 bg-red-500/10 px-4 py-3 text-sm text-[var(--status-danger)]">
           <div className="mb-1 font-semibold">
             {t("taskLog.failureReason")}
           </div>
-          <div className="break-words text-red-100/85">{errorText}</div>
+          <div className="break-words text-[var(--status-danger)]">{errorText}</div>
         </div>
       ) : null}
 
       {cancelError ? (
-        <div className="rounded-lg border border-red-400/35 bg-red-500/10 px-3 py-2 text-xs text-red-100">
+        <div className="rounded-lg border border-red-400/35 bg-red-500/10 px-3 py-2 text-xs text-[var(--status-danger)]">
           {cancelError}
         </div>
       ) : null}
@@ -398,14 +398,14 @@ export function TaskLogPanel({
                 className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center"
               >
                 <div className="min-w-0 sm:flex-1">
-                  <div className="flex items-center gap-2 text-xs font-medium text-amber-100">
+                  <div className="flex items-center gap-2 text-xs font-medium text-[var(--status-warning)]">
                     <KeyRound className="h-4 w-4 shrink-0" />
                     <span>{t("taskLog.otpWaiting")}</span>
-                    <span className="truncate text-amber-100/65">
+                    <span className="truncate text-[var(--status-warning)]">
                       {request.worker_label || request.worker_id}
                     </span>
                   </div>
-                  <div className="mt-1 truncate pl-6 text-[11px] text-amber-100/70">
+                  <div className="mt-1 truncate pl-6 text-[11px] text-[var(--status-warning)]">
                     {request.email} · {t("taskLog.otpAutoPolling")}
                   </div>
                 </div>
@@ -437,7 +437,7 @@ export function TaskLogPanel({
                     disabled={!canSubmit}
                     title={t("taskLog.otpSubmit")}
                     aria-label={t("taskLog.otpSubmit")}
-                    className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-amber-300/35 bg-amber-300/15 text-amber-100 hover:bg-amber-300/25 disabled:cursor-not-allowed disabled:opacity-45"
+                    className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-amber-300/35 bg-amber-300/15 text-[var(--status-warning)] hover:bg-amber-300/25 disabled:cursor-not-allowed disabled:opacity-45"
                   >
                     {submitting ? (
                       <LoaderCircle className="h-4 w-4 animate-spin" />
@@ -447,7 +447,7 @@ export function TaskLogPanel({
                   </button>
                 </div>
                 {otpErrors[request.request_id] ? (
-                  <div className="w-full text-xs text-red-300">
+                  <div className="w-full text-xs text-[var(--status-danger)]">
                     {otpErrors[request.request_id]}
                   </div>
                 ) : null}
@@ -459,7 +459,7 @@ export function TaskLogPanel({
 
       <div className="flex items-center justify-between gap-3">
         <div>
-          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--text-muted)]">
+          <div className="text-[11px]  text-[var(--text-muted)]">
             {t("taskLog.liveLog")}
           </div>
           <div className="mt-1 text-sm font-medium text-[var(--text-primary)]">
@@ -473,7 +473,7 @@ export function TaskLogPanel({
               onClick={cancelTask}
               disabled={!canCancel || cancelSubmitting}
               title={t("taskLog.cancelTask")}
-              className="inline-flex items-center gap-1.5 rounded-full border border-red-400/35 bg-red-500/10 px-3 py-1.5 text-xs text-red-200 hover:bg-red-500/15 disabled:cursor-not-allowed disabled:opacity-60"
+              className="inline-flex items-center gap-1.5 rounded-full border border-red-400/35 bg-red-500/10 px-3 py-1.5 text-xs text-[var(--status-danger)] hover:bg-red-500/15 disabled:cursor-not-allowed disabled:opacity-60"
             >
               {cancelSubmitting || currentStatus === "cancel_requested" ? (
                 <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
@@ -495,9 +495,9 @@ export function TaskLogPanel({
         </div>
       </div>
 
-      <div className="min-h-[260px] flex-1 overflow-y-auto rounded-xl border border-[var(--border)] bg-[var(--bg-input)] p-3 font-mono text-xs">
+      <div className="log-console min-h-[260px] flex-1 overflow-y-auto p-3 font-mono text-xs">
         {events.length === 0 ? (
-          <div className="flex h-full min-h-[180px] items-center justify-center rounded-2xl border border-dashed border-[var(--border)] text-[var(--text-muted)]">
+          <div className="flex h-full min-h-[180px] items-center justify-center rounded-lg border border-dashed border-[var(--border)] text-[var(--text-muted)]">
             {t("taskLog.waiting")}
           </div>
         ) : (
@@ -560,11 +560,12 @@ function LogGroupView({
   }, [collapsed, total]);
 
   return (
-    <div className="overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--bg-pane)]/40">
+    <div className="overflow-hidden border-b border-[var(--border)]">
       <button
         type="button"
         onClick={onToggle}
-        className="flex w-full items-center gap-2 border-b border-[var(--border)] bg-[var(--bg-hover)]/60 px-3 py-1.5 text-left text-[11px] uppercase tracking-[0.16em] text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+        aria-expanded={!collapsed}
+        className="flex w-full items-center gap-2 border-b border-[var(--border)] bg-[var(--bg-hover)]/60 px-3 py-1.5 text-left text-[11px]  text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
       >
         {collapsed ? (
           <ChevronRight className="h-3.5 w-3.5" />
@@ -581,7 +582,7 @@ function LogGroupView({
       {!collapsed && (
         <div className="max-h-[280px] overflow-y-auto px-2 py-2">
           {truncated && (
-            <div className="mb-2 rounded border border-amber-400/30 bg-amber-400/10 px-2 py-1 text-[10px] text-amber-200">
+            <div className="mb-2 rounded border border-amber-400/30 bg-amber-400/10 px-2 py-1 text-[10px] text-[var(--status-warning)]">
               {t("taskLog.truncatedHint", {
                 shown: MAX_VISIBLE_PER_GROUP,
                 total,
@@ -592,7 +593,7 @@ function LogGroupView({
             {visible.map((ev) => (
               <div
                 key={ev.id}
-                className={`rounded-md border border-white/5 bg-white/[0.025] px-3 py-1.5 leading-5 ${classifyLine(ev.line)}`}
+                className={`break-words px-3 py-1.5 leading-5 ${classifyLine(ev.line)}`}
               >
                 {ev.line}
               </div>

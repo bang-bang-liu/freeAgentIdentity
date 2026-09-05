@@ -30,11 +30,56 @@ from .constants import (
 CAMOUFOX_VISIBLE_WINDOW_SIZE = (1280, 720)
 SECURITY_EMAIL_RESEND_MIN_INTERVAL = 60.0
 
+# 日本常见屏幕分辨率（根据真实设备统计）
+JP_COMMON_SCREENS = [
+    {"width": 1920, "height": 1080},  # Full HD (最常见)
+    {"width": 1366, "height": 768},   # 笔记本常见
+    {"width": 1536, "height": 864},   # 125% 缩放的 1920x1080
+    {"width": 1440, "height": 900},   # MacBook
+    {"width": 2560, "height": 1440},  # 2K
+    {"width": 1280, "height": 720},   # HD
+    {"width": 1600, "height": 900},   # HD+
+]
+
+# 日本常见操作系统分布
+JP_COMMON_OS = [
+    "windows",  # 70% 市场份额
+    "windows",
+    "windows",
+    "macos",    # 20% 市场份额
+    "macos",
+    "linux",    # 10% 市场份额
+]
+
+# 常见浏览器扩展（模拟真实用户）
+COMMON_ADDONS = [
+    [],  # 50% 用户不装扩展
+    [],
+    ["ublock_origin"],  # 30% 装广告拦截
+    ["ublock_origin"],
+    ["ublock_origin"],
+    ["ublock_origin", "tampermonkey"],  # 10% 装多个
+    ["tampermonkey"],  # 10% 只装脚本管理
+]
+
 
 def _diagnostic_fingerprint(value: object) -> str:
     """Return a short diagnostic tag without putting secrets in task logs."""
     normalized = str(value or "").strip()
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12] if normalized else "unknown"
+
+
+def _generate_registration_fingerprint() -> dict:
+    """为单次注册生成随机但真实的浏览器指纹配置。
+
+    返回 Camoufox launch_opts 的指纹相关字段，用于避免多个账号共享相同指纹。
+    每次调用返回不同的配置，模拟不同的真实用户设备。
+    """
+    return {
+        "screen": random.choice(JP_COMMON_SCREENS),
+        "os": random.choice(JP_COMMON_OS),
+        "addons": random.choice(COMMON_ADDONS),
+    }
 
 
 def _otp_submission_diagnostic(otp_callback, code: str) -> str:

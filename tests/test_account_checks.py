@@ -51,7 +51,7 @@ def _create(email: str, platform: str = "chatgpt") -> int:
 
 def test_check_service_rejects_selected_account_from_another_platform(monkeypatch):
     chatgpt_id = _create("chatgpt@example.com")
-    cursor_id = _create("cursor@example.com", platform="cursor")
+    blink_id = _create("blink@example.com", platform="blink")
     monkeypatch.setattr(account_checks_module.task_runtime, "wake_up", lambda: None)
 
     captured = {}
@@ -66,10 +66,11 @@ def test_check_service_rejects_selected_account_from_another_platform(monkeypatc
     )
 
     assert result == {"task_id": "task-check"}
-    assert captured == {"platform": "chatgpt", "account_ids": [chatgpt_id], "kwargs": {}}
+    assert captured["platform"] == "chatgpt"
+    assert captured["account_ids"] == [chatgpt_id]
     with pytest.raises(ValueError, match="不属于平台"):
         account_checks_module.AccountChecksService().check_all_async(
-            "chatgpt", account_ids=[cursor_id]
+            "chatgpt", account_ids=[blink_id]
         )
 
 

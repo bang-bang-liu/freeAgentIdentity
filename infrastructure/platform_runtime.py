@@ -168,52 +168,6 @@ def _build_account_overview(platform: str, data: dict[str, Any]) -> dict[str, An
             overview["chips"].append(chip)
 
     usage_summary = data.get("usage_summary") or {}
-    if platform == "cursor" and isinstance(usage_summary.get("models"), dict):
-        usage_models = []
-        for model_name, info in usage_summary["models"].items():
-            if not isinstance(info, dict):
-                continue
-            usage_models.append({
-                "model": model_name,
-                "num_requests": info.get("num_requests"),
-                "num_requests_total": info.get("num_requests_total"),
-                "num_tokens": info.get("num_tokens"),
-                "remaining_requests": info.get("remaining_requests"),
-                "remaining_tokens": info.get("remaining_tokens"),
-            })
-            chip = f"{model_name} {info.get('num_requests', 0)}次"
-            if info.get("remaining_requests") is not None:
-                chip += f" / 剩{info['remaining_requests']}"
-            overview["chips"].append(chip)
-        if usage_models:
-            overview["usage_models"] = usage_models
-
-    if platform == "kiro" and isinstance(usage_summary, dict):
-        if usage_summary.get("next_reset_at"):
-            overview["next_reset_at"] = usage_summary.get("next_reset_at")
-        if usage_summary.get("days_until_reset") is not None:
-            overview["days_until_reset"] = usage_summary.get("days_until_reset")
-            overview["chips"].append(f"重置 {usage_summary.get('days_until_reset')} 天")
-        breakdowns = []
-        for item in usage_summary.get("breakdowns") or []:
-            if not isinstance(item, dict):
-                continue
-            breakdowns.append({
-                "display_name": item.get("display_name"),
-                "current_usage": item.get("current_usage"),
-                "usage_limit": item.get("usage_limit"),
-                "remaining_usage": item.get("remaining_usage"),
-                "trial_status": item.get("trial_status"),
-                "trial_expiry": item.get("trial_expiry"),
-                "trial_remaining_usage": item.get("trial_remaining_usage"),
-            })
-            label = item.get("display_name") or item.get("resource_type") or "usage"
-            chip = f"{label} {item.get('current_usage', 0)}/{item.get('usage_limit', '-')}"
-            if item.get("trial_status"):
-                chip += f" · {item['trial_status']}"
-            overview["chips"].append(chip)
-        if breakdowns:
-            overview["usage_breakdowns"] = breakdowns
 
     if data.get("quota_note"):
         overview["quota_note"] = data.get("quota_note")

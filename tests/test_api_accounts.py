@@ -193,11 +193,11 @@ def test_update_account(client):
 
 def test_filter_accounts_by_platform(client):
     _create_account(platform="chatgpt", email="a@test.com")
-    _create_account(platform="cursor", email="b@test.com")
-    resp = client.get("/api/accounts", params={"platform": "cursor"})
+    _create_account(platform="blink", email="b@test.com")
+    resp = client.get("/api/accounts", params={"platform": "blink"})
     data = resp.json()
     assert data["total"] == 1
-    assert data["items"][0]["platform"] == "cursor"
+    assert data["items"][0]["platform"] == "blink"
 
 
 def test_account_stats(client):
@@ -207,9 +207,9 @@ def test_account_stats(client):
 
 
 def test_export_any2api_multi_platform(client):
-    _create_account(platform="kiro", email="k@test.com", password="")
+    _create_account(platform="chatgpt", email="c@test.com", password="")
     _create_account(platform="grok", email="g@test.com", password="")
-    _create_account(platform="cursor", email="c@test.com", password="")
+    _create_account(platform="blink", email="b@test.com", password="")
     resp = client.post("/api/accounts/export/any2api", json={"select_all": True})
     assert resp.status_code == 200
     assert "any2api_admin" in resp.headers.get("content-disposition", "")

@@ -18,20 +18,23 @@ const CATEGORY_GROUPS = [
 /* ------------------------------------------------------------------ */
 /*  Toggle                                                             */
 /* ------------------------------------------------------------------ */
-function Toggle({ checked, onChange, disabled }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean }) {
+function Toggle({ checked, onChange, disabled, label }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean; label?: string }) {
   return (
+    <span className="inline-flex min-h-11 items-center">
     <button
       type="button"
       role="switch"
+      aria-label={label || 'Enabled'}
       aria-checked={checked}
       disabled={disabled}
       onClick={() => onChange(!checked)}
-      className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+      className={`provider-switch relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
         disabled ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'
       } ${checked ? 'bg-[var(--accent)]' : 'bg-[var(--chip-bg)] border border-[var(--border)]'}`}
     >
       <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${checked ? 'translate-x-[18px]' : 'translate-x-[3px]'}`} />
     </button>
+    </span>
   )
 }
 
@@ -545,9 +548,9 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
 
     return (
       <div key={key}>
-        <div className="flex items-center gap-3 rounded-lg border border-[var(--border)] bg-[var(--bg-card)] px-4 py-3">
+        <div className="provider-row">
           {/* Left: name + desc + badge */}
-          <div className="min-w-0 flex-1">
+          <div className="provider-identity">
             <div className="flex items-center gap-2">
               <span className="text-sm font-medium text-[var(--text-primary)]">{provider.label}</span>
               {isDefault && <Badge variant="success">{t('providers.default')}</Badge>}
@@ -558,7 +561,7 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
           </div>
 
           {/* Right: actions */}
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="provider-actions">
             <button
               onClick={() => hasFields && isEnabled ? setEditTarget({ provider, setting }) : undefined}
               disabled={!hasFields || !isEnabled}
@@ -603,6 +606,7 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
             )}
 
             <Toggle
+              label={`${provider.label}: ${t('common.enabled')}`}
               checked={isEnabled}
               onChange={v => handleToggle(provider, v)}
               disabled={loading[key] || isDefault}
@@ -631,12 +635,12 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
           if (!providers || providers.length === 0) return null
 
           return (
-            <div key={cat}>
+            <section key={cat} className="provider-group">
               <div className="mb-2">
                 <h3 className="text-sm font-semibold text-[var(--text-primary)]">{t(labelKey)}</h3>
                 <p className="text-xs text-[var(--text-muted)]">{t(descKey)}</p>
               </div>
-              <div className="space-y-1.5">
+              <div className="min-w-0">
                 {providers.map(p => renderCard(p, cat === 'custom'))}
                 {cat === 'custom' && onCreateCustom && (
                   <button
@@ -648,7 +652,7 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
                   </button>
                 )}
               </div>
-            </div>
+            </section>
           )
         })}
       </div>

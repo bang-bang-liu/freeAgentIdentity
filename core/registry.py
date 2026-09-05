@@ -13,7 +13,7 @@ def register(cls: Type[BasePlatform]):
 
 def load_all():
     """只加载当前仪表盘仍会展示的平台。"""
-    for name in ("chatgpt", "cursor", "kiro"):
+    for name in ("chatgpt",):
         importlib.import_module(f"platforms.{name}.plugin")
 
 

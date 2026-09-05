@@ -1,11 +1,12 @@
 import {
   BrowserRouter,
+  Link,
   NavLink,
   Route,
   Routes,
   useLocation,
 } from "react-router-dom";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getAuthToken, setAuthToken, API, cn } from "@/lib/utils";
 import { I18nProvider, useI18n } from "@/lib/i18n-context";
 import type { TranslationKey } from "@/lib/i18n";
@@ -23,7 +24,13 @@ import {
   Users,
   PanelLeftClose,
   PanelLeft,
+  Mail,
+  Plus,
+  ChevronRight,
+  Menu,
+  X,
 } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 
 /* ------------------------------------------------------------------ */
 /*  Sidebar                                                            */
@@ -33,7 +40,7 @@ type NavItem = {
   path: string;
   labelKey?: TranslationKey;
   label?: string;
-  icon: any;
+  icon: LucideIcon;
   exact?: boolean;
 };
 
@@ -53,16 +60,40 @@ function Sidebar({
   toggleTheme,
   collapsed,
   setCollapsed,
+  mobileOpen,
+  closeMobile,
 }: {
   theme: string;
   toggleTheme: () => void;
   collapsed: boolean;
   setCollapsed: (v: boolean) => void;
+  mobileOpen: boolean;
+  closeMobile: () => void;
 }) {
   const { t, toggleLanguage } = useI18n();
   const location = useLocation();
   const isSettings = location.pathname === "/settings";
   const currentTab = new URLSearchParams(location.search).get("tab") || "general";
+  const sidebarRef = useRef<HTMLElement>(null);
+
+  useEffect(() => {
+    if (!mobileOpen) return;
+    const sidebar = sidebarRef.current;
+    const previousFocus = document.activeElement as HTMLElement | null;
+    const focusable = () => Array.from(sidebar?.querySelectorAll<HTMLElement>('a, button:not(:disabled)') || [])
+      .filter(element => element.getClientRects().length > 0);
+    focusable()[0]?.focus();
+    const trapFocus = (event: KeyboardEvent) => {
+      if (event.key !== 'Tab') return;
+      const items = focusable();
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+    };
+    sidebar?.addEventListener('keydown', trapFocus);
+    return () => { sidebar?.removeEventListener('keydown', trapFocus); previousFocus?.focus(); };
+  }, [mobileOpen]);
 
   const navLinkClass = (active: boolean) =>
     cn(
@@ -83,19 +114,22 @@ function Sidebar({
 
   return (
     <aside
+      ref={sidebarRef}
       className={cn(
-        "flex h-screen flex-col border-r border-[var(--border)] bg-[var(--bg-surface)] transition-[width] duration-200",
-        collapsed ? "w-16" : "w-[190px]",
+        "app-sidebar flex shrink-0 flex-col",
+        collapsed && "is-collapsed",
+        mobileOpen && "is-mobile-open",
       )}
+      id="app-navigation"
     >
       {/* Header */}
       <div
         className={cn(
-          "flex h-12 shrink-0 items-center border-b border-[var(--border)] px-3",
+          "sidebar-brand flex shrink-0 items-center gap-2 border-b border-[var(--border)] px-4",
           collapsed && "justify-center",
         )}
       >
-        {!collapsed && (
+        {(!collapsed || mobileOpen) && (
           <div className="flex items-center gap-2.5 min-w-0 flex-1">
             <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-[var(--accent)] text-[11px] font-bold text-white">
               B
@@ -105,17 +139,18 @@ function Sidebar({
             </span>
           </div>
         )}
-        {collapsed && (
+        {collapsed && !mobileOpen && (
           <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-[var(--accent)] text-[11px] font-bold text-white">
             B
           </div>
         )}
+        <button className="mobile-only icon-control" onClick={closeMobile} aria-label={t("common.close")}><X size={18} /></button>
       </div>
 
       {/* Nav */}
-      <nav className="flex-1 overflow-y-auto px-2 py-3 space-y-0.5">
+      <nav className="flex-1 overflow-y-auto px-3 py-5 space-y-1" onClick={closeMobile}>
         {NAV_ITEMS.map(({ path, labelKey, label: itemLabel, icon: Icon, exact }) => {
-          const active = exact
+          const active = path === "/settings" ? isSettings && currentTab !== "mailbox" : exact
             ? location.pathname === path
             : location.pathname.startsWith(path);
           const label = itemLabel || (labelKey ? t(labelKey) : path);
@@ -126,13 +161,15 @@ function Sidebar({
               end={exact}
               className={navLinkClass(active)}
               title={collapsed ? label : undefined}
+              aria-label={label}
+              aria-current={active ? "page" : false}
             >
               <Icon className={iconClass(active)} />
-              {!collapsed && <span>{label}</span>}
+              {(!collapsed || mobileOpen) && <span>{label}</span>}
             </NavLink>
           );
         })}
-        {!collapsed && isSettings && (
+        {(!collapsed || mobileOpen) && isSettings && (
           <div className="ml-[21px] mt-0.5 space-y-px border-l border-[var(--border)] pl-3">
             {SETTINGS_NAV_ITEMS.map((item) => {
               const active = currentTab === item.hash;
@@ -156,10 +193,22 @@ function Sidebar({
             })}
           </div>
         )}
+        <div className="!my-4 border-t border-[var(--border)]" />
+        <Link to="/accounts/chatgpt?register=1" className={navLinkClass(false)} title={t("accounts.autoRegister")}>
+          <Plus className={iconClass(false)} />{(!collapsed || mobileOpen) && <span>{t("accounts.autoRegister")}</span>}
+        </Link>
+        <Link to="/settings?tab=mailbox" className={navLinkClass(isSettings && currentTab === "mailbox")} aria-current={isSettings && currentTab === "mailbox" ? "page" : undefined} title={t("nav.settings.mailbox")}>
+          <Mail className={iconClass(isSettings && currentTab === "mailbox")} />{(!collapsed || mobileOpen) && <span>{t("nav.settings.mailbox")}</span>}
+        </Link>
       </nav>
 
       {/* Footer */}
-      <div className="shrink-0 border-t border-[var(--border)] px-2 py-1.5 flex items-center gap-1">
+      <div
+        className={cn(
+          "sidebar-footer shrink-0 border-t border-[var(--border)] px-3 py-3 flex items-center gap-1",
+          collapsed && !mobileOpen && "flex-col px-1.5 py-2",
+        )}
+      >
         <button
           onClick={toggleTheme}
           className={cn(
@@ -229,21 +278,46 @@ function Shell({
   const [collapsed, setCollapsed] = useState(
     () => localStorage.getItem("sidebar-collapsed") === "true",
   );
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const { t } = useI18n();
+  const location = useLocation();
+  const pageTitle = location.pathname === "/settings"
+    ? t("nav.settings")
+    : location.pathname.startsWith("/accounts") ? "chatgpt free" : t("nav.dashboard");
+
+  useEffect(() => {
+    if (!mobileOpen) return;
+    const media = window.matchMedia('(min-width: 768px)');
+    const onResize = () => { if (media.matches) setMobileOpen(false); };
+    const close = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setMobileOpen(false);
+    };
+    window.addEventListener("keydown", close);
+    media.addEventListener('change', onResize);
+    return () => { window.removeEventListener("keydown", close); media.removeEventListener('change', onResize); };
+  }, [mobileOpen]);
 
   useEffect(() => {
     localStorage.setItem("sidebar-collapsed", String(collapsed));
   }, [collapsed]);
 
   return (
-    <div className="flex h-screen overflow-hidden bg-[var(--bg-base)]">
+    <div className="app-shell app-canvas overflow-hidden">
+      {mobileOpen && <button className="sidebar-scrim" onClick={() => setMobileOpen(false)} aria-label={t("common.close")} />}
       <Sidebar
         theme={theme}
         toggleTheme={toggleTheme}
         collapsed={collapsed}
         setCollapsed={setCollapsed}
+        mobileOpen={mobileOpen}
+        closeMobile={() => setMobileOpen(false)}
       />
-      <main className="flex-1 overflow-y-auto">
-        <div className="mx-auto max-w-6xl px-6 py-6 lg:px-8">
+      <main id="main-content" className="workspace-main min-w-0 flex-1" inert={mobileOpen}>
+        <header className="workspace-topbar">
+          <button className="mobile-only icon-control" onClick={() => setMobileOpen(true)} aria-label={t("sidebar.expand")} aria-expanded={mobileOpen} aria-controls="app-navigation"><Menu size={18} /></button>
+          <span className="text-[var(--text-muted)]">BangBang</span><ChevronRight size={14} className="text-[var(--text-muted)]" /><span>{pageTitle}</span>
+        </header>
+        <div className="workspace-content">
           <UpdateBanner />
           <Routes>
             <Route path="/" element={<Dashboard />} />
@@ -294,10 +368,10 @@ function LoginScreen({ onLogin }: { onLogin: (token: string) => void }) {
   };
 
   return (
-    <div className="flex h-screen items-center justify-center bg-[var(--bg-base)]">
+    <div className="app-canvas flex h-dvh items-center justify-center">
       <form
         onSubmit={submit}
-        className="w-80 space-y-4 rounded-xl border border-[var(--border)] bg-[var(--bg-card)] p-6"
+        className="panel-surface w-80 space-y-4 p-6"
       >
         <div className="flex items-center gap-2.5">
           <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[var(--accent)] text-sm font-bold text-white">
@@ -380,7 +454,7 @@ function AppContent() {
 
   if (authState === "loading") {
     return (
-      <div className="flex h-screen items-center justify-center bg-[var(--bg-base)] text-[var(--text-muted)] text-sm">
+      <div className="app-canvas flex h-dvh items-center justify-center text-[var(--text-muted)] text-sm">
         {t("app.loading")}
       </div>
     );

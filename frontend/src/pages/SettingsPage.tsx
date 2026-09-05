@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { Sun, Moon, Monitor } from "lucide-react";
-import { cn, apiFetch } from "@/lib/utils";
+import { apiFetch } from "@/lib/utils";
 import {
   getConfig,
   getConfigOptions,
@@ -29,7 +29,7 @@ function SettingGroup({
   children: React.ReactNode;
 }) {
   return (
-    <div className="space-y-3">
+    <section className="setting-group">
       <div>
         <h3 className="text-[15px] font-semibold text-[var(--text-primary)]">
           {title}
@@ -38,8 +38,8 @@ function SettingGroup({
           <p className="mt-0.5 text-[13px] text-[var(--text-muted)]">{desc}</p>
         )}
       </div>
-      {children}
-    </div>
+      <div className="min-w-0">{children}</div>
+    </section>
   );
 }
 
@@ -61,17 +61,13 @@ function ThemeSelector({
 }) {
   const { t } = useI18n();
   return (
-    <div className="inline-flex rounded-xl border border-[var(--border)] bg-[var(--chip-bg)] p-1">
+    <div className="theme-options">
       {THEME_OPTIONS.map(({ value, labelKey, icon: Icon }) => (
         <button
           key={value}
           onClick={() => setTheme(value)}
-          className={cn(
-            "inline-flex items-center gap-2 rounded-xl px-5 py-2.5 text-sm font-medium transition-all",
-            theme === value
-              ? "bg-[var(--accent)] text-white shadow-sm"
-              : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]",
-          )}
+          className="theme-option"
+          aria-pressed={theme === value}
         >
           <Icon className="h-4 w-4" />
           {t(labelKey)}
@@ -89,17 +85,13 @@ function LanguageSelector({
   setLanguage: (language: Language) => void;
 }) {
   return (
-    <div className="inline-flex rounded-xl border border-[var(--border)] bg-[var(--chip-bg)] p-1">
+    <div className="theme-options">
       {LANGUAGE_OPTIONS.map(({ value, label }) => (
         <button
           key={value}
           onClick={() => setLanguage(value)}
-          className={cn(
-            "inline-flex items-center gap-2 rounded-xl px-5 py-2.5 text-sm font-medium transition-all",
-            language === value
-              ? "bg-[var(--accent)] text-white shadow-sm"
-              : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]",
-          )}
+          className="theme-option"
+          aria-pressed={language === value}
         >
           {label}
         </button>
@@ -165,13 +157,12 @@ function GeneralTab({
         <LanguageSelector language={language} setLanguage={setLanguage} />
       </SettingGroup>
 
-      <div className="border-t border-[var(--border)]" />
 
       <SettingGroup
         title={t("settings.defaultStrategy.title")}
         desc={t("settings.defaultStrategy.desc")}
       >
-        <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-card)] divide-y divide-[var(--border)]/50">
+        <div className="space-y-4">
           <SettingRow label={t("settings.defaultIdentity")}>
             <select
               value={
@@ -212,7 +203,7 @@ function GeneralTab({
         </div>
       </SettingGroup>
 
-      <Button onClick={save} disabled={saving} className="w-full">
+      <Button onClick={save} disabled={saving}>
         <Save className="mr-2 h-4 w-4" />
         {saved
           ? `${t("common.saved")} ✓`
@@ -235,12 +226,10 @@ function SettingRow({
   children: React.ReactNode;
 }) {
   return (
-    <div className="flex items-center justify-between gap-4 px-4 py-3.5">
-      <label className="shrink-0 text-sm font-medium text-[var(--text-secondary)]">
-        {label}
-      </label>
-      <div className="min-w-0 max-w-[320px] flex-1">{children}</div>
-    </div>
+    <label className="block space-y-2 text-sm text-[var(--text-secondary)]">
+      <span>{label}</span>
+      <span className="block min-w-0 max-w-[400px]">{children}</span>
+    </label>
   );
 }
 
@@ -271,10 +260,14 @@ export default function SettingsPage({
   };
 
   return (
-    <div className="mx-auto max-w-4xl">
-      <h1 className="mb-6 text-xl font-semibold text-[var(--text-primary)]">
+    <div className="settings-workspace">
+      <div className="page-heading"><h1>
         {titles[tab] || t("settings.title.fallback")}
-      </h1>
+      </h1></div>
+      <nav className="settings-tabs" aria-label={t("nav.settings")}>
+        <Link to="/settings?tab=general" aria-current={tab === "general" ? "page" : undefined}>{t("nav.settings.general")}</Link>
+        <Link to="/settings?tab=mailbox" aria-current={tab === "mailbox" ? "page" : undefined}>{t("nav.settings.mailbox")}</Link>
+      </nav>
 
       {tab === "general" && <GeneralTab theme={theme} setTheme={setTheme} />}
       {isConfigTab && <Settings />}

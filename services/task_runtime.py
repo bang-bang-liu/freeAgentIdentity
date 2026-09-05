@@ -6,6 +6,7 @@ import threading
 import time
 
 from application.tasks import claim_next_runnable_task, execute_task, mark_incomplete_tasks_interrupted
+from application.account_locks import account_lock_registry
 
 
 @dataclass(slots=True)
@@ -55,6 +56,9 @@ class TaskRuntime:
                     if state.platform:
                         running_platform_counts[state.platform] = running_platform_counts.get(state.platform, 0) + 1
                     busy_account_keys.update(state.account_keys)
+                # 合并细粒度账号锁表（login_refresh 任务不在 claim 阶段申报账号键，
+                # 而是在执行器内部逐个申请和释放，避免整批锁住）
+                busy_account_keys.update(account_lock_registry.busy_keys())
             while available_slots > 0 and self._running:
                 task_info = claim_next_runnable_task(
                     running_platform_counts=running_platform_counts,

@@ -11,9 +11,7 @@ from core.db import AccountModel
 
 
 PLATFORM_TOKEN_KEY_PRIORITY: dict[str, list[str]] = {
-    "cursor": ["session_token", "sessionToken", "legacy_token"],
     "chatgpt": ["access_token", "accessToken", "legacy_token", "session_token", "sessionToken"],
-    "kiro": ["accessToken", "access_token", "legacy_token", "sessionToken", "session_token"],
     "trae": ["legacy_token", "access_token", "accessToken"],
     "blink": ["firebase_refresh_token", "legacy_token", "refresh_token", "access_token", "session_token"],
     "windsurf": ["session_token", "sessionToken", "legacy_token", "auth_token", "authToken"],
