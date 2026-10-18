@@ -116,6 +116,7 @@ function GeneralTab({
     useState<ConfigOptionsResponse | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState("");
 
   useEffect(() => {
     Promise.all([
@@ -129,6 +130,8 @@ function GeneralTab({
 
   const save = async () => {
     setSaving(true);
+    setSaved(false);
+    setSaveError("");
     try {
       await apiFetch("/config", {
         method: "PUT",
@@ -137,6 +140,8 @@ function GeneralTab({
       invalidateConfigCache();
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : String(error));
     } finally {
       setSaving(false);
     }
@@ -203,6 +208,7 @@ function GeneralTab({
         </div>
       </SettingGroup>
 
+      {saveError && <p className="inline-error" role="alert">{saveError}</p>}
       <Button onClick={save} disabled={saving}>
         <Save className="mr-2 h-4 w-4" />
         {saved

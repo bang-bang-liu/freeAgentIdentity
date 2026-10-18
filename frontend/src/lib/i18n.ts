@@ -10,6 +10,12 @@ export const LANGUAGE_STORAGE_KEY = "app-language";
 
 const ZH_MESSAGES = {
   "app.loading": "加载中...",
+  "common.skipToContent": "跳转到主要内容",
+  "taskDock.title": "近期任务",
+  "taskDock.connecting": "连接中",
+  "taskDock.empty": "暂无任务",
+  "taskDock.hide": "收起日志",
+  "taskDock.show": "查看日志",
 
   "common.refresh": "刷新",
   "common.clear": "清除",
@@ -384,12 +390,12 @@ const ZH_MESSAGES = {
   "providers.addCustom": "添加自定义{type}服务",
   "providers.type.mailbox": "邮箱",
   "providers.type.captcha": "验证",
-  "taskLog.status": "Status",
-  "taskLog.progress": "Progress",
-  "taskLog.events": "Events",
+  "taskLog.status": "状态",
+  "taskLog.progress": "进度",
+  "taskLog.events": "日志条数",
   "taskLog.logCount": "{count} 条日志",
   "taskLog.failureReason": "失败原因",
-  "taskLog.liveLog": "Live Log",
+  "taskLog.liveLog": "任务日志",
   "taskLog.liveTitle": "实时执行日志",
   "taskLog.copyLogs": "复制日志",
   "taskLog.cancelTask": "取消任务",
@@ -453,6 +459,12 @@ export type TranslationKey = keyof typeof ZH_MESSAGES;
 
 const EN_MESSAGES: Record<TranslationKey, string> = {
   "app.loading": "Loading...",
+  "common.skipToContent": "Skip to main content",
+  "taskDock.title": "Recent task",
+  "taskDock.connecting": "Connecting",
+  "taskDock.empty": "No tasks",
+  "taskDock.hide": "Hide logs",
+  "taskDock.show": "View logs",
 
   "common.refresh": "Refresh",
   "common.clear": "Clear",

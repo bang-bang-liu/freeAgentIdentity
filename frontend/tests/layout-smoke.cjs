@@ -1,7 +1,6 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 
 const baseURL = process.env.UI_BASE_URL || 'http://127.0.0.1:5173';
 const output = path.resolve(__dirname, '../../.runtime/taste-ui-qa');
@@ -25,7 +24,8 @@ const settings = catalog.slice(0, 2).map((p, i) => ({
 const platform = { name: 'chatgpt', display_name: 'ChatGPT', supported_identity_modes: ['mailbox'], supported_executors: ['protocol', 'headless', 'headed'] };
 
 async function mockAPI(page) {
-  const state = { failure: false, empty: false, taskStatus: 'running', writes: [] };
+  const state = { failure: false, empty: false, healthCases: false, statsFailure: false, statsEmpty: false, taskType: 'register', taskSuccess: 1, taskFailed: 1, taskStatus: 'running', writes: [] };
+  const taskResponse = () => ({ type: state.taskType, status: state.taskStatus, success: state.taskSuccess, error_count: state.taskFailed, cancellable: state.taskStatus === 'running', progress_detail: { total: 5, current: state.taskSuccess + state.taskFailed, label: `${state.taskSuccess + state.taskFailed} / 5` }, registration_stats: { success: state.taskSuccess, failed: state.taskFailed, completed: state.taskSuccess + state.taskFailed, success_rate: state.taskSuccess + state.taskFailed ? Math.round(state.taskSuccess / (state.taskSuccess + state.taskFailed) * 1000) / 10 : null, failure_stages: state.taskFailed ? [{ stage: 'verification', count: state.taskFailed }] : [], setup_failures: 0, setup_failure_stages: [] } });
   await page.route('**/api/**', async route => {
     const req = route.request();
     const url = new URL(req.url());
@@ -39,18 +39,30 @@ async function mockAPI(page) {
     if (endpoint === '/config/options') return send({ mailbox_providers: catalog, mailbox_settings: settings, captcha_providers: [], captcha_policy: {}, executor_options: [{ value: 'protocol', label: 'Protocol' }, { value: 'headless', label: 'Headless' }], identity_mode_options: [{ value: 'mailbox', label: 'Mailbox' }] });
     if (endpoint === '/config') return send({ default_identity_provider: 'mailbox', default_executor: 'headless' });
     if (endpoint === '/accounts/stats') return send({ total: 43, by_platform: { chatgpt: 43 }, by_plan_state: { free: 34, subscribed: 9 }, by_lifecycle_status: { registered: 43 }, by_validity_status: { valid: 36, invalid: 7 } });
+    if (endpoint === '/tasks/register/stats') {
+      if (state.statsFailure) return send({ error: 'Fixture statistics unavailable' }, 503);
+      return send({ success: state.statsEmpty ? 0 : 137, failed: state.statsEmpty ? 0 : 19, completed: state.statsEmpty ? 0 : 156, success_rate: state.statsEmpty ? null : 87.8, total_tasks: state.statsEmpty ? 0 : 24, active_tasks: 0, cancelled_tasks: state.statsEmpty ? 0 : 2, interrupted_tasks: 0, setup_failures: 0, setup_failure_stages: [], failure_stages: state.statsEmpty ? [] : [{ stage: 'verification', count: 11 }, { stage: 'authorization', count: 4 }, { stage: 'credentials', count: 3 }, { stage: 'unknown', count: 1 }], updated_at: '2026-10-18T05:40:32Z' });
+    }
     if (endpoint === '/accounts') {
       if (state.failure) return send({ error: 'Test connection failure' }, 503);
-      let rows = state.empty ? [] : accounts.filter(a => a.email.includes(url.searchParams.get('email') || ''));
-      if (url.searchParams.get('status')) rows = rows.filter(a => a.display_status === url.searchParams.get('status'));
+      const source = state.healthCases ? [
+        { ...accounts[0], email: 'alpha@example.com', display_status: 'registered', validity_status: 'unknown' },
+        { ...accounts[1], email: 'beta@example.com', validity_status: 'invalid', display_summary: { status: { validity: 'valid' } } },
+        { ...accounts[2], email: 'gamma@example.com', validity_status: 'valid', display_summary: { status: { validity: 'invalid' } } },
+      ] : accounts;
+      let rows = state.empty ? [] : source.filter(a => a.email.includes(url.searchParams.get('email') || ''));
+      if (url.searchParams.get('status')) rows = rows.filter(a => [a.display_status, a.lifecycle_status, a.plan_state, a.validity_status].includes(url.searchParams.get('status')));
       const size = Number(url.searchParams.get('page_size') || 20);
       const start = (Number(url.searchParams.get('page') || 1) - 1) * size;
       return send({ items: rows.slice(start, start + size), total: rows.length });
     }
     if (endpoint === '/actions/chatgpt') return send({ actions: [] });
-    if (endpoint === '/tasks/register') return send({ task_id: 'layout-test' });
-    if (endpoint === '/tasks/layout-test') return send({ status: state.taskStatus, cancellable: true, progress_detail: { total: 5, current: 2, label: '2 / 5' } });
-    if (endpoint.endsWith('/cancel')) { state.taskStatus = 'cancelled'; return send({ status: 'cancelled' }); }
+    if (/^\/accounts\/\d+$/.test(endpoint)) return send({ ok: true });
+    if (endpoint.startsWith('/accounts/export/')) return send({ items: accounts });
+    if (endpoint.startsWith('/accounts/check-') || endpoint === '/accounts/login-refresh') { state.taskType = 'account_check_all'; return send({ task_id: 'layout-test' }); }
+    if (endpoint === '/tasks/register') { state.taskType = 'register'; state.taskStatus = 'running'; return send({ task_id: 'layout-test' }); }
+    if (endpoint === '/tasks/layout-test') return send(taskResponse());
+    if (endpoint.endsWith('/cancel')) { state.taskStatus = 'cancelled'; return send(taskResponse()); }
     if (endpoint.endsWith('/logs/stream')) return route.fulfill({ contentType: 'text/event-stream', body: 'data: {"id":1,"line":"[18:30:42] Worker 1: mailbox ready","detail":{"subtask_id":"worker_1","subtask_label":"Worker 1"}}\n\ndata: {"id":2,"line":"[18:30:45] Worker 1: account saved","detail":{"subtask_id":"worker_1","subtask_label":"Worker 1"}}\n\n' });
     if (endpoint.endsWith('/events') || endpoint.endsWith('/otp-requests')) return send({ items: [] });
     if (endpoint.endsWith('/mailboxes')) return send({ items: [{ email: 'mailbox.test@example.com', key: 'test-mailbox', used: false, active: false }] });
@@ -74,6 +86,10 @@ async function noOverflow(page, label) {
   assert.deepEqual(clipped, [], `${label}: clipped controls`);
 }
 
+module.exports = { mockAPI };
+
+if (require.main === module) {
+const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 (async () => {
   fs.mkdirSync(output, { recursive: true });
   const browser = await chromium.launch({ headless: true, channel: process.env.UI_BROWSER_CHANNEL || 'msedge' });
@@ -89,7 +105,22 @@ async function noOverflow(page, label) {
         for (const [name, route] of [['dashboard', '/'], ['accounts', '/accounts/chatgpt'], ['mailbox', '/settings?tab=mailbox'], ['settings', '/settings?tab=general']]) {
           await page.goto(baseURL + route);
           await page.locator('h1').waitFor();
-          if (name === 'accounts') await page.getByText('test.account.01@example.com', { exact: true }).waitFor();
+          if (name === 'accounts') {
+            await page.getByText('test.account.01@example.com', { exact: true }).waitFor();
+            assert.equal(await page.locator('.account-tile').count(), 20);
+            assert.equal(await page.locator('.account-tile').first().locator('.account-avatar').getAttribute('data-health'), 'invalid');
+            assert.equal(await page.locator('.account-tile').nth(1).locator('.account-avatar').getAttribute('data-health'), 'valid');
+            const images = await page.locator('.account-avatar').evaluateAll(elements => elements.map(el => { const r = el.getBoundingClientRect(); return { width: r.width, height: r.height }; }));
+            assert.ok(images.every(image => image.width === image.height && image.width === 54), 'Avatars must remain circular');
+            await page.screenshot({ path: path.join(output, `avatars-${width}-${theme}.png`), fullPage: true });
+            await page.getByRole('checkbox', { name: '选择 test.account.02@example.com', exact: true }).check();
+            await page.getByRole('button', { name: '表格视图', exact: true }).click();
+            await page.locator('tbody .account-avatar').first().waitFor();
+            assert.equal(await page.getByRole('checkbox', { name: '选择 test.account.02@example.com', exact: true }).isChecked(), true);
+            await noOverflow(page, `table-${width}-${theme}`);
+            await page.screenshot({ path: path.join(output, `table-${width}-${theme}.png`), fullPage: true });
+            await page.getByRole('button', { name: '头像视图', exact: true }).click();
+          }
           if (name === 'mailbox') await page.getByText('Outlook', { exact: true }).waitFor();
           await noOverflow(page, `${name}-${width}-${theme}`);
           await page.screenshot({ path: path.join(output, `${name}-${width}-${theme}.png`), fullPage: true });
@@ -119,6 +150,7 @@ async function noOverflow(page, label) {
     }
     const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
     const page = await context.newPage();
+    await page.addInitScript(() => localStorage.setItem('accounts-view', 'table'));
     page.on('pageerror', e => errors.push(e.message));
     const state = await mockAPI(page);
     await page.goto(baseURL + '/accounts/chatgpt');
@@ -135,13 +167,37 @@ async function noOverflow(page, label) {
     await page.getByRole('dialog').waitFor();
     await page.getByRole('dialog').getByRole('button', { name: '取消', exact: true }).click();
     assert.ok(!new URL(page.url()).searchParams.has('register'));
+    await page.getByRole('button', { name: '清除', exact: true }).click();
+    await page.getByRole('button', { name: '有效 36', exact: true }).click();
+    await page.getByRole('button', { name: 'test.account.01@example.com', exact: true }).waitFor({ state: 'hidden' });
+    assert.equal(await page.getByRole('combobox', { name: '状态', exact: true }).inputValue(), 'valid');
+    assert.equal(await page.getByRole('button', { name: '全部账号 43', exact: true }).count(), 1);
+    await page.getByRole('button', { name: 'test.account.02@example.com', exact: true }).click();
+    await page.getByRole('dialog', { name: '账号详情', exact: true }).waitFor();
+    await page.keyboard.press('Escape');
+    await page.getByRole('dialog').waitFor({ state: 'hidden' });
+    assert.equal(await page.evaluate(() => document.activeElement.textContent), 'test.account.02@example.com');
+    await page.getByRole('button', { name: '紧凑行高', exact: true }).click();
+    assert.equal(await page.locator('.accounts-panel').getAttribute('data-density'), 'compact');
+    await page.getByRole('button', { name: '全部账号 43', exact: true }).click();
+    await page.getByRole('button', { name: '自动注册', exact: true }).click();
+    await page.getByRole('dialog').getByRole('button', { name: '开始自动注册', exact: true }).click();
+    await page.getByRole('dialog').getByText('2 / 5', { exact: true }).waitFor();
+    await page.getByRole('dialog').getByRole('button', { name: '关闭', exact: true }).click();
+    const dock = page.getByRole('region', { name: '近期任务', exact: true });
+    await dock.getByText('执行中', { exact: true }).first().waitFor();
+    await dock.getByRole('button', { name: '查看日志', exact: true }).click();
+    await dock.getByText('[18:30:42] Worker 1: mailbox ready', { exact: true }).waitFor();
+    await dock.getByRole('button', { name: '取消任务', exact: true }).click();
+    await dock.getByRole('button', { name: '收起日志', exact: true }).click();
+    await dock.getByText('已取消', { exact: true }).first().waitFor();
     state.empty = true;
     await page.reload();
     await page.getByText('test.account.02@example.com', { exact: true }).waitFor({ state: 'hidden' });
     await page.screenshot({ path: path.join(output, 'accounts-empty.png') });
     state.failure = true;
     await page.reload();
-    await page.getByRole('alert').waitFor();
+    await page.getByRole('alert').first().waitFor();
     await page.screenshot({ path: path.join(output, 'accounts-error.png') });
     await page.setViewportSize({ width: 390, height: 844 });
     await page.getByRole('button', { name: '展开侧栏', exact: true }).first().click();
@@ -157,7 +213,28 @@ async function noOverflow(page, label) {
     await page.getByText('mailbox.test@example.com', { exact: true }).waitFor();
     await page.screenshot({ path: path.join(output, 'mailbox-manager-mobile.png') });
     await context.close();
+    const healthContext = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+    const healthPage = await healthContext.newPage();
+    healthPage.on('pageerror', error => errors.push(error.message));
+    const healthState = await mockAPI(healthPage);
+    healthState.healthCases = true;
+    await healthPage.goto(baseURL + '/accounts/chatgpt');
+    await healthPage.getByRole('button', { name: 'alpha@example.com', exact: true }).waitFor();
+    const healthValues = await healthPage.locator('.account-tile .account-avatar').evaluateAll(elements => elements.map(el => el.dataset.health));
+    assert.deepEqual(healthValues, ['unknown', 'valid', 'invalid']);
+    assert.deepEqual(await healthPage.locator('.account-avatar-initial').allTextContents(), ['A', 'B', 'G']);
+    assert.equal(await healthPage.locator('.account-tile[data-health=unknown]').count(), 1, 'Registered must not imply available');
+    await healthPage.getByRole('button', { name: 'beta@example.com', exact: true }).click();
+    await healthPage.getByRole('dialog', { name: '账号详情', exact: true }).waitFor();
+    await healthPage.keyboard.press('Escape');
+    await healthPage.getByRole('dialog').waitFor({ state: 'hidden' });
+    // Radix restores focus in a scheduled cleanup after the dialog unmounts.
+    await healthPage.waitForFunction(() => document.activeElement.getAttribute('aria-label') === 'beta@example.com', null, { timeout: 2000 });
+    assert.equal(await healthPage.evaluate(() => document.activeElement.getAttribute('aria-label')), 'beta@example.com');
+    assert.deepEqual(healthState.writes, [], 'Avatar inspection must not mutate accounts');
+    await healthContext.close();
     assert.deepEqual(errors, []);
     console.log('PASS search, selection, sidebar, registration shortcut, empty/error, mobile navigation; no page errors');
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });
+}

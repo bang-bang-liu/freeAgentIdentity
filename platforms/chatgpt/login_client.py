@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import json
 import time
+import weakref
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -128,29 +129,60 @@ class EmailOtpResolver:
             f"manual={'yes' if self._manual_available else 'no'}"
         )
 
+    def close(self) -> None:
+        """Release an automatically rebuilt mailbox connection, if any."""
+        close = getattr(self.rebuilt, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+    def _check_cancelled(self) -> None:
+        if self.cancel_check and self.cancel_check():
+            raise ChatGPTLoginError(LoginErrorCode.CANCELLED, "任务已取消")
+
     def baseline(self) -> set:
         """取码前的邮件基线。失败返回空集合，不影响后续流程。"""
         if not self._auto_available:
             return set()
+        self._check_cancelled()
         try:
             ids = self.rebuilt.mailbox.get_current_ids(self.rebuilt.account)
+            self._check_cancelled()
             return set(ids or set())
+        except ChatGPTLoginError:
+            raise
         except Exception:
+            self._check_cancelled()
             return set()
 
-    def fetch(self, *, purpose: str = "email_login") -> str:
+    def fetch(
+        self,
+        *,
+        purpose: str = "email_login",
+        before_ids: set | None = None,
+        issued_after: float | None = None,
+    ) -> str:
         """返回验证码。取不到抛 ``ChatGPTLoginError``。
 
         ``purpose`` 只用于手动请求的展示，取 ``email_login`` /
         ``mfa_login`` / ``security_reauth``。
         """
-        before_ids = self.baseline()
+        # The caller may establish the baseline before triggering the OTP
+        # delivery request.  This is important for existing-account login:
+        # authorize/continue can deliver the message before control returns to
+        # this method.  Keeping the old default preserves the standalone
+        # resolver API used by registration and tests.
+        if before_ids is None:
+            before_ids = self.baseline()
         if self._auto_available:
-            code = self._fetch_auto(before_ids)
+            code = self._fetch_auto(before_ids, issued_after=issued_after)
             if code:
                 self.last_source = "auto"
                 self.log("邮箱验证码已自动获取")
                 return code
+            self._check_cancelled()
             self.log("自动取码未成功，转手动输入")
 
         if self._manual_available:
@@ -159,6 +191,7 @@ class EmailOtpResolver:
                 self.last_source = "manual"
                 return code
 
+        self._check_cancelled()
         raise ChatGPTLoginError(
             LoginErrorCode.MANUAL_OTP_TIMEOUT
             if self._manual_available
@@ -166,17 +199,34 @@ class EmailOtpResolver:
             "未能获取邮箱验证码",
         )
 
-    def _fetch_auto(self, before_ids: set) -> str:
+    def _fetch_auto(self, before_ids: set, *, issued_after: float | None = None) -> str:
         try:
-            code = self.rebuilt.mailbox.wait_for_code(
-                self.rebuilt.account,
-                timeout=self.timeout,
-                before_ids=before_ids,
-                cancel_check=self.cancel_check,
-            )
+            self._check_cancelled()
+            kwargs = {
+                "timeout": self.timeout,
+                "before_ids": before_ids,
+                "cancel_check": self.cancel_check,
+            }
+            if issued_after is not None:
+                kwargs["issued_after"] = issued_after
+            try:
+                code = self.rebuilt.mailbox.wait_for_code(self.rebuilt.account, **kwargs)
+            except TypeError as exc:
+                # Third-party/test mailbox adapters may still implement the
+                # older wait_for_code signature.  Retry without the optional
+                # timestamp only when that is the incompatibility.
+                if "issued_after" not in kwargs or "issued_after" not in str(exc):
+                    raise
+                kwargs.pop("issued_after", None)
+                code = self.rebuilt.mailbox.wait_for_code(self.rebuilt.account, **kwargs)
         except Exception as exc:
+            try:
+                self._check_cancelled()
+            except ChatGPTLoginError as cancelled:
+                raise cancelled from exc
             self.log(f"自动取码失败: {type(exc).__name__}")
             return ""
+        self._check_cancelled()
         return _text(code)
 
     def _fetch_manual(self, *, purpose: str) -> str:
@@ -191,13 +241,18 @@ class EmailOtpResolver:
         deadline = time.monotonic() + self.timeout
         try:
             while time.monotonic() < deadline:
-                if self.cancel_check and self.cancel_check():
-                    raise ChatGPTLoginError(LoginErrorCode.CANCELLED, "任务已取消")
+                self._check_cancelled()
                 code = handle.consume_code(request_id)
                 if code:
                     self.log("已收到手动输入的邮箱验证码")
                     return _text(code)
-                time.sleep(0.5)
+                sleep_deadline = min(deadline, time.monotonic() + 0.5)
+                while time.monotonic() < sleep_deadline:
+                    self._check_cancelled()
+                    remaining = sleep_deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(0.1, remaining))
         finally:
             try:
                 handle.close_request(request_id)
@@ -283,6 +338,7 @@ def login_chatgpt_web(
     manual_totp_handle: Any = None,
     log: Callable[[str], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    register_cancel_callback: Callable[[Callable[[], None]], None] | None = None,
     deadline_seconds: int = DEFAULT_ACCOUNT_DEADLINE,
 ) -> ChatGPTLoginResult:
     """重新登录 ChatGPT web，返回新的凭据快照。
@@ -319,7 +375,41 @@ def login_chatgpt_web(
         if time.monotonic() > deadline:
             raise ChatGPTLoginError(LoginErrorCode.NETWORK_TIMEOUT, "单账号认证超时")
 
+    _check_budget()
     auth = AuthFlow(Config(proxy=proxy or None))
+    # A running HTTP request may otherwise keep the task worker alive for the
+    # request timeout after the cancel endpoint has returned.  Register a
+    # weak-reference callback so the task can close the auth session promptly
+    # without making the cancellation registry retain the session forever.
+    auth_cancel_callback = None
+    resolver_close = getattr(otp_resolver, "close", None)
+    if callable(register_cancel_callback):
+        try:
+            auth_ref = weakref.ref(auth)
+        except TypeError:
+            # Small test/third-party AuthFlow adapters may use slots without
+            # weak-reference support.  The task callback registry is cleared
+            # at task completion, so a short-lived strong fallback is safe.
+            auth_ref = lambda: auth
+
+        def _close_auth_on_cancel() -> None:
+            if callable(resolver_close):
+                try:
+                    resolver_close()
+                except Exception:
+                    pass
+            current = auth_ref()
+            if current is not None:
+                try:
+                    current.close()
+                except Exception:
+                    pass
+
+        auth_cancel_callback = _close_auth_on_cancel
+        try:
+            register_cancel_callback(auth_cancel_callback)
+        except Exception:
+            auth_cancel_callback = None
     auth.result.email = email
     if password:
         auth.result.password = password
@@ -331,11 +421,23 @@ def login_chatgpt_web(
         device_id = auth.auth_oauth_init(auth_url)
         sentinel = auth.get_sentinel_token(device_id)
     except Exception as exc:
+        if cancel_check and cancel_check():
+            raise ChatGPTLoginError(LoginErrorCode.CANCELLED, "任务已取消") from exc
         raise ChatGPTLoginError(
             LoginErrorCode.NETWORK_TIMEOUT, f"登录引导失败: {type(exc).__name__}"
         ) from exc
 
     _check_budget()
+    otp_before_ids: set = set()
+    otp_issued_after: float | None = None
+    if otp_resolver is not None:
+        # Existing-account authorize/continue can dispatch the first OTP
+        # before returning.  Establish the baseline immediately beforehand so
+        # that message is eligible even when the mailbox API is polled later.
+        _check_budget()
+        otp_before_ids = otp_resolver.baseline()
+        otp_issued_after = time.time()
+        _check_budget()
     try:
         step = auth.authorize_continue(
             email=email,
@@ -345,6 +447,8 @@ def login_chatgpt_web(
             trace_step="authorize_continue_login_refresh",
         )
     except Exception as exc:
+        if cancel_check and cancel_check():
+            raise ChatGPTLoginError(LoginErrorCode.CANCELLED, "任务已取消") from exc
         raise ChatGPTLoginError(
             LoginErrorCode.NETWORK_TIMEOUT, f"进入登录流程失败: {type(exc).__name__}"
         ) from exc
@@ -364,6 +468,8 @@ def login_chatgpt_web(
         try:
             step = auth.login_password_verify(password)
         except Exception as exc:
+            if cancel_check and cancel_check():
+                raise ChatGPTLoginError(LoginErrorCode.CANCELLED, "任务已取消") from exc
             low = str(exc).lower()
             if "invalid_username_or_password" in low or "401" in low:
                 raise ChatGPTLoginError(
@@ -386,16 +492,24 @@ def login_chatgpt_web(
             if not auth.kickoff_otp_delivery("existing_passwordless_login"):
                 auth.send_otp("https://auth.openai.com/email-verification")
         except Exception as exc:
+            if cancel_check and cancel_check():
+                raise ChatGPTLoginError(LoginErrorCode.CANCELLED, "任务已取消") from exc
             raise ChatGPTLoginError(
                 LoginErrorCode.NETWORK_TIMEOUT, f"发送邮箱验证码失败: {type(exc).__name__}"
             ) from exc
 
-        code = otp_resolver.fetch(purpose="email_login")
+        code = otp_resolver.fetch(
+            purpose="email_login",
+            before_ids=otp_before_ids,
+            issued_after=otp_issued_after,
+        )
         _check_budget()
         emit("提交邮箱验证码")
         try:
             step = auth.verify_otp(code)
         except Exception as exc:
+            if cancel_check and cancel_check():
+                raise ChatGPTLoginError(LoginErrorCode.CANCELLED, "任务已取消") from exc
             raise ChatGPTLoginError(
                 LoginErrorCode.EMAIL_OTP_INVALID, f"邮箱验证码校验失败: {type(exc).__name__}"
             ) from exc
@@ -419,8 +533,12 @@ def login_chatgpt_web(
         try:
             issue_mfa_challenge(auth, factor_id)
         except MfaLoginError as exc:
+            if cancel_check and cancel_check():
+                raise ChatGPTLoginError(LoginErrorCode.CANCELLED, "任务已取消") from exc
             raise ChatGPTLoginError(LoginErrorCode.MFA_INVALID, exc.message) from exc
         except Exception as exc:
+            if cancel_check and cancel_check():
+                raise ChatGPTLoginError(LoginErrorCode.CANCELLED, "任务已取消") from exc
             raise ChatGPTLoginError(
                 LoginErrorCode.NETWORK_TIMEOUT, f"MFA challenge 失败: {type(exc).__name__}"
             ) from exc
@@ -456,6 +574,8 @@ def login_chatgpt_web(
             try:
                 verify_resp = verify_mfa_totp(auth, factor_id, manual_code)
             except Exception as exc:
+                if cancel_check and cancel_check():
+                    raise ChatGPTLoginError(LoginErrorCode.CANCELLED, "任务已取消") from exc
                 raise ChatGPTLoginError(
                     LoginErrorCode.MFA_INVALID, "手动输入的动态码验证失败"
                 ) from exc
@@ -476,6 +596,8 @@ def login_chatgpt_web(
     try:
         _finish_session(auth, continue_url)
     except Exception as exc:
+        if cancel_check and cancel_check():
+            raise ChatGPTLoginError(LoginErrorCode.CANCELLED, "任务已取消") from exc
         raise ChatGPTLoginError(
             LoginErrorCode.TOKEN_FETCH_TIMEOUT, f"session 获取失败: {type(exc).__name__}"
         ) from exc
@@ -504,4 +626,13 @@ def login_chatgpt_web(
         f"sessionToken={'yes' if built.session_token else 'no'}, "
         f"expires_at={built.access_token_expires_at or '未知'}"
     )
+    try:
+        auth.close()
+    except Exception:
+        pass
+    if callable(resolver_close):
+        try:
+            resolver_close()
+        except Exception:
+            pass
     return built

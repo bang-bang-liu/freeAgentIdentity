@@ -1663,7 +1663,9 @@ class ChatGPTProtocolRegister:
         registration_email_codes: set[str] = set()
         registration_email_identities: set[str] = set()
         try:
+            self.log("[registration:authorization] 连接与认证")
             self._initialize_signup(email)
+            self.log("[registration:verification] 邮箱验证")
             self.log("等待 Outlook 验证码...")
             code = str(self.otp_callback() or "").strip()
             if not code:
@@ -1684,6 +1686,7 @@ class ChatGPTProtocolRegister:
                     allow_redirects=True,
                 )
             if "password" in continue_url.lower():
+                self.log("[registration:authorization] 设置注册密码")
                 password_result = self._register_password(email, password)
                 self.log("ChatGPT 登录密码设置成功")
                 password_continue_url = str(password_result.get("continue_url") or "").strip()
@@ -1696,9 +1699,11 @@ class ChatGPTProtocolRegister:
                         allow_redirects=True,
                     )
             name, birthdate = _random_profile()
+            self.log("[registration:profile] 创建账号资料")
             created = self._create_account(name, birthdate)
             self.log("ChatGPT 账号资料创建成功")
             callback_url = str(created.get("continue_url") or "").strip()
+            self.log("[registration:credentials] 获取注册凭据")
             if callback_url:
                 self.session.get(
                     urljoin(OPENAI_AUTH, callback_url),
@@ -1717,6 +1722,7 @@ class ChatGPTProtocolRegister:
 
             if self.setup_security:
                 self.log("注册流程完成，开始设置 TOTP+密码")
+                self.log("[registration:security] 安全设置")
                 security_setup_error = ""
                 try:
                     security_info = self._setup_password_and_totp_protocol(
@@ -1751,6 +1757,7 @@ class ChatGPTProtocolRegister:
                     "totp_secret": "",
                     "otpauth": "",
                 }
+            self.log("[registration:credentials] 获取最终凭据")
             try:
                 result = self._session_result(email, password)
             except Exception as exc:

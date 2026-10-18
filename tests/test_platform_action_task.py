@@ -21,8 +21,8 @@ class _FakeLogger:
     def log(self, message, **kwargs):
         self.events.append(("log", message, kwargs))
 
-    def record_error(self, error):
-        self.events.append(("error", error, {}))
+    def record_error(self, error, **kwargs):
+        self.events.append(("error", error, kwargs))
 
     def record_success(self):
         self.events.append(("success", "", {}))

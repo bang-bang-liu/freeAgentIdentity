@@ -11,14 +11,26 @@ import pytest
 from sqlmodel import Session, select
 
 from application.login_refresh import (
+    _execute_login_refresh_task,
     create_login_refresh_task,
     preview_login_refresh,
     _persist_credentials,
 )
-from application.login_refresh_types import LoginRefreshPreview
-from application.tasks import TASK_TYPE_LOGIN_REFRESH, _task_account_keys
+from application.login_refresh_types import (
+    LoginRefreshAccountResult,
+    LoginRefreshPreview,
+)
+from application.tasks import (
+    TASK_STATUS_CANCELLED,
+    TASK_TYPE_LOGIN_REFRESH,
+    _task_account_keys,
+)
 from core.db import AccountModel, engine
-from platforms.chatgpt.login_types import ChatGPTLoginResult
+from platforms.chatgpt.login_types import (
+    ChatGPTLoginError,
+    ChatGPTLoginResult,
+    LoginErrorCode,
+)
 
 
 def test_task_account_keys_extracts_all_account_ids():
@@ -82,6 +94,119 @@ def test_create_task_deduplicates_account_ids():
             call_args = mock_create_task.call_args
             payload = call_args.kwargs["payload"]
             assert payload["account_ids"] == [1, 2]
+
+
+def test_cancelled_login_error_finishes_task_as_cancelled(monkeypatch):
+    class FakeLogger:
+        task_id = "task-login-refresh-cancel"
+
+        def __init__(self):
+            self.finished = []
+            self.result_data = None
+
+        def mark_running(self):
+            return None
+
+        def is_cancel_requested(self):
+            return False
+
+        def log(self, _message, **_kwargs):
+            return None
+
+        def set_progress(self, *_args):
+            return None
+
+        def set_result_data(self, data):
+            self.result_data = data
+
+        def finish(self, status, *, error=""):
+            self.finished.append((status, error))
+
+    def cancelled_refresh(**_kwargs):
+        raise ChatGPTLoginError(LoginErrorCode.CANCELLED, "任务已取消")
+
+    monkeypatch.setattr(
+        "application.login_refresh._refresh_single_account",
+        cancelled_refresh,
+    )
+    logger = FakeLogger()
+
+    _execute_login_refresh_task(
+        {
+            "platform": "chatgpt",
+            "account_ids": [101],
+            "concurrency": 1,
+        },
+        logger,
+    )
+
+    assert logger.finished[-1][0] == TASK_STATUS_CANCELLED
+    assert logger.result_data["failed"] == 0
+    assert logger.result_data["succeeded"] == 0
+
+
+def test_completed_account_is_kept_when_cancel_arrives_before_result_is_consumed(
+    monkeypatch,
+):
+    class FakeLogger:
+        task_id = "task-login-refresh-late-cancel"
+
+        def __init__(self):
+            self.cancelled = False
+            self.finished = []
+            self.result_data = None
+
+        def mark_running(self):
+            return None
+
+        def is_cancel_requested(self):
+            return self.cancelled
+
+        def log(self, _message, **_kwargs):
+            return None
+
+        def set_progress(self, *_args):
+            return None
+
+        def set_result_data(self, data):
+            self.result_data = data
+
+        def finish(self, status, *, error=""):
+            self.finished.append((status, error))
+
+    logger = FakeLogger()
+
+    def successful_refresh(**kwargs):
+        logger.cancelled = True
+        return LoginRefreshAccountResult(
+            account_id=kwargs["account_id"],
+            email="u***@example.com",
+            status="succeeded",
+        )
+
+    monkeypatch.setattr(
+        "application.login_refresh._refresh_single_account",
+        successful_refresh,
+    )
+
+    _execute_login_refresh_task(
+        {
+            "platform": "chatgpt",
+            "account_ids": [101, 102],
+            "concurrency": 1,
+        },
+        logger,
+    )
+
+    assert logger.finished[-1][0] == TASK_STATUS_CANCELLED
+    assert logger.result_data["succeeded"] == 1
+    assert logger.result_data["items"] == [
+        {
+            "account_id": 101,
+            "status": "succeeded",
+            "security_setup_status": "",
+        }
+    ]
 
 
 def test_preview_identifies_password_totp_mode(tmp_path):

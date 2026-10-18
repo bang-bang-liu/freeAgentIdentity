@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
 import { createPortal } from 'react-dom'
 import { useSearchParams } from 'react-router-dom'
+import * as Dialog from '@radix-ui/react-dialog'
 import { Search } from 'lucide-react'
 import { getConfigOptions, getPlatforms } from '@/lib/app-data'
 import type { ConfigOptionsResponse } from '@/lib/config-options'
@@ -10,11 +11,14 @@ import { formatDateTime, translateAccountStatus } from '@/lib/i18n'
 import { useI18n } from '@/lib/i18n-context'
 import { buildExecutorOptions, buildRegistrationOptions } from '@/lib/registration'
 import { TaskLogPanel } from '@/components/tasks/TaskLogPanel'
+import { TaskDock } from '@/components/tasks/TaskDock'
+import { RegistrationStatsDialog } from '@/components/registration/RegistrationStatsDialog'
+import { AccountAvatar, accountHealth } from '@/components/accounts/AccountAvatar'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { getTaskStatusText, TASK_STATUS_VARIANTS } from '@/lib/tasks'
-import { RefreshCw, Copy, Download, Upload, Plus, X, Mail, Trash2, UserCheck, FlaskConical, Crown, Clock, CircleX, Sparkles, BadgeCheck, Gift, Circle, ChevronLeft, ChevronRight, LogIn } from 'lucide-react'
+import { RefreshCw, Copy, Download, Upload, Plus, X, Mail, Trash2, UserCheck, FlaskConical, Crown, Clock, CircleX, Sparkles, BadgeCheck, Gift, Circle, ChevronLeft, ChevronRight, LogIn, Users, Inbox, Rows3, List, Eye, KeyRound, MoreHorizontal, LayoutGrid, Table2 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 
 const STATUS_VARIANT: Record<string, any> = {
@@ -100,11 +104,11 @@ function getStatusIcon(status: string): LucideIcon {
 }
 
 function getStatusIconColor(variant: string): string {
-  if (variant === 'success') return 'text-emerald-500'
-  if (variant === 'warning') return 'text-amber-500'
-  if (variant === 'danger') return 'text-red-500'
-  if (variant === 'default') return 'text-blue-500'
-  return 'text-gray-400'
+  if (variant === 'success') return 'text-[var(--status-success)]'
+  if (variant === 'warning') return 'text-[var(--status-warning)]'
+  if (variant === 'danger') return 'text-[var(--status-danger)]'
+  if (variant === 'default') return 'text-[var(--text-accent)]'
+  return 'text-[var(--text-muted)]'
 }
 
 function getPlanChip(acc: any): { label: string; tone: 'sky' | 'violet'; title: string } | null {
@@ -176,12 +180,12 @@ function isTrialAccount(acc: any): boolean {
 }
 
 const STATUS_CHIP_TONES: Record<string, string> = {
-  emerald: 'bg-emerald-500/10 text-emerald-500 ring-emerald-500/20',
-  violet: 'bg-violet-500/10 text-violet-500 ring-violet-500/20',
-  sky: 'bg-sky-500/10 text-sky-500 ring-sky-500/20',
-  amber: 'bg-amber-500/10 text-amber-500 ring-amber-500/20',
-  red: 'bg-red-500/10 text-red-500 ring-red-500/20',
-  gray: 'bg-[var(--text-primary)]/5 text-[var(--text-secondary)] ring-[var(--border)]',
+  emerald: 'bg-[var(--success-soft)] text-[var(--status-success)]',
+  violet: 'bg-[var(--accent-soft)] text-[var(--text-accent)]',
+  sky: 'bg-[var(--bg-pane)] text-[var(--text-secondary)]',
+  amber: 'bg-[var(--warning-soft)] text-[var(--status-warning)]',
+  red: 'bg-[var(--danger-soft)] text-[var(--status-danger)]',
+  gray: 'bg-[var(--bg-pane)] text-[var(--text-secondary)]',
 }
 
 function StatusIconChip({ label, tone, title }: { label: string; tone: string; title?: string }) {
@@ -189,7 +193,7 @@ function StatusIconChip({ label, tone, title }: { label: string; tone: string; t
     <span
       aria-label={title || label}
       title={title || label}
-      className={`inline-flex items-center gap-1 whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${STATUS_CHIP_TONES[tone] || STATUS_CHIP_TONES.gray}`}
+      className={`inline-flex items-center gap-1 whitespace-nowrap rounded px-1.5 py-0.5 text-[11px] font-medium ${STATUS_CHIP_TONES[tone] || STATUS_CHIP_TONES.gray}`}
     >
       <span>{label}</span>
     </span>
@@ -380,10 +384,12 @@ function RegisterModal({
   platformMeta,
   onClose,
   onDone,
+  onTaskCreated,
 }: {
   platformMeta: any
   onClose: () => void
   onDone: () => void
+  onTaskCreated: (taskId: string) => void
 }) {
   const { t, language } = useI18n()
   const [configOptions, setConfigOptions] = useState<ConfigOptionsResponse>({
@@ -568,6 +574,7 @@ function RegisterModal({
         }),
       })
       setTaskId(res.task_id)
+      onTaskCreated(res.task_id)
     } catch (error: any) {
       setStartError(error?.message || String(error))
     } finally { setStarting(false) }
@@ -595,7 +602,6 @@ function RegisterModal({
               <>
                 <div>
                   <div className="mt-1 text-sm font-semibold text-[var(--text-primary)]">{t('accounts.selectIdentity')}</div>
-                  <div className="mt-1 text-xs text-[var(--text-muted)]">{t('accounts.selectIdentityDesc')}</div>
                   <div className="mt-3 grid gap-3 md:grid-cols-2">
                     {visibleRegistrationOptions.map(option => {
                       const active = selection.identityProvider === option.identityProvider
@@ -604,6 +610,7 @@ function RegisterModal({
                           key={option.key}
                           type="button"
                           aria-pressed={active}
+                          title={option.description}
                           onClick={() => setSelection(current => ({
                             ...current,
                             identityProvider: option.identityProvider,
@@ -618,7 +625,6 @@ function RegisterModal({
                             {option.identityProvider === 'mailbox' ? <Mail className="h-4 w-4" /> : null}
                             {option.label}
                           </div>
-                          <div className="mt-1 text-xs text-[var(--text-muted)]">{option.description}</div>
                         </button>
                       )
                     })}
@@ -627,7 +633,6 @@ function RegisterModal({
 
                 <div>
                   <div className="mt-1 text-sm font-semibold text-[var(--text-primary)]">{t('accounts.selectExecutor')}</div>
-                  <div className="mt-1 text-xs text-[var(--text-muted)]">{t('accounts.selectExecutorDesc')}</div>
                   <div className="mt-3 grid gap-3 md:grid-cols-3">
                     {visibleExecutorOptions.map(option => {
                       const active = selection.executorType === option.value
@@ -637,6 +642,7 @@ function RegisterModal({
                           type="button"
                           aria-pressed={active}
                           disabled={option.disabled}
+                          title={option.description}
                           onClick={() => !option.disabled && setSelection(current => ({ ...current, executorType: option.value }))}
                           className={`registration-choice border px-4 py-3 text-left transition-colors ${
                             option.disabled
@@ -647,7 +653,6 @@ function RegisterModal({
                           }`}
                         >
                           <div className="text-sm font-medium text-[var(--text-primary)]">{option.label}</div>
-                          <div className="mt-1 text-xs text-[var(--text-muted)]">{option.description}</div>
                           {option.reason ? (
                             <div className="mt-2 text-xs text-amber-400">{option.reason}</div>
                           ) : null}
@@ -832,7 +837,7 @@ function RegisterModal({
         </div>
         <div className="px-6 py-3 border-t border-[var(--border)] flex justify-end">
           <Button variant="outline" size="sm" onClick={onClose}>
-            {done ? t('common.close') : t('common.cancel')}
+            {taskId || done ? t('common.close') : t('common.cancel')}
           </Button>
         </div>
       </div>
@@ -1682,9 +1687,9 @@ function ActionMenu({
         title="复制 access_token"
         aria-label={`复制 ${acc.email} 的 access_token`}
       >
-        AT
+        <KeyRound size={14} />
       </button>
-      <button onClick={onDetail} className="table-action-btn">详情</button>
+      <button onClick={onDetail} className="table-action-btn" title="账号详情" aria-label={`查看 ${acc.email} 的详情`}><Eye size={14} /></button>
       {actions.some(action => action.id === 'rebind_email') && (
         <button
           onClick={() => startAction(actions.find(action => action.id === 'rebind_email'))}
@@ -1698,7 +1703,7 @@ function ActionMenu({
       {actions.length > 0 && (
         <div className="relative">
           <button ref={triggerRef} onClick={() => setOpen(o => !o)}
-            className="table-action-btn">更多 ▾</button>
+            className="table-action-btn" title="更多操作" aria-label="更多操作" aria-expanded={open}><MoreHorizontal size={14} /></button>
           {open && typeof document !== 'undefined' && createPortal(
             <div
               ref={menuRef}
@@ -1736,9 +1741,9 @@ function ActionMenu({
       {actions.length === 0 && (
         <button
           onClick={() => { if (confirm(`确认删除 ${acc.email}？`)) apiFetch(`/accounts/${acc.id}`, { method: 'DELETE' }).then(onDelete) }}
-          className="table-action-btn table-action-btn-danger"
+          className="table-action-btn table-action-btn-danger" title="删除账号" aria-label={`删除 ${acc.email}`}
         >
-          删除
+          <Trash2 size={14} />
         </button>
       )}
     </div>
@@ -1748,11 +1753,13 @@ function ActionMenu({
 // ── 账号详情弹框 ───────────────────────────────────────────
 function DetailModal({ acc, onClose, onSave }: { acc: any; onClose: () => void; onSave: () => void }) {
   const { t } = useI18n()
+  const returnFocusRef = useRef(document.activeElement as HTMLElement | null)
   const [form, setForm] = useState({
     lifecycle_status: getLifecycleStatus(acc),
     primary_token: getPrimaryToken(acc),
   })
   const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState('')
   const overview = getAccountOverview(acc)
   const verificationMailbox = getVerificationMailbox(acc)
   const providerAccounts = getProviderAccounts(acc)
@@ -1773,24 +1780,29 @@ function DetailModal({ acc, onClose, onSave }: { acc: any; onClose: () => void; 
     try {
       await apiFetch(`/accounts/${acc.id}`, { method: 'PATCH', body: JSON.stringify(form) })
       onSave()
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : String(error))
     } finally { setSaving(false) }
   }
 
   return (
-    <div className="dialog-backdrop">
-      <div className="dialog-panel dialog-panel-sm flex flex-col" style={{maxHeight:'90vh'}} onClick={e => e.stopPropagation()}>
+    <Dialog.Root open onOpenChange={open => { if (!open) onClose() }}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="detail-scrim" />
+        <Dialog.Content className="account-detail-drawer flex flex-col" onCloseAutoFocus={event => { event.preventDefault(); returnFocusRef.current?.focus() }}>
         {/* ── Sticky Header ── */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-[var(--border)] shrink-0">
-          <div>
-            <h2 className="text-base font-semibold text-[var(--text-primary)]">账号详情</h2>
-            <p className="text-xs text-[var(--text-muted)] mt-0.5">{acc.email}</p>
+          <AccountAvatar email={acc.email || ''} validity={getValidityStatus(acc)} small />
+          <div className="min-w-0">
+            <Dialog.Title className="text-base font-semibold text-[var(--text-primary)]">账号详情</Dialog.Title>
+            <Dialog.Description className="text-xs text-[var(--text-muted)] mt-1 break-all">{acc.email}</Dialog.Description>
           </div>
-          <button onClick={onClose} className="text-[var(--text-muted)] hover:text-[var(--text-primary)]"><X className="h-4 w-4" /></button>
+          <Dialog.Close className="icon-control" title={t('common.close')} aria-label={t('common.close')}><X className="h-4 w-4" /></Dialog.Close>
         </div>
         {/* ── Scrollable Content ── */}
         <div className="px-6 py-4 space-y-3 flex-1 overflow-y-auto min-h-0">
-          <div className="relative overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--accent-soft)] p-4 shadow-[var(--shadow-soft)]">
-            <div className="pointer-events-none absolute -right-16 -top-20 h-44 w-44 rounded-full bg-[var(--accent-soft)] blur-3xl" />
+          {saveError && <p className="inline-error" role="alert">{saveError}</p>}
+          <div className="detail-status-section">
             <div className="relative flex flex-wrap items-start justify-between gap-3">
               <div>
                 <div className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">核心状态</div>
@@ -1997,8 +2009,9 @@ function DetailModal({ acc, onClose, onSave }: { acc: any; onClose: () => void; 
           <Button onClick={save} disabled={saving} className="flex-1">{saving ? '保存中...' : '保存'}</Button>
           <Button variant="outline" onClick={onClose} className="flex-1">取消</Button>
         </div>
-      </div>
-    </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
   )
 }
 
@@ -2347,11 +2360,15 @@ export default function Accounts() {
   const [trialProxyDialogOpen, setTrialProxyDialogOpen] = useState(false)
   const [trialCheckStarting, setTrialCheckStarting] = useState(false)
   const [batchTask, setBatchTask] = useState<{ taskId: string; title: string } | null>(null)
-  const [batchTaskStatus, setBatchTaskStatus] = useState<string | null>(null)
+  const [summary, setSummary] = useState<Record<string, number> | null>(null)
+  const [summaryError, setSummaryError] = useState('')
+  const [dense, setDense] = useState(() => localStorage.getItem('accounts-density') === 'compact')
+  const [accountView, setAccountView] = useState<'grid' | 'table'>(() => localStorage.getItem('accounts-view') === 'table' ? 'table' : 'grid')
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
   const tableWrapRef = useRef<HTMLDivElement>(null)
   const loadSeqRef = useRef(0)
+  const summarySeqRef = useRef(0)
   const userPinnedSizeRef = useRef(false)
 
   useEffect(() => {
@@ -2402,14 +2419,39 @@ export default function Accounts() {
 
   useEffect(() => { load(tab, debouncedSearch, filterStatus) }, [load])
 
+  const loadSummary = useCallback(() => {
+    const seq = ++summarySeqRef.current
+    // The existing stats endpoint is global; filtered totals keep this summary platform-scoped.
+    return Promise.all(['', 'valid', 'invalid', 'subscribed'].map(async status => {
+        const params = new URLSearchParams({ platform: tab, status, page: '1', page_size: '1' })
+        const result = await apiFetch(`/accounts?${params}`)
+        return [status || 'all', Number(result.total)] as const
+      })).then(entries => {
+      if (seq !== summarySeqRef.current) return
+      setSummary(Object.fromEntries(entries))
+      setSummaryError('')
+    }).catch(error => {
+      if (seq !== summarySeqRef.current) return
+      setSummary(null)
+      setSummaryError(error instanceof Error ? error.message : String(error))
+    })
+  }, [])
+
+  useEffect(() => {
+    void loadSummary()
+    return () => { summarySeqRef.current += 1 }
+  }, [loadSummary])
+
+  const refreshAccounts = () => { void load(); void loadSummary() }
+
   useEffect(() => {
     tableWrapRef.current?.closest('main')?.scrollTo({ top: 0 })
-  }, [page, pageSize])
+  }, [page, pageSize, accountView])
 
   // 自动适配：按表格可视高度估算每页行数，让一页刚好铺满、无需内部滚动
   const fitRowsToViewport = useCallback(() => {
     const wrap = tableWrapRef.current
-    if (!wrap || userPinnedSizeRef.current) return
+    if (accountView !== 'table' || !wrap || userPinnedSizeRef.current || window.innerWidth < 768) return
     const head = wrap.querySelector('thead')
     const rows = wrap.querySelectorAll<HTMLElement>('tbody tr')
     if (!head || rows.length === 0) return
@@ -2420,13 +2462,13 @@ export default function Accounts() {
     const usable = wrap.clientHeight - head.offsetHeight - 8
     const fit = Math.floor(usable / rowHeight)
     if (fit >= 5 && fit <= 200 && fit !== pageSize) setPageSize(fit)
-  }, [pageSize])
+  }, [pageSize, accountView])
 
   useEffect(() => {
     if (loading || accounts.length === 0) return
     const frame = requestAnimationFrame(fitRowsToViewport)
     return () => cancelAnimationFrame(frame)
-  }, [loading, accounts, fitRowsToViewport])
+  }, [loading, accounts, fitRowsToViewport, dense])
 
   useEffect(() => {
     let timer: number | undefined
@@ -2507,15 +2549,19 @@ export default function Accounts() {
 
   const currentPlatformMeta = platformsMap[tab]
   const platformLabel = currentPlatformMeta?.display_name || tab
-  const visibleTrial = accounts.filter(acc => getPlanState(acc) === 'trial').length
-  const visibleSubscribed = accounts.filter(acc => getPlanState(acc) === 'subscribed').length
-  const visibleInvalid = accounts.filter(acc => getValidityStatus(acc) === 'invalid' || getLifecycleStatus(acc) === 'invalid').length
+  const zh = language === 'zh-CN'
+  const accountStats = [
+    { key: 'all', label: zh ? '账号总量' : 'Total accounts', icon: Users, tone: '' },
+    { key: 'valid', label: zh ? '有效账号' : 'Valid accounts', icon: BadgeCheck, tone: 'success' },
+    { key: 'invalid', label: zh ? '失效账号' : 'Invalid accounts', icon: CircleX, tone: 'danger' },
+    { key: 'subscribed', label: zh ? '已订阅' : 'Subscribed', icon: Crown, tone: 'accent' },
+  ]
 
   return (
     <div className="accounts-workspace flex min-h-0 flex-1 flex-col gap-4 overflow-hidden">
-      {detail && <DetailModal acc={detail} onClose={() => setDetail(null)} onSave={() => { setDetail(null); load() }} />}
-      {showImport && <ImportModal onClose={() => setShowImport(false)} onDone={() => { setShowImport(false); load() }} />}
-      {showRegister && <RegisterModal platformMeta={platformsMap[tab]} onClose={() => setShowRegister(false)} onDone={() => load()} />}
+      {detail && <DetailModal acc={detail} onClose={() => setDetail(null)} onSave={() => { setDetail(null); refreshAccounts() }} />}
+      {showImport && <ImportModal onClose={() => setShowImport(false)} onDone={() => { setShowImport(false); refreshAccounts() }} />}
+      {showRegister && <RegisterModal platformMeta={platformsMap[tab]} onClose={() => setShowRegister(false)} onDone={refreshAccounts} onTaskCreated={taskId => setBatchTask({ taskId, title: `${t('accounts.autoRegister')} ${platformLabel}` })} />}
       {actionResult && <ActionResultModal title={actionResult.title} payload={actionResult.payload} onClose={() => setActionResult(null)} />}
       {batchProxyDialogOpen && (
         <BatchCheckProxyModal
@@ -2541,7 +2587,6 @@ export default function Accounts() {
                     ? t('accounts.batchCheckSelectedTask', { platform: platformLabel, count: selectedCount })
                     : t('accounts.batchCheckAllTask', { platform: platformLabel }),
                 })
-                setBatchTaskStatus(null)
               } else {
                 setBatchProxyStarting(false)
               }
@@ -2578,7 +2623,6 @@ export default function Accounts() {
                     ? t('accounts.gcashCheckSelectedTask', { count: selectedCount })
                     : t('accounts.gcashCheckAllTask'),
                 })
-                setBatchTaskStatus(null)
               } else {
                 setGcashCheckStarting(false)
               }
@@ -2615,7 +2659,6 @@ export default function Accounts() {
                     ? t('accounts.trialCheckSelectedTask', { count: selectedCount })
                     : t('accounts.trialCheckAllTask'),
                 })
-                setBatchTaskStatus(null)
               } else {
                 setTrialCheckStarting(false)
               }
@@ -2627,62 +2670,21 @@ export default function Accounts() {
           }}
         />
       )}
-      {batchTask && (
-        <ActionTaskModal
-          title={batchTask.title}
-          taskId={batchTask.taskId}
-          taskStatus={batchTaskStatus}
-          onClose={() => {
-            setBatchTask(null)
-            setBatchTaskStatus(null)
-            setBatchRefreshing(false)
-            load()
-          }}
-          onDone={(status) => {
-            setBatchTaskStatus(status)
-            setBatchRefreshing(false)
-            load()
-          }}
-        />
-      )}
       {loadError && <div className="inline-error" role="alert">{loadError}</div>}
-      <Card className="accounts-panel flex min-h-0 flex-1 flex-col overflow-hidden p-0">
+      <Card className="accounts-panel flex min-h-0 flex-1 flex-col overflow-hidden p-0" data-density={dense ? 'compact' : 'comfortable'}>
         <div className="accounts-header">
-          <div className="flex min-w-0 shrink-0 flex-wrap items-center gap-3">
-            <h1 className="shrink-0 text-lg font-semibold tracking-tight text-[var(--text-primary)]">
-              {platformLabel}
-            </h1>
-            <div className="hidden h-4 w-[1px] bg-[var(--border)] sm:block"></div>
-            <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-xs">
-              <span className="shrink-0 text-[var(--text-muted)]">{t('accounts.count', { count: total })}</span>
-              {visibleTrial > 0 && <span className="flex items-center rounded-full bg-emerald-500/10 px-2 py-0.5 font-medium text-emerald-500 ring-1 ring-inset ring-emerald-500/20">{t('accounts.trial', { count: visibleTrial })}</span>}
-              {visibleSubscribed > 0 && <span className="flex items-center rounded-full bg-blue-500/10 px-2 py-0.5 font-medium text-blue-500 ring-1 ring-inset ring-blue-500/20">{t('accounts.subscribed', { count: visibleSubscribed })}</span>}
-              {visibleInvalid > 0 && <span className="flex items-center rounded-full bg-red-500/10 px-2 py-0.5 font-medium text-red-500 ring-1 ring-inset ring-red-500/20">{t('accounts.invalid', { count: visibleInvalid })}</span>}
-              {selectedCount > 0 && <span className="flex items-center rounded-full bg-[var(--text-primary)]/10 px-2 py-0.5 font-medium text-[var(--text-primary)] ring-1 ring-inset ring-[var(--text-primary)]/20">{t('accounts.selected', { count: selectedCount })}</span>}
-            </div>
+          <div className="min-w-0">
+            <h1>{platformLabel} <span className="heading-suffix">{language === 'zh-CN' ? '账号' : 'accounts'}</span></h1>
+            <p className="account-heading-meta">{language === 'zh-CN' ? '账号管理' : 'Account management'}<span>/</span>{t('accounts.count', { count: summary?.all ?? total })}</p>
           </div>
-          <div className="flex w-full flex-wrap items-center gap-2 lg:w-auto lg:justify-end">
-            <Button size="sm" onClick={() => setShowRegister(true)} className="h-8 shrink-0 whitespace-nowrap shadow-sm">
-              <Plus className="mr-1.5 h-3.5 w-3.5 shrink-0" />
-              {t('accounts.autoRegister')}
-            </Button>
-            <div className="hidden h-4 w-[1px] shrink-0 bg-[var(--border)] sm:block"></div>
+          <div className="account-primary-actions">
+            <RegistrationStatsDialog platform={tab} />
             <Button size="sm" variant="outline" onClick={() => setShowImport(true)} className={ACCOUNT_TOOL_BUTTON_CLASS}>
               <Upload className="mr-1.5 h-3.5 w-3.5 shrink-0" />
               {t('accounts.import')}
             </Button>
             {tab === 'chatgpt' ? (
               <>
-                <LoginRefreshMenu
-                  total={total}
-                  statusFilter={filterStatus}
-                  searchFilter={debouncedSearch}
-                  selectedIds={[...selectedIds]}
-                  onTaskCreated={(taskId, title) => {
-                    setBatchTask({ taskId, title })
-                    setBatchTaskStatus(null)
-                  }}
-                />
                 <ExportMenu
                   total={total}
                   statusFilter={filterStatus}
@@ -2696,13 +2698,31 @@ export default function Accounts() {
                 {t('accounts.export')}
               </Button>
             )}
+            <Button size="sm" onClick={() => setShowRegister(true)}>
+              <Plus className="mr-1.5 h-3.5 w-3.5 shrink-0" />{t('accounts.autoRegister')}
+            </Button>
           </div>
         </div>
-        
+        <div className="metric-strip account-metrics" aria-label={zh ? '账号统计' : 'Account statistics'}>
+          {accountStats.map(({ key, label, icon: Icon, tone }) => (
+            <div key={key}>
+              <p className="metric-label"><Icon size={15} />{label}</p>
+              <p className={`metric-value metric-${tone}`}>{summary ? summary[key].toLocaleString() : summaryError ? '-' : <span className="skeleton w-16 h-9" />}</p>
+            </div>
+          ))}
+        </div>
+        {summaryError && <p className="inline-error mb-3" role="alert">{zh ? '统计加载失败' : 'Statistics unavailable'}: {summaryError}</p>}
+        <div className="account-status-tabs" role="group" aria-label={zh ? '快捷筛选' : 'Quick filters'}>
+          {[{ value: '', label: zh ? '全部账号' : 'All accounts' }, { value: 'valid', label: zh ? '有效' : 'Valid' }, { value: 'invalid', label: zh ? '失效' : 'Invalid' }, { value: 'subscribed', label: zh ? '已订阅' : 'Subscribed' }].map(item => (
+            <button key={item.value} aria-pressed={filterStatus === item.value} onClick={() => { setFilterStatus(item.value); setPage(1) }}>
+              {item.label}{summary && <span>{summary[item.value || 'all']}</span>}
+            </button>
+          ))}
+        </div>
         {/* Search & Filter Toolbar */}
         <div className="accounts-toolbar">
           <div className="account-filters">
-            <div className="relative flex-1 max-w-sm">
+            <div className="account-search relative flex-1">
               <div className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-2.5 text-[var(--text-muted)]">
                 <Search size={14} />
               </div>
@@ -2712,8 +2732,9 @@ export default function Accounts() {
                 aria-label={t('accounts.searchPlaceholder')}
                 value={search}
                 onChange={e => setSearch(e.target.value)}
-                className="w-full rounded-md border border-[var(--border)] bg-transparent py-1.5 pl-8 pr-3 text-sm text-[var(--text-primary)] transition-colors placeholder:text-[var(--text-muted)] focus:border-[var(--text-primary)] focus:outline-none focus:ring-1 focus:ring-[var(--text-primary)]"
+                className="w-full rounded-md border border-[var(--border)] bg-transparent py-1.5 pl-8 pr-8 text-[13px] text-[var(--text-primary)]"
               />
+              {search && <button className="search-clear" onClick={() => setSearch('')} title={t('common.clear')} aria-label={t('common.clear')}><X size={13} /></button>}
             </div>
             <select
               value={filterStatus}
@@ -2722,6 +2743,7 @@ export default function Accounts() {
               className="rounded-md border border-[var(--border)] bg-[var(--bg-input)] py-1.5 px-3 text-sm text-[var(--text-primary)]"
             >
               <option value="">{t('accounts.allStatuses')}</option>
+              <option value="valid">{translateAccountStatus('valid', language)}</option>
               <option value="registered">{translateAccountStatus('registered', language)}</option>
               <option value="trial">{t('dashboard.trial')}</option>
               <option value="subscribed">{t('dashboard.subscribed')}</option>
@@ -2730,9 +2752,18 @@ export default function Accounts() {
               <option value="expired">{t('accounts.expired')}</option>
               <option value="invalid">{t('dashboard.invalid')}</option>
             </select>
+            <div className="account-view-switch" role="group" aria-label={zh ? '账号视图' : 'Account view'}>
+              {([{ value: 'grid', label: zh ? '头像视图' : 'Avatar view', icon: LayoutGrid }, { value: 'table', label: zh ? '表格视图' : 'Table view', icon: Table2 }] as const).map(({ value, label, icon: Icon }) => (
+                <button key={value} type="button" title={label} aria-label={label} aria-pressed={accountView === value} onClick={() => { setAccountView(value); localStorage.setItem('accounts-view', value) }}>
+                  <Icon size={16} aria-hidden="true" />
+                </button>
+              ))}
+            </div>
           </div>
           
           <div className="account-tools">
+            {selectedCount > 0 && <span className="selection-count" role="status">{t('accounts.selected', { count: selectedCount })}</span>}
+            <LoginRefreshMenu total={total} statusFilter={filterStatus} searchFilter={debouncedSearch} selectedIds={[...selectedIds]} onTaskCreated={(taskId, title) => setBatchTask({ taskId, title })} />
             <Button
               variant="ghost"
               size="sm"
@@ -2784,8 +2815,11 @@ export default function Accounts() {
                   ? t('accounts.trialCheckSelected', { count: selectedCount })
                   : t('accounts.trialCheck')}
             </Button>
-            <Button variant="ghost" size="sm" onClick={() => load()} disabled={loading} title={t('common.refresh')} aria-label={t('common.refresh')} className="h-7 w-7 p-0 text-[var(--text-muted)] hover:text-[var(--text-primary)]">
+            <Button variant="ghost" size="sm" onClick={refreshAccounts} disabled={loading} title={t('common.refresh')} aria-label={t('common.refresh')} className="h-8 w-8 p-0 text-[var(--text-muted)] hover:text-[var(--text-primary)]">
               <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
+            </Button>
+            <Button variant="ghost" size="sm" className="h-8 w-8 p-0" title={zh ? (dense ? '标准行高' : '紧凑行高') : (dense ? 'Comfortable rows' : 'Compact rows')} aria-label={zh ? '紧凑行高' : 'Compact rows'} aria-pressed={dense} onClick={() => { setDense(!dense); localStorage.setItem('accounts-density', dense ? 'comfortable' : 'compact') }}>
+              {dense ? <List size={16} /> : <Rows3 size={16} />}
             </Button>
             {selectedCount > 0 && (
               <Button
@@ -2801,7 +2835,7 @@ export default function Accounts() {
                       [...selectedIds].map(id => apiFetch(`/accounts/${id}`, { method: 'DELETE' }))
                     )
                     setSelectedIds(new Set())
-                    load()
+                    refreshAccounts()
                   } finally {
                     setBulkDeleting(false)
                   }
@@ -2813,16 +2847,44 @@ export default function Accounts() {
             )}
           </div>
         </div>
+        {accountView === 'grid' ? (
+          <section className="account-collection" aria-label={zh ? '账号头像列表' : 'Account avatars'} aria-busy={loading}>
+            <div className="account-collection-bar">
+              <label className="collection-select"><input type="checkbox" className="checkbox-accent" checked={allSelectedOnPage} disabled={!accounts.length} onChange={togglePage} aria-label={zh ? '选择本页账号' : 'Select this page'} />{zh ? '本页账号' : 'This page'}<span>{accounts.length}</span></label>
+              <div className="account-health-legend"><span data-health="valid">{zh ? '可用' : 'Available'}</span><span data-health="unknown">{zh ? '未确认' : 'Unverified'}</span><span data-health="invalid">{zh ? '失效' : 'Invalid'}</span></div>
+            </div>
+            <div className="account-atlas" ref={tableWrapRef}>
+              {loading && accounts.length === 0 && Array.from({ length: 8 }, (_, i) => <div key={i} className="account-tile-skeleton" aria-hidden="true"><span className="skeleton" /><span className="skeleton" /></div>)}
+              {!loading && accounts.length === 0 && <div className="account-empty atlas-empty"><Inbox size={28} aria-hidden="true" /><h3>{t('accounts.emptyTitle')}</h3>{(search || filterStatus) && <Button variant="link" size="sm" onClick={() => { setSearch(''); setFilterStatus('') }}>{zh ? '清除筛选' : 'Clear filters'}</Button>}</div>}
+              {accounts.map(acc => {
+                const health = accountHealth(getValidityStatus(acc))
+                const healthLabel = health === 'valid' ? (zh ? '可用' : 'Available') : health === 'invalid' ? (zh ? '失效' : 'Invalid') : (zh ? '未确认可用' : 'Unverified')
+                const plan = getPlanChip(acc)
+                return (
+                  <article className="account-tile" key={acc.id} data-selected={selectedIds.has(acc.id)} data-health={health}>
+                    <div className="account-tile-top"><input type="checkbox" className="checkbox-accent" checked={selectedIds.has(acc.id)} aria-label={`${zh ? '选择' : 'Select'} ${acc.email}`} onChange={() => toggleOne(acc.id)} /><span>{plan?.label || translateAccountStatus(getLifecycleStatus(acc), language)}</span></div>
+                    <button className="account-tile-identity" title={`${acc.email} · ${healthLabel}`} aria-label={acc.email} aria-describedby={`account-health-${acc.id}`} onClick={() => setDetail(acc)}>
+                      <AccountAvatar email={acc.email || ''} validity={getValidityStatus(acc)} />
+                      <span className="account-tile-email">{acc.email}</span>
+                    </button>
+                    <span className="account-tile-health" id={`account-health-${acc.id}`}>{healthLabel}</span>
+                    <div className="account-tile-footer"><span title={t('accounts.survivalTime')}><Clock size={11} aria-hidden="true" />{formatSurvivalDuration(acc, now, language)}</span><ActionMenu acc={acc} onDetail={() => setDetail(acc)} onDelete={refreshAccounts} onResult={(title, payload) => setActionResult({ title, payload })} onChanged={refreshAccounts} /></div>
+                  </article>
+                )
+              })}
+            </div>
+          </section>
+        ) : (
           <div ref={tableWrapRef} className="accounts-table glass-table-wrap min-h-0 flex-1 overflow-auto" aria-busy={loading}>
-        <table className="table-fixed w-full min-w-[980px] text-sm">
+        <table className="table-fixed w-full min-w-[860px] text-[13px]">
           <colgroup>
             <col className="w-10" />
-            <col className="w-[26%]" />
+            <col className="w-[29%]" />
             <col className="w-[10%]" />
-            <col className="w-[22%]" />
+            <col className="w-[24%]" />
             <col className="w-[8%]" />
-            <col className="w-[12%]" />
-            <col className="w-[22%]" />
+            <col className="w-[15%]" />
+            <col className="w-[14%]" />
           </colgroup>
           <thead className="sticky top-0 z-10 bg-[var(--bg-pane)]/85 shadow-[0_1px_0_var(--border)] backdrop-blur-sm">
             <tr className="border-b border-[var(--border)] text-xs uppercase tracking-wider font-medium text-[var(--text-muted)]">
@@ -2830,6 +2892,7 @@ export default function Accounts() {
                 <input
                   type="checkbox"
                   checked={allSelectedOnPage}
+                  aria-label={zh ? '选择本页账号' : 'Select this page'}
                   onChange={togglePage}
                   className="checkbox-accent rounded-[3px] border-[var(--border)] focus:ring-[var(--text-primary)] focus:ring-offset-0 bg-transparent text-[var(--text-primary)]"
                 />
@@ -2849,12 +2912,12 @@ export default function Accounts() {
             {!loading && accounts.length === 0 && (
               <tr>
                 <td colSpan={7} className="px-4 py-24 text-center">
-                  <div className="flex flex-col items-center justify-center space-y-3">
+                  <div className="account-empty flex flex-col items-center justify-center space-y-3">
                     <div className="flex h-12 w-12 items-center justify-center rounded-full bg-[var(--bg-pane)] border border-[var(--border)] shadow-sm">
-                      <svg className="h-6 w-6 text-[var(--text-muted)]" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4" /></svg>
+                      <Inbox className="h-6 w-6 text-[var(--text-muted)]" />
                     </div>
                     <h3 className="text-sm font-medium text-[var(--text-primary)]">{t('accounts.emptyTitle')}</h3>
-                    <p className="text-xs text-[var(--text-muted)] max-w-sm">{t('accounts.emptyDesc')}</p>
+                    {(search || filterStatus) && <Button variant="link" size="sm" onClick={() => { setSearch(''); setFilterStatus('') }}>{zh ? '清除筛选' : 'Clear filters'}</Button>}
                   </div>
                 </td>
               </tr>
@@ -2873,21 +2936,23 @@ export default function Accounts() {
                   <input
                     type="checkbox"
                     checked={selectedIds.has(acc.id)}
+                    aria-label={`${zh ? '选择' : 'Select'} ${acc.email}`}
                     onChange={() => toggleOne(acc.id)}
                     className="checkbox-accent rounded-[3px] border-[var(--border)] focus:ring-[var(--text-primary)] focus:ring-offset-0 bg-transparent text-[var(--text-primary)] transition-all opacity-40 group-hover:opacity-100 data-[state=checked]:opacity-100"
                   />
                 </td>
                 <td className="px-3 py-2.5 font-mono text-sm text-[var(--text-primary)] align-top">
-                  <div className="flex min-w-0 items-center gap-1.5">
-                    <span className="truncate tracking-tight" title={acc.email}>{acc.email}</span>
+                  <div className="flex min-w-0 items-center gap-2">
+                    <AccountAvatar email={acc.email || ''} validity={getValidityStatus(acc)} small />
+                    <button className="account-email" title={acc.email} onClick={() => setDetail(acc)}>{acc.email}</button>
                     <button onClick={e => { e.stopPropagation(); copy(acc.email) }} title="复制邮箱" className="text-[var(--text-muted)] hover:text-[var(--text-primary)] opacity-0 group-hover:opacity-100 transition-opacity"><Copy className="h-3 w-3" /></button>
                   </div>
-                  {verificationMailbox && (verificationMailbox.email || verificationMailbox.account_id || verificationMailbox.provider) && (
+                  {verificationMailbox && verificationMailbox.email !== acc.email && (verificationMailbox.email || verificationMailbox.account_id || verificationMailbox.provider) && (
                     <div
                       className="mt-1 truncate text-xs text-[var(--text-muted)] flex items-center gap-1"
                       title={`验证邮箱: ${verificationMailbox.email || '-'} · ${verificationMailbox.provider || '-'}`}
                     >
-                      <svg className="w-3 h-3 opacity-60 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z" /><polyline points="22,6 12,13 2,6" /></svg>
+                      <Mail className="w-3 h-3 flex-shrink-0" />
                       <span className="truncate">{verificationMailbox.email || '-'}</span>
                     </div>
                   )}
@@ -2908,8 +2973,8 @@ export default function Accounts() {
                 </td>
                 <td className="px-3 py-2.5 font-mono text-[13px] text-[var(--text-muted)] align-top">
                   <div className="flex min-w-0 items-center gap-1.5">
-                    <span className="truncate blur-[3px] transition-all cursor-default hover:blur-none select-none hover:select-auto hover:text-[var(--text-primary)]" title={acc.password}>{acc.password}</span>
-                    <button onClick={e => { e.stopPropagation(); copy(acc.password) }} className="text-[var(--text-muted)] hover:text-[var(--text-primary)] opacity-0 group-hover:opacity-100 transition-opacity"><Copy className="h-3 w-3" /></button>
+                    <span className="truncate" aria-label={zh ? '密码已隐藏' : 'Password hidden'}>******</span>
+                    <button onClick={e => { e.stopPropagation(); copy(acc.password) }} title={zh ? '复制密码' : 'Copy password'} aria-label={zh ? '复制密码' : 'Copy password'} className="text-[var(--text-muted)] hover:text-[var(--text-primary)]"><Copy className="h-3 w-3" /></button>
                   </div>
                 </td>
                 <td className="px-3 py-2.5 align-top">
@@ -2919,15 +2984,15 @@ export default function Accounts() {
                       const variant = String(STATUS_VARIANT[status] || 'secondary');
                       const StatusIcon = getStatusIcon(status);
                       const styles = (({
-                        success: "bg-emerald-500/10 text-emerald-500 ring-emerald-500/20",
-                        warning: "bg-amber-500/10 text-amber-500 ring-amber-500/20",
-                        danger: "bg-red-500/10 text-red-500 ring-red-500/20",
+                        success: "bg-[var(--success-soft)] text-[var(--status-success)]",
+                        warning: "bg-[var(--warning-soft)] text-[var(--status-warning)]",
+                        danger: "bg-[var(--danger-soft)] text-[var(--status-danger)]",
                         secondary: "bg-[var(--text-primary)]/5 text-[var(--text-secondary)] ring-[var(--border)]",
-                        default: "bg-blue-500/10 text-blue-500 ring-blue-500/20"
+                        default: "bg-[var(--accent-soft)] text-[var(--text-accent)]"
                       } as Record<string, string>)[variant]) || "bg-[var(--text-primary)]/5 text-[var(--text-secondary)] ring-[var(--border)]";
                       
                       return (
-                        <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${styles}`}>
+                        <span className={`inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-medium ${styles}`}>
                           <StatusIcon className={`mr-1 h-3 w-3 ${getStatusIconColor(variant)}`} />
                           {translateAccountStatus(status, language)}
                         </span>
@@ -2944,7 +3009,7 @@ export default function Accounts() {
                       return (
                         <div className="flex max-w-full flex-wrap items-center gap-1">
                           {planChip && <StatusIconChip {...planChip} />}
-                          {validityChip && (
+                          {validityChip && validityChip.label !== getDisplayStatus(acc) && (
                             <StatusIconChip
                               tone={validityChip.tone}
                               label={translateAccountStatus(validityChip.label, language)}
@@ -2997,9 +3062,9 @@ export default function Accounts() {
                     <ActionMenu
                       acc={acc}
                       onDetail={() => setDetail(acc)}
-                      onDelete={() => load()}
+                      onDelete={refreshAccounts}
                       onResult={(title, payload) => setActionResult({ title, payload })}
-                      onChanged={() => load()}
+                      onChanged={refreshAccounts}
                     />
                   </div>
                 </td>
@@ -3010,12 +3075,14 @@ export default function Accounts() {
           </tbody>
         </table>
           </div>
+        )}
         {/* Pagination */}
-        <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-[var(--border)]/50 px-5 py-3">
+        <div className="account-pagination flex shrink-0 flex-wrap items-center justify-between gap-3 py-3">
           <div className="flex items-center gap-3 text-xs text-[var(--text-muted)]">
             <span>{t('accounts.pageSummary', { page, pages: totalPages, count: total })}</span>
             <select
               value={pageSize}
+              aria-label={zh ? '每页账号数' : 'Accounts per page'}
               onChange={e => {
                 userPinnedSizeRef.current = true
                 setPageSize(Number(e.target.value))
@@ -3065,6 +3132,7 @@ export default function Accounts() {
           </div>
         </div>
       </Card>
+      {!showRegister && <TaskDock key={batchTask?.taskId || 'idle'} task={batchTask} onDone={() => { setBatchRefreshing(false); refreshAccounts() }} />}
     </div>
   )
 }

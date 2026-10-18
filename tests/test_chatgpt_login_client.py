@@ -107,6 +107,18 @@ def test_auto_fetch_passes_baseline_so_only_new_mail_is_accepted():
     assert mailbox.calls[0]["before_ids"] == {"old-1", "old-2"}
 
 
+def test_auto_fetch_forwards_pre_send_baseline_and_issue_time():
+    mailbox = FakeMailbox(ids={"old-1"})
+    resolver = login_client.EmailOtpResolver(rebuilt=FakeRebuilt(mailbox))
+
+    assert resolver.fetch(
+        before_ids={"before-authorize"},
+        issued_after=1789477281.75,
+    ) == "482615"
+    assert mailbox.calls[0]["before_ids"] == {"before-authorize"}
+    assert mailbox.calls[0]["issued_after"] == 1789477281.75
+
+
 def test_auto_failure_falls_back_to_manual():
     mailbox = FakeMailbox(raises=True)
     handle = FakeManualHandle()

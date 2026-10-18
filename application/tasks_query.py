@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from core.datetime_utils import serialize_datetime
+from domain.registration_stats import registration_snapshot
 from infrastructure.tasks_read_repository import TasksReadRepository
 
 
@@ -34,7 +35,7 @@ class TasksQueryService:
 
     @staticmethod
     def _serialize(item) -> dict:
-        return {
+        data = {
             "id": item.id,
             "task_id": item.id,
             "type": item.type,
@@ -57,3 +58,9 @@ class TasksQueryService:
             "updated_at": serialize_datetime(item.updated_at),
             "result": item.result,
         }
+        if item.type == "register":
+            data["registration_stats"] = registration_snapshot(
+                success=item.success, failed=item.error_count, result=item.result,
+                status=item.status, requested=item.progress.total, error=item.error,
+            )
+        return data

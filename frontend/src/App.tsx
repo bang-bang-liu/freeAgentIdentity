@@ -44,14 +44,10 @@ type NavItem = {
   exact?: boolean;
 };
 
-const SETTINGS_NAV_ITEMS: { labelKey: TranslationKey; hash: string }[] = [
-  { labelKey: "nav.settings.general", hash: "general" },
-  { labelKey: "nav.settings.mailbox", hash: "mailbox" },
-];
-
 const NAV_ITEMS: NavItem[] = [
   { path: "/", labelKey: "nav.dashboard", icon: LayoutDashboard, exact: true },
-  { path: "/accounts/chatgpt", label: "chatgpt free", icon: Users },
+  { path: "/accounts/chatgpt", label: "ChatGPT", icon: Users },
+  { path: "/settings?tab=mailbox", labelKey: "nav.settings.mailbox", icon: Mail },
   { path: "/settings", labelKey: "nav.settings", icon: SettingsIcon },
 ];
 
@@ -70,7 +66,7 @@ function Sidebar({
   mobileOpen: boolean;
   closeMobile: () => void;
 }) {
-  const { t, toggleLanguage } = useI18n();
+  const { t, toggleLanguage, language } = useI18n();
   const location = useLocation();
   const isSettings = location.pathname === "/settings";
   const currentTab = new URLSearchParams(location.search).get("tab") || "general";
@@ -97,9 +93,9 @@ function Sidebar({
 
   const navLinkClass = (active: boolean) =>
     cn(
-      "group flex items-center gap-3 rounded-lg px-3 py-2 text-[13px] font-medium transition-colors",
+      "group flex items-center gap-3 rounded-md px-3 py-2 text-[13px] font-medium transition-colors",
       active
-        ? "bg-[var(--accent-soft)] text-[var(--text-primary)]"
+        ? "bg-[var(--accent-soft)] text-[var(--text-accent)]"
         : "text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]",
       collapsed && "justify-center px-0",
     );
@@ -108,7 +104,7 @@ function Sidebar({
     cn(
       "h-[18px] w-[18px] shrink-0",
       active
-        ? "text-[var(--accent)]"
+        ? "text-[var(--text-accent)]"
         : "text-[var(--text-muted)] group-hover:text-[var(--text-secondary)]",
     );
 
@@ -131,26 +127,21 @@ function Sidebar({
       >
         {(!collapsed || mobileOpen) && (
           <div className="flex items-center gap-2.5 min-w-0 flex-1">
-            <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-[var(--accent)] text-[11px] font-bold text-white">
-              B
-            </div>
-            <span className="truncate text-sm font-semibold text-[var(--text-primary)]">
-              BangBang
-            </span>
+            <img src="/assets/brand-mark.svg" alt="" width={28} height={28} className="shrink-0" />
+            <div className="sidebar-brand-wordmark"><span>BangBang<span className="brand-dot">.</span></span><small>{language === 'zh-CN' ? '账号工作台' : 'Account studio'}</small></div>
           </div>
         )}
         {collapsed && !mobileOpen && (
-          <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-[var(--accent)] text-[11px] font-bold text-white">
-            B
-          </div>
+          <img src="/assets/brand-mark.svg" alt="BangBang" width={28} height={28} />
         )}
         <button className="mobile-only icon-control" onClick={closeMobile} aria-label={t("common.close")}><X size={18} /></button>
       </div>
 
       {/* Nav */}
       <nav className="flex-1 overflow-y-auto px-3 py-5 space-y-1" onClick={closeMobile}>
+        {(!collapsed || mobileOpen) && <p className="sidebar-section-label">{language === "zh-CN" ? "工作空间" : "Workspace"}</p>}
         {NAV_ITEMS.map(({ path, labelKey, label: itemLabel, icon: Icon, exact }) => {
-          const active = path === "/settings" ? isSettings && currentTab !== "mailbox" : exact
+          const active = path.startsWith("/settings") ? isSettings && (path.includes("mailbox") ? currentTab === "mailbox" : currentTab !== "mailbox") : exact
             ? location.pathname === path
             : location.pathname.startsWith(path);
           const label = itemLabel || (labelKey ? t(labelKey) : path);
@@ -169,36 +160,9 @@ function Sidebar({
             </NavLink>
           );
         })}
-        {(!collapsed || mobileOpen) && isSettings && (
-          <div className="ml-[21px] mt-0.5 space-y-px border-l border-[var(--border)] pl-3">
-            {SETTINGS_NAV_ITEMS.map((item) => {
-              const active = currentTab === item.hash;
-              return (
-                <NavLink
-                  key={item.hash}
-                  to={`/settings?tab=${item.hash}`}
-                  className={cn(
-                    "relative block rounded-md px-2.5 py-1.5 text-[13px] transition-colors",
-                    active
-                      ? "text-[var(--accent)] font-medium bg-[var(--accent-soft)]"
-                      : "text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]",
-                  )}
-                >
-                  {active && (
-                    <span className="absolute -left-[13.5px] top-1/2 h-4 w-[2px] -translate-y-1/2 rounded-full bg-[var(--accent)]" />
-                  )}
-                  {t(item.labelKey)}
-                </NavLink>
-              );
-            })}
-          </div>
-        )}
         <div className="!my-4 border-t border-[var(--border)]" />
         <Link to="/accounts/chatgpt?register=1" className={navLinkClass(false)} title={t("accounts.autoRegister")}>
           <Plus className={iconClass(false)} />{(!collapsed || mobileOpen) && <span>{t("accounts.autoRegister")}</span>}
-        </Link>
-        <Link to="/settings?tab=mailbox" className={navLinkClass(isSettings && currentTab === "mailbox")} aria-current={isSettings && currentTab === "mailbox" ? "page" : undefined} title={t("nav.settings.mailbox")}>
-          <Mail className={iconClass(isSettings && currentTab === "mailbox")} />{(!collapsed || mobileOpen) && <span>{t("nav.settings.mailbox")}</span>}
         </Link>
       </nav>
 
@@ -211,6 +175,7 @@ function Sidebar({
       >
         <button
           onClick={toggleTheme}
+          aria-label={theme === 'light' ? t('sidebar.theme.toDark') : theme === 'dark' ? t('sidebar.theme.toLight') : t('sidebar.theme.followSystem')}
           className={cn(
             "flex items-center justify-center rounded-md p-2 text-[var(--text-muted)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-secondary)]",
           )}
@@ -241,6 +206,7 @@ function Sidebar({
         )}
         <button
           onClick={toggleLanguage}
+          aria-label={t('sidebar.languageToggle')}
           className="flex items-center justify-center rounded-md p-2 text-[var(--text-muted)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-secondary)]"
           title={t("sidebar.languageToggle")}
         >
@@ -248,6 +214,7 @@ function Sidebar({
         </button>
         <button
           onClick={() => setCollapsed(!collapsed)}
+          aria-label={collapsed ? t('sidebar.expand') : t('sidebar.collapse')}
           className="flex items-center justify-center rounded-md p-2 text-[var(--text-muted)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-secondary)]"
           title={collapsed ? t("sidebar.expand") : t("sidebar.collapse")}
         >
@@ -283,7 +250,7 @@ function Shell({
   const location = useLocation();
   const pageTitle = location.pathname === "/settings"
     ? t("nav.settings")
-    : location.pathname.startsWith("/accounts") ? "chatgpt free" : t("nav.dashboard");
+    : location.pathname.startsWith("/accounts") ? "ChatGPT" : t("nav.dashboard");
 
   useEffect(() => {
     if (!mobileOpen) return;
@@ -303,6 +270,7 @@ function Shell({
 
   return (
     <div className="app-shell app-canvas overflow-hidden">
+      <a href="#main-content" className="skip-link">{t("common.skipToContent")}</a>
       {mobileOpen && <button className="sidebar-scrim" onClick={() => setMobileOpen(false)} aria-label={t("common.close")} />}
       <Sidebar
         theme={theme}
@@ -312,10 +280,10 @@ function Shell({
         mobileOpen={mobileOpen}
         closeMobile={() => setMobileOpen(false)}
       />
-      <main id="main-content" className="workspace-main min-w-0 flex-1" inert={mobileOpen}>
+      <main id="main-content" tabIndex={-1} className="workspace-main min-w-0 flex-1" inert={mobileOpen}>
         <header className="workspace-topbar">
           <button className="mobile-only icon-control" onClick={() => setMobileOpen(true)} aria-label={t("sidebar.expand")} aria-expanded={mobileOpen} aria-controls="app-navigation"><Menu size={18} /></button>
-          <span className="text-[var(--text-muted)]">BangBang</span><ChevronRight size={14} className="text-[var(--text-muted)]" /><span>{pageTitle}</span>
+          <span className="workspace-breadcrumb">BangBang</span><ChevronRight size={12} className="text-[var(--text-muted)]" aria-hidden="true" /><span>{pageTitle}</span><span className="workspace-edition">ACCOUNT STUDIO</span>
         </header>
         <div className="workspace-content">
           <UpdateBanner />

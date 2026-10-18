@@ -30,13 +30,10 @@ export default function Settings() {
   return (
     <div className="space-y-4">
       {error && (
-        <div className="rounded-lg border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-300">
+        <div className="inline-error" role="alert">
           {error}
         </div>
       )}
-      <div className="rounded-lg border border-[var(--accent-edge)] bg-[var(--accent-soft)] px-4 py-3 text-sm text-[var(--text-secondary)]">
-        {t('settings.provider.mailboxUsage')}
-      </div>
       <ProviderCards
         providerType="mailbox"
         catalog={catalog}

@@ -5,7 +5,7 @@ import type { TranslationKey } from '@/lib/i18n'
 import type { ProviderOption, ProviderSetting } from '@/lib/config-options'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { Save, Eye, EyeOff, X, Pencil, Plus, Trash2, FlaskConical, Search } from 'lucide-react'
+import { Save, Eye, EyeOff, X, Pencil, Plus, Trash2, FlaskConical, Search, Mail } from 'lucide-react'
 import { invalidateConfigOptionsCache } from '@/lib/app-data'
 
 const CATEGORY_GROUPS = [
@@ -548,9 +548,11 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
 
     return (
       <div key={key}>
-        <div className="provider-row">
+        <div className="provider-row" data-enabled={isEnabled}>
           {/* Left: name + desc + badge */}
           <div className="provider-identity">
+            <div className="provider-emblem" aria-hidden="true"><Mail size={20} /></div>
+            <div className="min-w-0">
             <div className="flex items-center gap-2">
               <span className="text-sm font-medium text-[var(--text-primary)]">{provider.label}</span>
               {isDefault && <Badge variant="success">{t('providers.default')}</Badge>}
@@ -558,6 +560,7 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
             {provider.description && (
               <p className="mt-0.5 text-xs text-[var(--text-muted)] line-clamp-1">{provider.description}</p>
             )}
+            </div>
           </div>
 
           {/* Right: actions */}

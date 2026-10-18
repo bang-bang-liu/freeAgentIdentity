@@ -21,6 +21,7 @@ from core.datetime_utils import format_local_clock, serialize_datetime
 from core.db import AccountModel, TaskEventModel, TaskModel, engine, save_account
 from core.platform_accounts import build_platform_account
 from core.registry import get
+from domain.registration_stats import normalize_registration_stage, observe_registration_stage, registration_snapshot
 from infrastructure.platform_runtime import PlatformRuntime
 from application.manual_otp import ManualOtpHandle, manual_otp_registry
 
@@ -85,9 +86,9 @@ def _task_cancel_event(task_id: str) -> threading.Event:
         return event
 
 
-def register_task_cancel_callback(task_id: str, callback: Callable[[], None] | None) -> None:
+def register_task_cancel_callback(task_id: str, callback: Callable[[], None] | None) -> bool:
     if not task_id or not callable(callback):
-        return
+        return False
     should_trigger = False
     with _task_cancel_guard:
         _task_cancel_callbacks.setdefault(task_id, set()).add(callback)
@@ -95,6 +96,7 @@ def register_task_cancel_callback(task_id: str, callback: Callable[[], None] | N
         should_trigger = bool(event and event.is_set())
     if should_trigger:
         _invoke_cancel_callback(callback)
+    return should_trigger
 
 
 def unregister_task_cancel_callback(task_id: str, callback: Callable[[], None] | None) -> None:
@@ -241,7 +243,7 @@ def serialize_task(task: TaskModel) -> dict[str, Any]:
     result = task.get_result()
     progress_total = int(task.progress_total or 0)
     progress_current = int(task.progress_current or 0)
-    return {
+    data = {
         "id": task.id,
         "task_id": task.id,
         "type": task.type,
@@ -267,6 +269,12 @@ def serialize_task(task: TaskModel) -> dict[str, Any]:
         "finished_at": _serialize_datetime(task.finished_at),
         "updated_at": _serialize_datetime(task.updated_at),
     }
+    if task.type == TASK_TYPE_REGISTER:
+        data["registration_stats"] = registration_snapshot(
+            success=data["success"], failed=data["error_count"], result=result,
+            status=task.status, requested=progress_total, error=task.error,
+        )
+    return data
 
 
 def serialize_event(event: TaskEventModel) -> dict[str, Any]:
@@ -569,6 +577,7 @@ class TaskLogger:
         """
         self._tlocal.subtask_id = str(subtask_id or "")
         self._tlocal.subtask_label = str(label or "")
+        self._tlocal.registration_stage = "initialization"
 
     def clear_subtask(self) -> None:
         try:
@@ -579,6 +588,13 @@ class TaskLogger:
             del self._tlocal.subtask_label
         except AttributeError:
             pass
+        try:
+            del self._tlocal.registration_stage
+        except AttributeError:
+            pass
+
+    def get_registration_stage(self) -> str:
+        return normalize_registration_stage(getattr(self._tlocal, "registration_stage", "unknown"))
 
     def _current_subtask(self) -> tuple[str, str]:
         sid = getattr(self._tlocal, "subtask_id", "") or ""
@@ -588,6 +604,10 @@ class TaskLogger:
     def log(self, message: str, *, level: str = "info", event_type: str = "log", detail: dict | None = None) -> None:
         # 自动给当前线程绑定的 subtask 加 detail，用于前端按 worker 分组折叠
         merged_detail = dict(detail or {})
+        if "registration_stage" in merged_detail:
+            self._tlocal.registration_stage = normalize_registration_stage(merged_detail["registration_stage"])
+        else:
+            self._tlocal.registration_stage = observe_registration_stage(message, self.get_registration_stage())
         sid, slabel = self._current_subtask()
         if sid and "subtask_id" not in merged_detail:
             merged_detail["subtask_id"] = sid
@@ -626,7 +646,14 @@ class TaskLogger:
             return bool(task and task.status in {TASK_STATUS_CANCEL_REQUESTED, TASK_STATUS_CANCELLED})
 
     def register_cancel_callback(self, callback: Callable[[], None] | None) -> None:
-        register_task_cancel_callback(self.task_id, callback)
+        triggered = register_task_cancel_callback(self.task_id, callback)
+        # The task may have been cancelled after the registry was cleared by
+        # the dispatcher but before a late-starting worker finished creating
+        # its protocol session.  Re-check the persisted state so that such a
+        # worker still closes its session immediately instead of waiting for a
+        # request timeout.
+        if callable(callback) and not triggered and self.is_cancel_requested():
+            _invoke_cancel_callback(callback)
 
     def unregister_cancel_callback(self, callback: Callable[[], None] | None) -> None:
         unregister_task_cancel_callback(self.task_id, callback)
@@ -647,13 +674,21 @@ class TaskLogger:
 
         _mutate_task(self.task_id, _update)
 
-    def record_error(self, error: str) -> None:
+    def record_error(self, error: str, *, stage: str | None = None) -> None:
+        failure_stage = normalize_registration_stage(stage) if stage else observe_registration_stage(error, self.get_registration_stage())
+
         def _update(task: TaskModel) -> None:
+            if task.type == TASK_TYPE_REGISTER and task.status in {TASK_STATUS_CANCEL_REQUESTED, TASK_STATUS_CANCELLED}:
+                return
             task.error_count += 1
             result = task.get_result()
             errors = list(result.get("errors", []))
             errors.append(error)
             result["errors"] = errors
+            if task.type == TASK_TYPE_REGISTER:
+                stages = dict(result.get("failure_stages") or {})
+                stages[failure_stage] = int(stages.get(failure_stage, 0)) + 1
+                result["failure_stages"] = stages
             task.set_result(result)
 
         _mutate_task(self.task_id, _update)
@@ -680,14 +715,25 @@ class TaskLogger:
         def _update(task: TaskModel) -> None:
             # A worker that returns after the user has cancelled must not
             # overwrite the terminal cancelled state with succeeded/failed.
-            if task.status == TASK_STATUS_CANCELLED and status != TASK_STATUS_CANCELLED:
+            if (
+                task.status in {TASK_STATUS_CANCELLED, TASK_STATUS_CANCEL_REQUESTED}
+                and status != TASK_STATUS_CANCELLED
+            ):
                 return
             task.status = status
             task.finished_at = _utcnow()
             if error:
                 task.error = error
+            if task.type == TASK_TYPE_REGISTER and status == TASK_STATUS_FAILED and not task.success_count and not task.error_count:
+                result = task.get_result()
+                result["setup_failure_stage"] = observe_registration_stage(error, self.get_registration_stage())
+                task.set_result(result)
 
-        _mutate_task(self.task_id, _update)
+        updated = _mutate_task(self.task_id, _update)
+        if updated is not None and updated.status != status:
+            # Cancellation won the race.  Keep the terminal database state and
+            # do not append a misleading late "succeeded"/"failed" event.
+            return
         event_level = "error" if status == TASK_STATUS_FAILED else ("warning" if status in {TASK_STATUS_INTERRUPTED, TASK_STATUS_CANCELLED} else "info")
         self.log(
             f"任务结束: {status}",
@@ -830,6 +876,7 @@ def execute_task(task_id: str) -> None:
         logger.finish(TASK_STATUS_CANCELLED, error="任务在启动后立即被取消")
         if task_type == TASK_TYPE_REGISTER:
             clear_register_sub2api_upload_config(task_id)
+        if task_type in {TASK_TYPE_REGISTER, TASK_TYPE_LOGIN_REFRESH}:
             manual_otp_registry.clear_task(task_id)
         clear_task_cancel_callbacks(task_id)
         return
@@ -856,6 +903,7 @@ def execute_task(task_id: str) -> None:
     finally:
         if task_type == TASK_TYPE_REGISTER:
             clear_register_sub2api_upload_config(task_id)
+        if task_type in {TASK_TYPE_REGISTER, TASK_TYPE_LOGIN_REFRESH}:
             manual_otp_registry.clear_task(task_id)
         clear_task_cancel_callbacks(task_id)
 
@@ -980,7 +1028,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             )
             if logger.is_cancel_requested():
                 return "__cancel_requested__"
-            logger.log(f"开始注册第 {index + 1}/{count} 个账号")
+            logger.log(f"开始注册第 {index + 1}/{count} 个账号", detail={"registration_stage": "mailbox"})
             if resolved_proxy:
                 logger.log(f"使用代理: {resolved_proxy}")
             account = platform.register(email=email, password=password)
@@ -988,6 +1036,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             # cancel.  Never persist a late result after cancellation.
             if logger.is_cancel_requested():
                 return "__cancel_requested__"
+            logger.log("正在保存注册结果", event_type="stage", detail={"registration_stage": "persistence"})
             saved_account = save_account(account)
             saved_account_id = int(saved_account.id)
             if logger.is_cancel_requested():
@@ -1023,6 +1072,8 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 "email": account.email,
             }
         except Exception as exc:
+            if logger.is_cancel_requested():
+                return "__cancel_requested__"
             if resolved_proxy:
                 proxy_pool.report_fail(resolved_proxy)
             error = str(exc)
@@ -1036,10 +1087,15 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             }
             with failure_lock:
                 failed_accounts.append(failure_detail)
-            logger.record_error(error)
+            stage = normalize_registration_stage(getattr(exc, "registration_stage", ""))
+            if stage == "unknown":
+                current_stage = logger.get_registration_stage() if hasattr(logger, "get_registration_stage") else "unknown"
+                stage = observe_registration_stage(error, current_stage)
+            logger.record_error(error, stage=stage)
             logger.log(
                 f"注册失败: {failed_email + ' - ' if failed_email else ''}{error}",
                 level="error",
+                detail={"registration_stage": stage, "attempt": index + 1},
             )
             return error
         finally:

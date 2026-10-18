@@ -1,11 +1,18 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
+from application.registration_stats import RegistrationStatsService
 from application.tasks_query import TasksQueryService
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 service = TasksQueryService()
+stats_service = RegistrationStatsService()
+
+
+@router.get("/register/stats")
+def registration_statistics(platform: str = "chatgpt", days: int = Query(default=30, ge=0, le=3650)):
+    return stats_service.get_statistics(platform=platform, days=days)
 
 
 @router.get("/{task_id}")

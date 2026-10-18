@@ -5,6 +5,7 @@ import { useI18n } from '@/lib/i18n-context'
 import { Badge } from '@/components/ui/badge'
 import { Users, CheckCircle, Clock, XCircle, RefreshCw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { RegistrationAnalytics } from '@/components/registration/RegistrationAnalytics'
 
 const PLATFORM_COLORS: Record<string, string> = {
   trae: 'text-blue-400',
@@ -46,9 +47,9 @@ export default function Dashboard() {
 
   const statCards = [
     { label: t('dashboard.totalAccounts'), value: stats?.total ?? '-', icon: Users, color: 'text-[var(--text-accent)]' },
-    { label: t('dashboard.trial'), value: stats?.by_plan_state?.trial ?? 0, icon: Clock, color: 'text-amber-400' },
-    { label: t('dashboard.subscribed'), value: stats?.by_plan_state?.subscribed ?? 0, icon: CheckCircle, color: 'text-emerald-400' },
-    { label: t('dashboard.invalid'), value: (stats?.by_display_status?.expired ?? 0) + (stats?.by_validity_status?.invalid ?? 0), icon: XCircle, color: 'text-red-400' },
+    { label: t('dashboard.trial'), value: stats?.by_plan_state?.trial ?? 0, icon: Clock, color: 'text-[var(--status-warning)]' },
+    { label: t('dashboard.subscribed'), value: stats?.by_plan_state?.subscribed ?? 0, icon: CheckCircle, color: 'text-[var(--status-success)]' },
+    { label: t('dashboard.invalid'), value: (stats?.by_display_status?.expired ?? 0) + (stats?.by_validity_status?.invalid ?? 0), icon: XCircle, color: 'text-[var(--status-danger)]' },
   ]
   const platformEntries = Object.entries(stats?.by_platform || {})
   const totalCount = Math.max(Number(stats?.total || 0), 0)
@@ -74,9 +75,9 @@ export default function Dashboard() {
   return (
     <div className="dashboard-workspace" aria-busy={loading}>
       <div className="page-heading">
-        <h1>{t('nav.dashboard')}</h1>
-        <Button variant="outline" size="sm" onClick={load} disabled={loading}>
-          <RefreshCw className={`mr-2 h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />{t('common.refresh')}
+        <div><p className="page-eyebrow">{language === 'zh-CN' ? '工作台 / 01' : 'Workspace / 01'}</p><h1>{t('nav.dashboard')}</h1><p className="page-description">{language === 'zh-CN' ? '账号状态与注册表现，一处掌握。' : 'Account health and registration performance, together.'}</p></div>
+        <Button variant="outline" size="icon" onClick={load} disabled={loading} title={t('common.refresh')} aria-label={t('common.refresh')}>
+          <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
         </Button>
       </div>
       {error && <div className="inline-error mb-6" role="alert">{error}</div>}
@@ -85,16 +86,15 @@ export default function Dashboard() {
           <div key={label}>
             <div className="flex items-center justify-between gap-3">
               <div>
-                <p className="metric-label">{label}</p>
-                <p className="metric-value">{loading && !stats ? <span className="skeleton w-20 h-10" /> : value}</p>
-              </div>
-              <div className="flex h-9 w-9 items-center justify-center">
-                <Icon className={`h-4.5 w-4.5 ${color} opacity-90`} />
+                <p className="metric-label"><Icon size={15} />{label}</p>
+                <p className={`metric-value ${color}`}>{loading && !stats ? <span className="skeleton w-20 h-10" /> : value}</p>
               </div>
             </div>
           </div>
         ))}
       </div>
+
+      <RegistrationAnalytics />
 
       <div className="dashboard-layout">
       <section className="data-section">

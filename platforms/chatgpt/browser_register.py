@@ -3972,6 +3972,7 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, lo
             return _extract_flow_state(None, page.url)
 
         if _is_password_registration(state):
+            log("[registration:authorization] 设置注册密码")
             if register_submitted:
                 raise RuntimeError("重复进入密码注册阶段")
             log("提交注册密码...")
@@ -3992,6 +3993,7 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, lo
             continue
 
         if str(state.get("page_type") or "") == "login_password":
+            log("[registration:authorization] 登录认证")
             if _recover_signup_password_page(page, log):
                 state = _derive_registration_state_from_page(page)
                 continue
@@ -4006,6 +4008,7 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, lo
             continue
 
         if _is_email_otp(state):
+            log("[registration:verification] 邮箱验证")
             if not otp_callback:
                 raise RuntimeError("ChatGPT 注册需要邮箱验证码但未提供 otp_callback")
             if not _wait_for_visible_otp_input(page, timeout=15):
@@ -4040,6 +4043,7 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, lo
             continue
 
         if _is_about_you(state):
+            log("[registration:profile] 创建账号资料")
             log("提交 about_you 信息...")
             target_url = _normalize_url(
                 str(state.get("current_url") or state.get("continue_url") or f"{OPENAI_AUTH}/about-you"),
@@ -4144,6 +4148,7 @@ class ChatGPTBrowserRegister:
                 launch_opts["proxy"] = proxy
                 launch_opts["geoip"] = True
 
+        self.log("[registration:initialization] 初始化浏览器")
         with self._open_browser(launch_opts) as browser:
             with self._active_lock:
                 self._active_browser = browser
@@ -4172,6 +4177,7 @@ class ChatGPTBrowserRegister:
             else:
                 capture_registration_otp = None
 
+            self.log("[registration:authorization] 连接与认证")
             final_state = _browser_registration_flow(
                 page,
                 email,
@@ -4183,6 +4189,7 @@ class ChatGPTBrowserRegister:
             if registration_email_codes:
                 self.log("已记录注册阶段邮箱验证码，re-auth 将强制等待新的邮箱验证码")
 
+            self.log("[registration:credentials] 获取注册凭据")
             pre_security_session_info = None
             if self.setup_security:
                 try:
@@ -4201,6 +4208,7 @@ class ChatGPTBrowserRegister:
             if self.setup_security:
                 # 原步骤 7、8 完成后，先执行用户脚本中的 TOTP -> 密码安全设置。
                 self.log("步骤 9: 设置密码+2FA")
+                self.log("[registration:security] 安全设置")
                 security_setup_error = ""
                 try:
                     security_info = _setup_chatgpt_password_and_totp(
@@ -4245,6 +4253,7 @@ class ChatGPTBrowserRegister:
 
             # 原步骤 9：获取 session token 和 cookies（插入安全设置后顺延为步骤 10）。
             self.log("步骤 10: 获取 session")
+            self.log("[registration:credentials] 获取最终凭据")
             cookies_dict = {}
             try:
                 cookies_dict = _get_cookies(page)

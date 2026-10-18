@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import secrets
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from typing import Any
 
@@ -21,6 +21,7 @@ from application.login_refresh_types import (
 )
 from application.manual_otp import ManualOtpHandle, manual_otp_registry
 from application.tasks import (
+    TASK_STATUS_CANCELLED,
     TASK_STATUS_FAILED,
     TASK_STATUS_RUNNING,
     TASK_STATUS_SUCCEEDED,
@@ -34,7 +35,12 @@ from core.db import AccountCredentialModel, AccountModel, AccountOverviewModel, 
 from core.platform_accounts import resolve_primary_token
 from core.workbench_api_mailbox import WorkbenchApiRebuiltMailbox
 from platforms.chatgpt.login_client import EmailOtpResolver, login_chatgpt_web, mask_email
-from platforms.chatgpt.login_types import ChatGPTLoginResult, SecuritySetupResult
+from platforms.chatgpt.login_types import (
+    ChatGPTLoginError,
+    ChatGPTLoginResult,
+    LoginErrorCode,
+    SecuritySetupResult,
+)
 
 
 def _has_email_otp_source(graph: dict[str, Any]) -> bool:
@@ -75,6 +81,7 @@ def _build_email_otp_resolver_from_graph(
     manual_handle: Any,
     email_otp_mode: str,
     log: Any,
+    cancel_check: Any = None,
 ) -> EmailOtpResolver | None:
     """从账号图构建邮箱 OTP resolver。
 
@@ -119,6 +126,7 @@ def _build_email_otp_resolver_from_graph(
             manual_handle=manual_handle,
             mode=email_otp_mode,
             log=log,
+            cancel_check=cancel_check,
         )
     elif email_otp_mode in ["auto", "auto_then_manual"]:
         # 自动或自动+手动模式
@@ -127,6 +135,7 @@ def _build_email_otp_resolver_from_graph(
             manual_handle=manual_handle if email_otp_mode == "auto_then_manual" else None,
             mode=email_otp_mode,
             log=log,
+            cancel_check=cancel_check,
         )
 
     return None
@@ -341,8 +350,6 @@ def create_login_refresh_task(
         "email_otp_mode": email_otp_mode,
     }
 
-    from application.tasks import create_task
-
     task_dict = create_task(
         task_type=TASK_TYPE_LOGIN_REFRESH,
         platform=platform,
@@ -356,13 +363,20 @@ def create_login_refresh_task(
 def _execute_login_refresh_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     """刷新登录任务执行器；由 TaskRuntime 调用。"""
     platform = payload.get("platform", "")
-    account_ids: list[int] = payload.get("account_ids", [])
+    account_ids: list[int] = [
+        int(account_id)
+        for account_id in (payload.get("account_ids", []) or [])
+        if str(account_id).strip().isdigit() and int(account_id) > 0
+    ]
     proxy = payload.get("proxy", "")
     concurrency = int(payload.get("concurrency", 1) or 1)
     setup_security = bool(payload.get("setup_security", False))
     email_otp_mode = payload.get("email_otp_mode", "auto_then_manual")
 
     logger.mark_running()
+    if logger.is_cancel_requested():
+        logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
+        return
     logger.log(f"平台={platform}，账号数={len(account_ids)}，并发={concurrency}")
 
     results: list[LoginRefreshAccountResult] = []
@@ -371,12 +385,24 @@ def _execute_login_refresh_task(payload: dict[str, Any], logger: TaskLogger) -> 
     security_setup_completed = 0
     security_setup_partial = 0
 
+    def cancelled_result(account_id: int) -> LoginRefreshAccountResult:
+        return LoginRefreshAccountResult(
+            account_id=account_id,
+            email="",
+            status="cancelled",
+            error_code="CANCELLED",
+            error_message="任务已取消",
+        )
+
     def refresh_one(index: int, account_id: int) -> LoginRefreshAccountResult:
-        nonlocal succeeded, failed, security_setup_completed, security_setup_partial
+        if logger.is_cancel_requested():
+            return cancelled_result(account_id)
         logger.log(f"开始刷新登录第 {index + 1}/{len(account_ids)} 个账号：account_id={account_id}")
 
         try:
             with account_lock_registry.acquire(account_id):
+                if logger.is_cancel_requested():
+                    return cancelled_result(account_id)
                 result = _refresh_single_account(
                     account_id=account_id,
                     platform=platform,
@@ -385,23 +411,9 @@ def _execute_login_refresh_task(payload: dict[str, Any], logger: TaskLogger) -> 
                     email_otp_mode=email_otp_mode,
                     logger=logger,
                 )
-
-                if result.status == "succeeded":
-                    succeeded += 1
-                    logger.set_progress(succeeded + failed)
-                    if result.security_setup_status == "completed":
-                        security_setup_completed += 1
-                    elif result.security_setup_status == "partial":
-                        security_setup_partial += 1
-                else:
-                    failed += 1
-                    logger.set_progress(succeeded + failed)
-
                 return result
         except AccountLockBusyError as e:
             logger.log(f"账号 {account_id} 被其他任务占用，跳过", level="warning")
-            failed += 1
-            logger.set_progress(succeeded + failed)
             return LoginRefreshAccountResult(
                 account_id=account_id,
                 email="",
@@ -409,10 +421,21 @@ def _execute_login_refresh_task(payload: dict[str, Any], logger: TaskLogger) -> 
                 error_code="ACCOUNT_LOCKED",
                 error_message=str(e),
             )
-        except Exception as e:
+        except ChatGPTLoginError as e:
+            if e.code == LoginErrorCode.CANCELLED or logger.is_cancel_requested():
+                return cancelled_result(account_id)
             logger.log(f"账号 {account_id} 刷新失败：{e}", level="error")
-            failed += 1
-            logger.set_progress(succeeded + failed)
+            return LoginRefreshAccountResult(
+                account_id=account_id,
+                email="",
+                status="failed",
+                error_code=str(e.code or LoginErrorCode.NETWORK_TIMEOUT),
+                error_message=e.message or str(e),
+            )
+        except Exception as e:
+            if logger.is_cancel_requested():
+                return cancelled_result(account_id)
+            logger.log(f"账号 {account_id} 刷新失败：{e}", level="error")
             return LoginRefreshAccountResult(
                 account_id=account_id,
                 email="",
@@ -421,20 +444,92 @@ def _execute_login_refresh_task(payload: dict[str, Any], logger: TaskLogger) -> 
                 error_message=str(e),
             )
 
+    completed = 0
+    cancelled = False
+
+    def consume_result(result: LoginRefreshAccountResult) -> None:
+        nonlocal completed, cancelled, succeeded, failed
+        nonlocal security_setup_completed, security_setup_partial
+        if result.status == "cancelled":
+            cancelled = True
+            return
+        results.append(result)
+        completed += 1
+        if result.status == "succeeded":
+            succeeded += 1
+            if result.security_setup_status == "completed":
+                security_setup_completed += 1
+            elif result.security_setup_status == "partial":
+                security_setup_partial += 1
+        else:
+            failed += 1
+        # Keep the original one-argument logger contract; the task row already
+        # carries ``progress_total`` from create_login_refresh_task().
+        logger.set_progress(completed)
+        if logger.is_cancel_requested():
+            cancelled = True
+
     if concurrency == 1:
         for i, aid in enumerate(account_ids):
             if logger.is_cancel_requested():
-                logger.log("任务已取消")
+                cancelled = True
                 break
-            results.append(refresh_one(i, aid))
+            result = refresh_one(i, aid)
+            consume_result(result)
+            if cancelled:
+                break
     else:
-        with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures = {executor.submit(refresh_one, i, aid): aid for i, aid in enumerate(account_ids)}
-            for future in as_completed(futures):
-                if logger.is_cancel_requested():
-                    logger.log("任务已取消")
+        executor = ThreadPoolExecutor(max_workers=concurrency)
+        futures = {
+            executor.submit(refresh_one, i, aid): aid
+            for i, aid in enumerate(account_ids)
+        }
+        pending = set(futures)
+        try:
+            while pending:
+                done, pending = wait(
+                    pending,
+                    timeout=0.1,
+                    return_when=FIRST_COMPLETED,
+                )
+                cancel_requested = logger.is_cancel_requested()
+                for future in done:
+                    try:
+                        result = future.result()
+                    except ChatGPTLoginError as exc:
+                        account_id = futures.get(future, 0)
+                        if exc.code == LoginErrorCode.CANCELLED or logger.is_cancel_requested():
+                            result = cancelled_result(int(account_id or 0))
+                        else:
+                            result = LoginRefreshAccountResult(
+                                account_id=int(account_id or 0),
+                                email="",
+                                status="failed",
+                                error_code=str(exc.code or LoginErrorCode.NETWORK_TIMEOUT),
+                                error_message=exc.message or str(exc),
+                            )
+                    except Exception as exc:
+                        account_id = futures.get(future, 0)
+                        result = LoginRefreshAccountResult(
+                            account_id=int(account_id or 0),
+                            email="",
+                            status="failed",
+                            error_code="UNKNOWN_ERROR",
+                            error_message=str(exc),
+                        )
+                    consume_result(result)
+                if cancel_requested or cancelled:
+                    cancelled = True
+                    for remaining in pending:
+                        remaining.cancel()
                     break
-                results.append(future.result())
+        finally:
+            # A cancelled refresh must return control to the task runtime even
+            # when one account is still unwinding a network/OTP operation.
+            executor.shutdown(wait=not cancelled, cancel_futures=True)
+
+    if logger.is_cancel_requested():
+        cancelled = True
 
     task_result = LoginRefreshTaskResult(
         platform=platform,
@@ -466,6 +561,11 @@ def _execute_login_refresh_task(payload: dict[str, Any], logger: TaskLogger) -> 
             ],
         }
     )
+
+    if cancelled:
+        logger.log("任务已取消", level="warning")
+        logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
+        return
 
     if failed == 0:
         logger.finish(TASK_STATUS_SUCCEEDED)
@@ -545,14 +645,24 @@ def _refresh_single_account(
             manual_handle=manual_otp_handle,
             email_otp_mode=email_otp_mode,
             log=logger.log,
+            cancel_check=logger.is_cancel_requested,
         )
 
         # 构建手动 TOTP 处理器（当账号无保存的 TOTP 时使用）
         manual_totp_handle = manual_otp_handle if not has_totp else None
 
         try:
+            if logger.is_cancel_requested():
+                return LoginRefreshAccountResult(
+                    account_id=account_id,
+                    email=mask_email(account.email),
+                    status="cancelled",
+                    error_code=LoginErrorCode.CANCELLED,
+                    error_message="任务已取消",
+                )
             # 主登录流程
             logger.log("开始 ChatGPT 登录")
+            register_cancel_callback = getattr(logger, "register_cancel_callback", None)
             login_result = login_chatgpt_web(
                 email=account.email,
                 password=password,
@@ -561,7 +671,22 @@ def _refresh_single_account(
                 otp_resolver=otp_resolver,
                 manual_totp_handle=manual_totp_handle,
                 log=logger.log,
+                cancel_check=logger.is_cancel_requested,
+                register_cancel_callback=(
+                    register_cancel_callback
+                    if callable(register_cancel_callback)
+                    else None
+                ),
             )
+
+            if logger.is_cancel_requested():
+                return LoginRefreshAccountResult(
+                    account_id=account_id,
+                    email=mask_email(account.email),
+                    status="cancelled",
+                    error_code=LoginErrorCode.CANCELLED,
+                    error_message="任务已取消",
+                )
 
             logger.log(
                 f"登录成功：method={login_result.login_method}, "
@@ -575,6 +700,14 @@ def _refresh_single_account(
             new_password_plaintext = ""
 
             if setup_security:
+                if logger.is_cancel_requested():
+                    return LoginRefreshAccountResult(
+                        account_id=account_id,
+                        email=mask_email(account.email),
+                        status="cancelled",
+                        error_code=LoginErrorCode.CANCELLED,
+                        error_message="任务已取消",
+                    )
                 logger.log(f"开始安全设置：has_password={has_password}, has_totp={has_totp}")
 
                 # 调用 ensure_security
@@ -605,6 +738,14 @@ def _refresh_single_account(
                 )
 
             # 持久化凭据
+            if logger.is_cancel_requested():
+                return LoginRefreshAccountResult(
+                    account_id=account_id,
+                    email=mask_email(account.email),
+                    status="cancelled",
+                    error_code=LoginErrorCode.CANCELLED,
+                    error_message="任务已取消",
+                )
             logger.log("保存新的 ChatGPT 登录凭据")
             _persist_credentials(
                 account_id=account_id,
@@ -632,7 +773,34 @@ def _refresh_single_account(
                 totp_created=totp_created,
             )
 
+        except ChatGPTLoginError as e:
+            if e.code == LoginErrorCode.CANCELLED or logger.is_cancel_requested():
+                logger.log("登录已取消", level="warning")
+                return LoginRefreshAccountResult(
+                    account_id=account_id,
+                    email=mask_email(account.email),
+                    status="cancelled",
+                    error_code=LoginErrorCode.CANCELLED,
+                    error_message="任务已取消",
+                )
+            logger.log(f"登录失败：{e}", level="error")
+            return LoginRefreshAccountResult(
+                account_id=account_id,
+                email=mask_email(account.email),
+                status="failed",
+                error_code=str(e.code or LoginErrorCode.NETWORK_TIMEOUT),
+                error_message=e.message or str(e),
+            )
         except Exception as e:
+            if logger.is_cancel_requested():
+                logger.log("登录已取消", level="warning")
+                return LoginRefreshAccountResult(
+                    account_id=account_id,
+                    email=mask_email(account.email),
+                    status="cancelled",
+                    error_code=LoginErrorCode.CANCELLED,
+                    error_message="任务已取消",
+                )
             logger.log(f"登录失败：{e}", level="error")
             return LoginRefreshAccountResult(
                 account_id=account_id,
@@ -641,6 +809,13 @@ def _refresh_single_account(
                 error_code="LOGIN_FAILED",
                 error_message=str(e),
             )
+        finally:
+            close_resolver = getattr(otp_resolver, "close", None)
+            if callable(close_resolver):
+                try:
+                    close_resolver()
+                except Exception:
+                    pass
 
 
 def _persist_credentials(

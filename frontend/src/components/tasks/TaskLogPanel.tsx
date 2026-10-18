@@ -8,6 +8,8 @@ import {
   isTerminalTaskStatus,
 } from "@/lib/tasks";
 import { useI18n } from "@/lib/i18n-context";
+import { RegistrationCharts } from "@/components/registration/RegistrationCharts";
+import { taskRegistrationStatistics } from "@/lib/registration-stats";
 
 /**
  * 单条日志事件。`subtaskId` 来自后端 ``serialize_event(...).detail.subtask_id``——
@@ -37,6 +39,8 @@ type OtpRequest = {
 
 const MAIN_GROUP_ID = "__main__";
 
+export type TaskProgress = { status: string; current: number; total: number; success?: number; failed?: number; registration?: boolean };
+
 function classifyLine(line: string): string {
   if (line.includes("✓") || line.includes("成功")) return "text-[var(--status-success)]";
   if (line.includes("✗") || line.includes("失败") || line.includes("错误"))
@@ -47,9 +51,11 @@ function classifyLine(line: string): string {
 export function TaskLogPanel({
   taskId,
   onDone,
+  onProgress,
 }: {
   taskId: string;
   onDone: (status: string) => void;
+  onProgress?: (progress: TaskProgress) => void;
 }) {
   const { t, language } = useI18n();
   const [events, setEvents] = useState<LogEvent[]>([]);
@@ -67,12 +73,15 @@ export function TaskLogPanel({
   const cursorRef = useRef(0);
   const doneRef = useRef(false);
   const onDoneRef = useRef(onDone);
+  const onProgressRef = useRef(onProgress);
+  const progressRef = useRef<TaskProgress>({ status: 'pending', current: 0, total: 0 });
   const sseHealthyRef = useRef(false);
   const eventSourceRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
     onDoneRef.current = onDone;
-  }, [onDone]);
+    onProgressRef.current = onProgress;
+  }, [onDone, onProgress]);
 
   const completeTask = useCallback((status: string) => {
     if (doneRef.current) return;
@@ -81,6 +90,8 @@ export function TaskLogPanel({
     eventSourceRef.current?.close();
     eventSourceRef.current = null;
     setDoneStatus(status);
+    progressRef.current = { ...progressRef.current, status };
+    onProgressRef.current?.(progressRef.current);
     setOtpRequests([]);
     onDoneRef.current(status);
   }, []);
@@ -88,6 +99,7 @@ export function TaskLogPanel({
   useEffect(() => {
     if (!taskId) return;
     let disposed = false;
+    let taskSyncSequence = 0;
     seenEventIdsRef.current = new Set();
     cursorRef.current = 0;
     doneRef.current = false;
@@ -104,6 +116,7 @@ export function TaskLogPanel({
     setCollapsed({});
 
     const pushEvent = (payload: any) => {
+      if (disposed) return;
       const eventId = Number(payload?.id || 0);
       if (eventId && seenEventIdsRef.current.has(eventId)) return;
       if (eventId) {
@@ -125,15 +138,28 @@ export function TaskLogPanel({
       if (payload?.done && !doneRef.current) {
         const nextStatus = payload.status || "succeeded";
         completeTask(nextStatus);
+        // SSE completion can arrive before the last progress poll. Fetch the
+        // persisted final counts once even after polling has stopped.
+        syncTask().catch(() => {});
       }
     };
 
     const syncTask = async () => {
+      const sequence = ++taskSyncSequence;
       const latest = await apiFetch(`/tasks/${taskId}`);
-      if (disposed) return;
+      if (disposed || sequence !== taskSyncSequence) return;
       setTask(latest);
+      progressRef.current = {
+        status: latest.status,
+        current: Number(latest.progress_detail?.current || 0),
+        total: Number(latest.progress_detail?.total || 0),
+        success: Number(latest.success || 0),
+        failed: Number(latest.error_count || 0),
+        registration: latest.type === 'register',
+      };
+      onProgressRef.current?.(progressRef.current);
       if (isTerminalTaskStatus(latest.status) && !doneRef.current) {
-        pushEvent({ done: true, status: latest.status });
+        completeTask(latest.status);
       }
     };
 
@@ -259,6 +285,7 @@ export function TaskLogPanel({
     isCancellableTaskStatus(currentStatus) &&
     currentStatus !== "cancel_requested";
   const progress = task?.progress_detail || {};
+  const registrationStatistics = taskRegistrationStatistics(task);
   const progressTotal = Number(progress.total || 0);
   const progressCurrent = Number(progress.current || 0);
   const progressPercent =
@@ -355,6 +382,8 @@ export function TaskLogPanel({
           </div>
         </div>
       </div>
+
+      {registrationStatistics && <div className="task-registration-statistics"><div className="task-registration-title">{language === 'zh-CN' ? '本批次注册统计' : 'This batch'}<span>{getTaskStatusText(currentStatus, language)}</span></div><RegistrationCharts statistics={registrationStatistics} compact /></div>}
 
       <div className="progress-track" role="progressbar" aria-label={t("taskLog.progress")} aria-valuenow={progressPercent} aria-valuemin={0} aria-valuemax={100}>
         <div
