@@ -4,12 +4,13 @@ import { useI18n } from '@/lib/i18n-context'
 import { getTaskStatusText } from '@/lib/tasks'
 import { TaskLogPanel, type TaskProgress } from './TaskLogPanel'
 
-export function TaskDock({ task, onDone }: {
+export function TaskDock({ task, onDone, initialExpanded = false }: {
   task: { taskId: string; title: string } | null
   onDone: (status: string) => void
+  initialExpanded?: boolean
 }) {
   const { language, t } = useI18n()
-  const [expanded, setExpanded] = useState(false)
+  const [expanded, setExpanded] = useState(initialExpanded)
   const [progress, setProgress] = useState<TaskProgress | null>(null)
   const percent = progress && progress.total > 0
     ? Math.min(100, Math.max(0, progress.current / progress.total * 100)) : 0

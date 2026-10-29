@@ -142,6 +142,8 @@ def login_refresh_create(req: LoginRefreshCreateRequest):
             setup_security=req.setup_security,
             email_otp_mode=req.email_otp_mode,
         )
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:

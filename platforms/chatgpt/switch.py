@@ -7,6 +7,8 @@ from typing import Optional
 
 from curl_cffi import requests as curl_requests
 
+from platforms.chatgpt.query_auth import read_profile_response
+
 logger = logging.getLogger(__name__)
 
 
@@ -67,8 +69,8 @@ def _fetch_profile(
     session_cookies = _parse_cookie_header(cookies)
     last_error: dict = {}
 
-    # A current browser session is the native authentication mechanism for
-    # this endpoint. Do not mix it with a Bearer token in the same request.
+    # A cookie-only request can return HTTP 200 with an anonymous visitor's
+    # profile. Verify the identity before accepting it or skipping Bearer auth.
     if session_cookies:
         try:
             response = curl_requests.get(
@@ -79,9 +81,10 @@ def _fetch_profile(
                 timeout=20,
                 impersonate="chrome124",
             )
-            if response.status_code == 200:
-                return True, response.json(), "cookies"
-            last_error = {"status_code": response.status_code, "body": response.text[:400]}
+            ok, profile = read_profile_response(response)
+            if ok:
+                return True, profile, "cookies"
+            last_error = profile
         except Exception as exc:
             last_error = {"error": str(exc)}
 
@@ -94,9 +97,10 @@ def _fetch_profile(
                 timeout=20,
                 impersonate="chrome124",
             )
-            if response.status_code == 200:
-                return True, response.json(), "access_token"
-            last_error = {"status_code": response.status_code, "body": response.text[:400]}
+            ok, profile = read_profile_response(response)
+            if ok:
+                return True, profile, "access_token"
+            last_error = profile
         except Exception as exc:
             last_error = {"error": str(exc)}
 
@@ -167,7 +171,7 @@ def fetch_chatgpt_account_state(
             if include_trial:
                 state["plus_trial_eligible"] = None
                 state["plus_trial_check_state"] = "unavailable"
-                state["plus_trial_error"] = "账号 profile 查询失败，无法查询 Plus 试用资格"
+                state["plus_trial_error"] = profile.get("error") or "账号 profile 查询失败，无法查询 Plus 试用资格"
     else:
         state["valid"] = False
         state["profile_error"] = "缺少 access_token，且无法通过 session_token 刷新"

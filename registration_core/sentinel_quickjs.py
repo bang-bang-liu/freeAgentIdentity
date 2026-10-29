@@ -328,6 +328,11 @@ def get_sentinel_token_bundle_via_quickjs(
         )
         return {"token": token, "so_token": so_token}
     except Exception as e:
+        if callable(getattr(session, "check_budget", None)):
+            session.check()
+            from .auth_errors import AuthFlowError
+            if isinstance(e, AuthFlowError):
+                raise
         log(f"Sentinel QuickJS ??: {e}")
         return None
 

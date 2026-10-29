@@ -24,6 +24,9 @@ jobs:
       - name: Install Python deps
         run: pip install -r requirements.txt
 
+      - name: Install login challenge runtime
+        run: npm ci --omit=dev --prefix registration_core/cloudflare
+
       - name: Install Playwright browsers
         run: playwright install chromium
 
@@ -42,11 +45,13 @@ jobs:
           pip install pyinstaller
           pyinstaller --onedir --name backend \
             --add-data "platforms:platforms" \
+            --add-data "registration_core:registration_core" \
             --add-data "core:core" \
             --add-data "api:api" \
             --add-data "services:services" \
             --add-data "static:static" \
             --collect-all browserforge \
+            --collect-all playwright \
             --collect-all camoufox \
             --collect-all apify_fingerprint_datapoints \
             --collect-all language_tags \
@@ -104,6 +109,9 @@ jobs:
       - name: Install Python deps
         run: pip install -r requirements.txt
 
+      - name: Install login challenge runtime
+        run: npm ci --omit=dev --prefix registration_core/cloudflare
+
       - name: Build frontend
         run: cd frontend && npm ci --legacy-peer-deps && npm run build
 
@@ -121,11 +129,13 @@ jobs:
           pip install pyinstaller
           pyinstaller --onedir --name backend `
             --add-data "platforms;platforms" `
+            --add-data "registration_core;registration_core" `
             --add-data "core;core" `
             --add-data "api;api" `
             --add-data "services;services" `
             --add-data "static;static" `
             --collect-all browserforge `
+            --collect-all playwright `
             --collect-all camoufox `
             --collect-all apify_fingerprint_datapoints `
             --collect-all language_tags `

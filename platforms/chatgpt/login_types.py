@@ -24,6 +24,13 @@ class LoginErrorCode:
     PLATFORM_UNSUPPORTED = "PLATFORM_UNSUPPORTED"
     MISSING_EMAIL = "MISSING_EMAIL"
     INVALID_PASSWORD = "INVALID_PASSWORD"
+    CREDENTIAL_REVOKED = "CREDENTIAL_REVOKED"
+    CREDENTIAL_INVALID = "CREDENTIAL_INVALID"
+    ANONYMOUS_PROFILE = "ANONYMOUS_PROFILE"
+    IDENTITY_MISMATCH = "IDENTITY_MISMATCH"
+    API_RESPONSE_INVALID = "API_RESPONSE_INVALID"
+    AUTH_SESSION_INVALID = "AUTH_SESSION_INVALID"
+    NETWORK_ERROR = "NETWORK_ERROR"
     MFA_REQUIRED = "MFA_REQUIRED"
     MFA_INVALID = "MFA_INVALID"
     EMAIL_OTP_INVALID = "EMAIL_OTP_INVALID"
@@ -94,9 +101,12 @@ class ChatGPTLoginResult:
     account_id: str = ""
     login_method: str = ""
     access_token_expires_at: str = ""
+    token_verified: bool = False
+    verified_email: str = ""
+    verified_user_id: str = ""
 
     def is_valid(self) -> bool:
-        return bool(self.access_token)
+        return bool(self.access_token and self.token_verified and self.verified_user_id)
 
     def credential_updates(self) -> dict[str, str]:
         """返回可直接交给 ``patch_account_graph(credential_updates=...)`` 的字典。
@@ -112,6 +122,8 @@ class ChatGPTLoginResult:
             "cookies": self.cookie_header,
             "auth_session_json": self.auth_session_json,
             "device_id": self.device_id,
+            "account_id": self.account_id,
+            "access_token_expires_at": self.access_token_expires_at,
         }
         return {key: value for key, value in candidates.items() if str(value or "").strip()}
 
@@ -124,6 +136,7 @@ class ChatGPTLoginResult:
             "login_method": self.login_method,
             "access_token_expires_at": self.access_token_expires_at,
             "account_id_present": bool(self.account_id),
+            "token_verified": self.token_verified,
         }
 
 

@@ -14,11 +14,12 @@ import { TaskLogPanel } from '@/components/tasks/TaskLogPanel'
 import { TaskDock } from '@/components/tasks/TaskDock'
 import { RegistrationStatsDialog } from '@/components/registration/RegistrationStatsDialog'
 import { AccountAvatar, accountHealth } from '@/components/accounts/AccountAvatar'
+import { LoginRefreshMenu } from '@/components/accounts/LoginRefreshMenu'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { getTaskStatusText, TASK_STATUS_VARIANTS } from '@/lib/tasks'
-import { RefreshCw, Copy, Download, Upload, Plus, X, Mail, Trash2, UserCheck, FlaskConical, Crown, Clock, CircleX, Sparkles, BadgeCheck, Gift, Circle, ChevronLeft, ChevronRight, LogIn, Users, Inbox, Rows3, List, Eye, KeyRound, MoreHorizontal, LayoutGrid, Table2 } from 'lucide-react'
+import { RefreshCw, Copy, Download, Upload, Plus, X, Mail, Trash2, UserCheck, FlaskConical, Crown, Clock, CircleX, Sparkles, BadgeCheck, Gift, Circle, ChevronLeft, ChevronRight, Users, Inbox, Rows3, List, Eye, KeyRound, MoreHorizontal, LayoutGrid, Table2 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 
 const STATUS_VARIANT: Record<string, any> = {
@@ -212,12 +213,15 @@ function getSecondaryMetrics(acc: any) {
 
 function getDisplayWarnings(acc: any) {
   const warnings = getDisplaySummary(acc)?.warnings
-  return Array.isArray(warnings) ? warnings : []
+  const items = Array.isArray(warnings) ? warnings : []
+  const overview = getAccountOverview(acc)
+  return overview.login_required ? [...items, { key: 'login_required', tone: 'warning', message: `需要重新登录：${overview.check_error || overview.auth?.last_login_error || '登录凭据尚未验证'}` }] : items
 }
 
 function getDisplayBadges(acc: any) {
   const badges = getDisplaySummary(acc)?.badges
-  return Array.isArray(badges) ? badges : []
+  const items = Array.isArray(badges) ? badges : []
+  return getAccountOverview(acc).login_required ? [...items, { label: '需要重新登录' }] : items
 }
 
 function getDisplaySections(acc: any) {
@@ -1458,12 +1462,14 @@ function ActionParamsModal({
 // ── 行操作菜单 ─────────────────────────────────────────────
 function ActionMenu({
   acc,
+  layout = 'row',
   onDetail,
   onDelete,
   onResult,
   onChanged,
 }: {
   acc: any
+  layout?: 'row' | 'card'
   onDetail: () => void
   onDelete: () => void
   onResult: (title: string, payload: any) => void
@@ -1637,8 +1643,13 @@ function ActionMenu({
     }
   }
 
+  const loginControl = acc.platform === 'chatgpt' && <LoginRefreshMenu
+    total={1} statusFilter="" searchFilter="" selectedIds={[acc.id]} singleAccount={acc}
+    onTaskCreated={(taskId, title) => { setActionTaskStatus(null); setActionTask({ taskId, title }) }}
+  />
+
   return (
-    <div className="relative flex w-full min-w-0 flex-wrap items-center justify-end gap-0.5 whitespace-nowrap">
+    <div className={layout === 'card' ? 'account-actions-card' : 'relative flex w-full min-w-0 flex-wrap items-center justify-end gap-0.5 whitespace-nowrap'}>
       {toast && (
         <div
           className="fixed top-5 right-5 z-[70] flex items-center gap-2.5 rounded-xl border px-4 py-3 text-[13px] font-medium shadow-lg  cursor-pointer transition-all"
@@ -1680,72 +1691,78 @@ function ActionMenu({
           }}
         />
       )}
-      <button
-        type="button"
-        onClick={() => { void copyAccessToken() }}
-        className="table-action-btn"
-        title="复制 access_token"
-        aria-label={`复制 ${acc.email} 的 access_token`}
-      >
-        <KeyRound size={14} />
-      </button>
-      <button onClick={onDetail} className="table-action-btn" title="账号详情" aria-label={`查看 ${acc.email} 的详情`}><Eye size={14} /></button>
-      {actions.some(action => action.id === 'rebind_email') && (
+      {layout === 'card' && loginControl}
+      <div className={layout === 'card' ? 'account-actions-tools' : 'contents'}>
         <button
-          onClick={() => startAction(actions.find(action => action.id === 'rebind_email'))}
-          disabled={!!running}
+          type="button"
+          onClick={() => { void copyAccessToken() }}
           className="table-action-btn"
-          title="换绑邮箱"
+          title="复制 access_token"
+          aria-label={`复制 ${acc.email} 的 access_token`}
         >
-          {running === 'rebind_email' ? '换绑中...' : '换绑'}
+          <KeyRound size={14} />
         </button>
-      )}
-      {actions.length > 0 && (
-        <div className="relative">
-          <button ref={triggerRef} onClick={() => setOpen(o => !o)}
-            className="table-action-btn" title="更多操作" aria-label="更多操作" aria-expanded={open}><MoreHorizontal size={14} /></button>
-          {open && typeof document !== 'undefined' && createPortal(
-            <div
-              ref={menuRef}
-              className="fixed z-[60] w-[220px] overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--bg-card)]/96 py-1.5 shadow-[var(--shadow-soft)] "
-              style={{ top: menuPosition.top, left: menuPosition.left, maxHeight: menuPosition.maxHeight }}
-            >
-              {actions.map(a => (
-                <button key={a.id}
+        <button onClick={onDetail} className="table-action-btn" title="账号详情" aria-label={`查看 ${acc.email} 的详情`}><Eye size={14} /></button>
+        {layout === 'row' && loginControl}
+        {actions.some(action => action.id === 'rebind_email') && (
+          <button
+            onClick={() => startAction(actions.find(action => action.id === 'rebind_email'))}
+            disabled={!!running}
+            className="table-action-btn"
+            title="换绑邮箱"
+          >
+            {running === 'rebind_email'
+              ? layout === 'card' ? <RefreshCw size={14} className="animate-spin" aria-label="换绑中..." /> : '换绑中...'
+              : '换绑'}
+          </button>
+        )}
+        {actions.length > 0 && (
+          <div className="relative">
+            <button ref={triggerRef} onClick={() => setOpen(o => !o)}
+              className="table-action-btn" title="更多操作" aria-label="更多操作" aria-expanded={open}><MoreHorizontal size={14} /></button>
+            {open && typeof document !== 'undefined' && createPortal(
+              <div
+                ref={menuRef}
+                className="fixed z-[60] w-[220px] overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--bg-card)]/96 py-1.5 shadow-[var(--shadow-soft)] "
+                style={{ top: menuPosition.top, left: menuPosition.left, maxHeight: menuPosition.maxHeight }}
+              >
+                {actions.map(a => (
+                  <button key={a.id}
+                    onClick={() => {
+                      setOpen(false)
+                      startAction(a)
+                    }}
+                    disabled={!!running}
+                    className="w-full px-3 py-2 text-left text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] disabled:opacity-50">
+                    {running === a.id ? '执行中...' : a.label}
+                  </button>
+                ))}
+                <div className="my-1 border-t border-[var(--border)]/70" />
+                <button
                   onClick={() => {
                     setOpen(false)
-                    startAction(a)
+                    if (confirm(`确认删除 ${acc.email}？`)) {
+                      apiFetch(`/accounts/${acc.id}`, { method: 'DELETE' }).then(onDelete)
+                    }
                   }}
-                  disabled={!!running}
-                  className="w-full px-3 py-2 text-left text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] disabled:opacity-50">
-                  {running === a.id ? '执行中...' : a.label}
+                  className="w-full px-3 py-2 text-left text-xs text-[#f0b0b0] transition-colors hover:bg-[rgba(239,68,68,0.08)] hover:text-[#ffd5d5]"
+                >
+                  删除
                 </button>
-              ))}
-              <div className="my-1 border-t border-[var(--border)]/70" />
-              <button
-                onClick={() => {
-                  setOpen(false)
-                  if (confirm(`确认删除 ${acc.email}？`)) {
-                    apiFetch(`/accounts/${acc.id}`, { method: 'DELETE' }).then(onDelete)
-                  }
-                }}
-                className="w-full px-3 py-2 text-left text-xs text-[#f0b0b0] transition-colors hover:bg-[rgba(239,68,68,0.08)] hover:text-[#ffd5d5]"
-              >
-                删除
-              </button>
-            </div>,
-            document.body,
-          )}
-        </div>
-      )}
-      {actions.length === 0 && (
-        <button
-          onClick={() => { if (confirm(`确认删除 ${acc.email}？`)) apiFetch(`/accounts/${acc.id}`, { method: 'DELETE' }).then(onDelete) }}
-          className="table-action-btn table-action-btn-danger" title="删除账号" aria-label={`删除 ${acc.email}`}
-        >
-          <Trash2 size={14} />
-        </button>
-      )}
+              </div>,
+              document.body,
+            )}
+          </div>
+        )}
+        {actions.length === 0 && (
+          <button
+            onClick={() => { if (confirm(`确认删除 ${acc.email}？`)) apiFetch(`/accounts/${acc.id}`, { method: 'DELETE' }).then(onDelete) }}
+            className="table-action-btn table-action-btn-danger" title="删除账号" aria-label={`删除 ${acc.email}`}
+          >
+            <Trash2 size={14} />
+          </button>
+        )}
+      </div>
     </div>
   )
 }
@@ -2162,154 +2179,6 @@ function ExportMenu({
   )
 }
 
-function LoginRefreshMenu({
-  total,
-  statusFilter,
-  searchFilter,
-  selectedIds,
-  onTaskCreated,
-}: {
-  total: number
-  statusFilter: string
-  searchFilter: string
-  selectedIds: number[]
-  onTaskCreated?: (taskId: string, title: string) => void
-}) {
-  const { t } = useI18n()
-  const [showPreview, setShowPreview] = useState(false)
-  const [loading, setLoading] = useState(false)
-  const [preview, setPreview] = useState<any>(null)
-  const [proxy, setProxy] = useState('http://127.0.0.1:7897')
-  const hasSelection = selectedIds.length > 0
-
-  const openPreview = async () => {
-    setLoading(true)
-    try {
-      const data = await apiFetch('/login-refresh/preview', {
-        method: 'POST',
-        body: JSON.stringify({
-          platform: 'chatgpt',
-          ids: hasSelection ? selectedIds : [],
-          select_all: !hasSelection,
-          status_filter: !hasSelection ? statusFilter || null : null,
-          search_filter: !hasSelection ? searchFilter || null : null,
-          proxy: proxy,
-        }),
-      })
-      setPreview(data)
-      setShowPreview(true)
-    } catch (e: any) {
-      window.alert(e?.message || t('accounts.loginRefreshStartFailed'))
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  const startRefresh = async () => {
-    setLoading(true)
-    try {
-      const result = await apiFetch('/login-refresh/create', {
-        method: 'POST',
-        body: JSON.stringify({
-          platform: 'chatgpt',
-          ids: hasSelection ? selectedIds : [],
-          select_all: !hasSelection,
-          status_filter: !hasSelection ? statusFilter || null : null,
-          search_filter: !hasSelection ? searchFilter || null : null,
-          proxy: proxy,
-        }),
-      })
-      setShowPreview(false)
-      setPreview(null)
-      if (result?.task_id && onTaskCreated) {
-        const title = hasSelection
-          ? t('accounts.loginRefreshSelected', { count: selectedIds.length })
-          : t('accounts.loginRefresh')
-        onTaskCreated(result.task_id, title)
-      }
-    } catch (e: any) {
-      window.alert(e?.message || t('accounts.loginRefreshStartFailed'))
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  return (
-    <>
-      <Button
-        variant="outline"
-        size="sm"
-        onClick={openPreview}
-        disabled={total === 0 || loading}
-        className={ACCOUNT_TOOL_BUTTON_CLASS}
-      >
-        <LogIn className="h-4 w-4 mr-1 shrink-0" />
-        {loading ? t('accounts.loginRefreshing') : hasSelection ? t('accounts.loginRefreshSelected', { count: selectedIds.length }) : t('accounts.loginRefresh')}
-      </Button>
-
-      {showPreview && createPortal(
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-          <div className="relative w-full max-w-2xl rounded-xl border border-[var(--border)] bg-[var(--bg-card)] shadow-2xl">
-            <div className="flex items-center justify-between border-b border-[var(--border)] px-6 py-4">
-              <h2 className="text-lg font-semibold text-[var(--text-primary)]">{t('accounts.loginRefreshPreviewTitle')}</h2>
-              <button
-                onClick={() => setShowPreview(false)}
-                className="rounded-lg p-1 text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-              >
-                <X className="h-5 w-5" />
-              </button>
-            </div>
-            <div className="max-h-[60vh] overflow-y-auto px-6 py-4">
-              <div className="mb-4">
-                <label className="block text-sm font-medium text-[var(--text-primary)] mb-2">
-                  {t('accounts.loginRefreshProxy')}
-                </label>
-                <input
-                  type="text"
-                  value={proxy}
-                  onChange={(e) => setProxy(e.target.value)}
-                  placeholder="http://127.0.0.1:7897"
-                  className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-pane)] px-3 py-2 text-sm text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:ring-2 focus:ring-[var(--accent)]"
-                />
-              </div>
-              <p className="mb-4 text-sm text-[var(--text-secondary)]">{t('accounts.loginRefreshPreviewDesc')}</p>
-              {preview?.accounts && preview.accounts.length > 0 ? (
-                <div className="space-y-2">
-                  {preview.accounts.map((acc: any, idx: number) => (
-                    <div key={idx} className="rounded-lg border border-[var(--border)] bg-[var(--bg-pane)] px-4 py-2.5 text-sm">
-                      <div className="font-medium text-[var(--text-primary)]">{acc.email}</div>
-                      {acc.can_refresh === false && (
-                        <div className="mt-1 text-xs text-amber-500">{acc.reason || '无本地凭证'}</div>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-pane)] px-4 py-8 text-center text-sm text-[var(--text-muted)]">
-                  暂无可刷新的账号
-                </div>
-              )}
-            </div>
-            <div className="flex items-center justify-end gap-3 border-t border-[var(--border)] px-6 py-4">
-              <Button variant="outline" size="sm" onClick={() => setShowPreview(false)} disabled={loading}>
-                取消
-              </Button>
-              <Button
-                size="sm"
-                onClick={startRefresh}
-                disabled={loading || !preview?.accounts || preview.accounts.length === 0}
-              >
-                {loading ? t('accounts.loginRefreshing') : t('accounts.loginRefreshStart')}
-              </Button>
-            </div>
-          </div>
-        </div>,
-        document.body
-      )}
-    </>
-  )
-}
-
 function getPageItems(current: number, totalPages: number): (number | 'ellipsis')[] {
   if (totalPages <= 7) return Array.from({ length: totalPages }, (_, i) => i + 1)
   const items: (number | 'ellipsis')[] = [1]
@@ -2359,7 +2228,7 @@ export default function Accounts() {
   const [gcashCheckStarting, setGcashCheckStarting] = useState(false)
   const [trialProxyDialogOpen, setTrialProxyDialogOpen] = useState(false)
   const [trialCheckStarting, setTrialCheckStarting] = useState(false)
-  const [batchTask, setBatchTask] = useState<{ taskId: string; title: string } | null>(null)
+  const [batchTask, setBatchTask] = useState<{ taskId: string; title: string; expanded?: boolean } | null>(null)
   const [summary, setSummary] = useState<Record<string, number> | null>(null)
   const [summaryError, setSummaryError] = useState('')
   const [dense, setDense] = useState(() => localStorage.getItem('accounts-density') === 'compact')
@@ -2763,7 +2632,7 @@ export default function Accounts() {
           
           <div className="account-tools">
             {selectedCount > 0 && <span className="selection-count" role="status">{t('accounts.selected', { count: selectedCount })}</span>}
-            <LoginRefreshMenu total={total} statusFilter={filterStatus} searchFilter={debouncedSearch} selectedIds={[...selectedIds]} onTaskCreated={(taskId, title) => setBatchTask({ taskId, title })} />
+            <LoginRefreshMenu total={total} statusFilter={filterStatus} searchFilter={debouncedSearch} selectedIds={[...selectedIds]} onTaskCreated={(taskId, title) => setBatchTask({ taskId, title, expanded: true })} />
             <Button
               variant="ghost"
               size="sm"
@@ -2867,8 +2736,11 @@ export default function Accounts() {
                       <AccountAvatar email={acc.email || ''} validity={getValidityStatus(acc)} />
                       <span className="account-tile-email">{acc.email}</span>
                     </button>
-                    <span className="account-tile-health" id={`account-health-${acc.id}`}>{healthLabel}</span>
-                    <div className="account-tile-footer"><span title={t('accounts.survivalTime')}><Clock size={11} aria-hidden="true" />{formatSurvivalDuration(acc, now, language)}</span><ActionMenu acc={acc} onDetail={() => setDetail(acc)} onDelete={refreshAccounts} onResult={(title, payload) => setActionResult({ title, payload })} onChanged={refreshAccounts} /></div>
+                    <span className="account-tile-health" id={`account-health-${acc.id}`}>{getAccountOverview(acc).login_required ? '需要重新登录' : healthLabel}</span>
+                    <div className="account-tile-footer">
+                      <span className="account-tile-lifetime" title={t('accounts.survivalTime')}><Clock size={12} aria-hidden="true" />{formatSurvivalDuration(acc, now, language)}</span>
+                      <ActionMenu layout="card" acc={acc} onDetail={() => setDetail(acc)} onDelete={refreshAccounts} onResult={(title, payload) => setActionResult({ title, payload })} onChanged={refreshAccounts} />
+                    </div>
                   </article>
                 )
               })}
@@ -3132,7 +3004,7 @@ export default function Accounts() {
           </div>
         </div>
       </Card>
-      {!showRegister && <TaskDock key={batchTask?.taskId || 'idle'} task={batchTask} onDone={() => { setBatchRefreshing(false); refreshAccounts() }} />}
+      {!showRegister && <TaskDock key={batchTask?.taskId || 'idle'} task={batchTask} initialExpanded={batchTask?.expanded} onDone={() => { setBatchRefreshing(false); refreshAccounts() }} />}
     </div>
   )
 }

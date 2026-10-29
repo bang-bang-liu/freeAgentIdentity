@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BACKEND_DIR="$SCRIPT_DIR/../"
 
 cd "$BACKEND_DIR"
+npm ci --omit=dev --prefix registration_core/cloudflare
 
 # 定位 patchright driver（含 node 二进制 + cli.js）
 DRIVER_DIR="$(.venv/bin/python -c "import pathlib, patchright; print(pathlib.Path(patchright.__file__).parent / 'driver')")"
@@ -17,6 +18,7 @@ rm -rf dist build backend.spec
 echo "[2/3] 打包后端..."
 .venv/bin/python -m PyInstaller --onefile --name backend \
   --add-data="platforms:platforms" \
+  --add-data="registration_core:registration_core" \
   --add-data="core:core" \
   --add-data="api:api" \
   --add-data="services:services" \

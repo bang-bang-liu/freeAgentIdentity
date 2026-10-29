@@ -21,6 +21,7 @@ from typing import Optional, Any
 from urllib.parse import urlparse, parse_qs, parse_qsl, urljoin, urlencode, urlunparse
 
 from .config import Config
+from .auth_errors import AuthFlowError
 from .contracts import MailboxProvider as MailProvider
 from .http_client import browser_profiles_for_flow, create_http_session
 
@@ -203,6 +204,13 @@ class AuthFlow:
 
             self._browser_engine = BrowserRegistrationEngine(self)
         return self._browser_engine
+
+    def enable_login_challenge_handling(self, *, log, check_budget, deadline: float) -> None:
+        """仅重新登录启用上游挑战处理，不改变注册请求行为。"""
+        from .login_transport import LoginChallengeSession
+
+        self._login_challenge_options = dict(log=log, check_budget=check_budget, deadline=deadline)
+        self.session = LoginChallengeSession(self.session, self._browser_profile, **self._login_challenge_options)
 
     def close(self) -> None:
         """Close both the HTTP session and an optional browser context."""
@@ -1985,7 +1993,12 @@ class AuthFlow:
             self._browser_profile.impersonate,
             self._browser_profile.user_agent,
         )
+        if getattr(self, "_login_challenge_options", None):
+            self.session.close()
         self.session = create_http_session(proxy=self.config.proxy, profile=self._browser_profile)
+        if getattr(self, "_login_challenge_options", None):
+            from .login_transport import LoginChallengeSession
+            self.session = LoginChallengeSession(self.session, self._browser_profile, **self._login_challenge_options)
         self.result.browser_profile_rotated = True
         self._record_browser_profile()
         return True
@@ -2182,9 +2195,15 @@ class AuthFlow:
                 allow_redirects=True,
             )
             self._trace_http("chatgpt_home", resp)
+            if getattr(self, "_login_challenge_options", None) and resp.status_code >= 400:
+                raise AuthFlowError.from_response("ChatGPT 首页预热", resp)
             logger.info("ChatGPT 首页: %s cookies=%s", getattr(resp, "status_code", "N/A"), self._integrity_cookie_summary())
         except Exception as e:
+            if getattr(self, "_login_challenge_options", None):
+                raise
             logger.warning("打开 ChatGPT 首页失败，继续: %s", e)
+        if getattr(self, "_login_challenge_options", None):
+            return
         # 纯协议：首页后只做 HTTP cookie 整理，绝不因缺 clearance 拉起浏览器。
         if not self._browser_mode_enabled() or bool(getattr(self, "_force_protocol_mode", False)):
             try:
@@ -2206,6 +2225,8 @@ class AuthFlow:
         )
         self._trace_http("chatgpt_auth_providers", resp)
         if resp.status_code != 200:
+            if getattr(self, "_login_challenge_options", None):
+                raise AuthFlowError.from_response("登录提供方初始化", resp)
             logger.warning("auth providers 返回异常: %s - %s", resp.status_code, (resp.text or "")[:200])
             return {}
         try:
@@ -2216,7 +2237,8 @@ class AuthFlow:
 
     def get_csrf_token(self) -> str:
         logger.info("[1/10] 获取 CSRF Token...")
-        headers = self._common_headers("https://chatgpt.com/auth/login")
+        headers = self._common_headers("https://chatgpt.com/" if getattr(self, "_login_challenge_options", None)
+                                       else "https://chatgpt.com/auth/login")
 
         # Cloudflare 可能在短时间内多次请求后返回 403，重试 3 次
         for attempt in range(3):
@@ -2235,6 +2257,8 @@ class AuthFlow:
                         "请切换可直连 chatgpt.com 的网络或在界面中配置可用代理后重试。"
                     ) from e
                 raise
+            if getattr(self, "_login_challenge_options", None) and resp.status_code != 200:
+                raise AuthFlowError.from_response("CSRF 初始化", resp)
             if resp.status_code == 403 and attempt < 2:
                 wait = (attempt + 1) * 5
                 logger.warning(f"Cloudflare 403, {wait}s 后重试 ({attempt + 1}/3)...")
@@ -2274,6 +2298,8 @@ class AuthFlow:
             "auth_session_logging_id": self._auth_session_logging_id,
             "screen_hint": hint,
         }
+        if getattr(self, "_login_challenge_options", None):
+            query.pop("ext-passkey-client-capabilities", None)
         if email:
             query["login_hint"] = email
         signin_url = "https://chatgpt.com/api/auth/signin/openai?" + urlencode(query)
@@ -2297,6 +2323,8 @@ class AuthFlow:
             extra_request={"method": "POST", "url": signin_url, "body": urlencode(form), "headers": headers},
         )
         if resp.status_code != 200:
+            if getattr(self, "_login_challenge_options", None):
+                raise AuthFlowError.from_response("登录入口初始化", resp)
             body = (resp.text or "")[:500]
             raise RuntimeError(f"Auth URL ????: HTTP {resp.status_code} - {body}")
         auth_url = ""
@@ -2316,7 +2344,8 @@ class AuthFlow:
     def auth_oauth_init(self, auth_url: str) -> str:
         logger.info("[3/10] OAuth 初始化...")
         headers = {
-            **self._html_headers("https://chatgpt.com/auth/login"),
+            **self._html_headers("https://chatgpt.com/" if getattr(self, "_login_challenge_options", None)
+                                 else "https://chatgpt.com/auth/login"),
         }
         try:
             resp = self.session.get(auth_url, headers=headers, timeout=30, allow_redirects=True)
@@ -2328,6 +2357,10 @@ class AuthFlow:
                 ) from e
             raise
         self._trace_http("auth_oauth_init", resp)
+        # A challenge/error document never established an OAuth login session.
+        # Continuing from it hides the real failure behind a later invalid_state.
+        if resp.status_code >= 400:
+            raise AuthFlowError.from_response("OAuth 初始化", resp)
 
         # Keep final landing URL for subsequent authorize/continue referer.
         try:
@@ -2420,6 +2453,10 @@ class AuthFlow:
                     "so_token": str(bundle.get("so_token", "") or ""),
                 }
         except Exception as e:
+            if getattr(self, "_login_challenge_options", None):
+                self.session.check()
+                if isinstance(e, AuthFlowError):
+                    raise
             logger.warning("Sentinel QuickJS bundle 失败，回退纯 token: %s", e)
 
         # create_account 强制要求 so-token：禁止回退到纯 Python 假 PoW（易出低信任号）。
@@ -2583,10 +2620,7 @@ class AuthFlow:
                     trace_step=(trace_step or f"authorize_continue_{screen_hint}") + "_retry",
                     allow_retry=False,
                 )
-            raise RuntimeError(
-                f"authorize/continue 失败(screen_hint={screen_hint}): "
-                f"HTTP {resp.status_code} req_id={req_id} body={body}"
-            )
+            raise AuthFlowError.from_response("authorize/continue", resp)
         try:
             return resp.json() if resp is not None else {}
         except Exception:
@@ -2612,12 +2646,12 @@ class AuthFlow:
         except Exception:
             pass
         csrf = self.get_csrf_token()
-        auth_url = self.get_auth_url(csrf, email=email)
+        auth_url = self.get_auth_url(csrf, email=email, screen_hint=hint, prompt="login")
         device_id = self.auth_oauth_init(auth_url)
         self.result.device_id = device_id
 
         landed = str(getattr(self, "_oauth_landed_url", "") or "").strip()
-        if "create-account" in landed:
+        if "create-account" in landed and hint != "login":
             referer = landed.split("?")[0] or "https://auth.openai.com/create-account"
             hint = "signup"
         elif "log-in" in landed or "login" in landed:
@@ -2652,7 +2686,11 @@ class AuthFlow:
                     allow_redirects=True,
                 )
                 self._trace_http("auth_hint_page_rebuild", page)
+                if page.status_code >= 400:
+                    raise AuthFlowError.from_response("OAuth 登录页初始化", page)
                 referer = str(getattr(page, "url", "") or target).split("?")[0] or target
+            except AuthFlowError:
+                raise
             except Exception:
                 referer = target
 
@@ -2998,6 +3036,8 @@ class AuthFlow:
         headers["Content-Type"] = "application/json"
         if self._last_sentinel_token:
             headers["openai-sentinel-token"] = self._last_sentinel_token
+        if getattr(self, "_login_challenge_options", None):
+            self._apply_sentinel_headers(headers, step="password_verify")
         resp = self.session.post(
             "https://auth.openai.com/api/accounts/password/verify",
             headers=headers,
@@ -3006,6 +3046,8 @@ class AuthFlow:
         )
         self._trace_http("login_password_verify", resp)
         if resp.status_code != 200:
+            if getattr(self, "_login_challenge_options", None):
+                raise AuthFlowError.from_response("密码验证", resp)
             body = (resp.text or "")[:260]
             raise RuntimeError(f"密码登录失败: {resp.status_code} - {body}")
         try:
@@ -3017,9 +3059,9 @@ class AuthFlow:
     def verify_otp(self, otp_code: str) -> dict:
         """POST /api/accounts/email-otp/validate。
 
-        对齐 GPT模拟注册纯协议：validate 只带 code，不在验码前刷新 Sentinel。
-        验码前再跑 authorize_continue sentinel 容易把 auth session 打成 invalid_state(409)。
-        需要兼容旧抓包双 token 时设 PROTOCOL_OTP_VALIDATE_SENTINEL=1。
+        注册默认只提交 code；重新登录按 toSub2 使用 email_otp_validate Sentinel。
+        不在验码前刷新 authorize_continue flow，避免使当前登录 state 失效。
+        注册兼容旧抓包时可设 PROTOCOL_OTP_VALIDATE_SENTINEL=1。
         """
         logger.info("[7/10] 验证 OTP...")
         self.result.last_email_otp_attempt = str(otp_code or "").strip()
@@ -3028,8 +3070,11 @@ class AuthFlow:
         headers["Content-Type"] = "application/json"
         headers["Accept"] = "application/json"
 
-        # 默认不带 sentinel；历史抓包路径可显式打开
-        if self._env_flag("PROTOCOL_OTP_VALIDATE_SENTINEL", "0"):
+        if getattr(self, "_login_challenge_options", None):
+            self.get_sentinel_token(self.result.device_id, flow="email_otp_validate")
+            self._apply_sentinel_headers(headers, step="email-otp/validate")
+        # 注册默认不带 sentinel；历史抓包路径可显式打开。
+        elif self._env_flag("PROTOCOL_OTP_VALIDATE_SENTINEL", "0"):
             try:
                 self._prepare_sentinel_for_step(
                     "authorize_continue",
@@ -3050,6 +3095,8 @@ class AuthFlow:
         )
         self._trace_http("validate_email_otp", resp)
         if resp.status_code != 200:
+            if getattr(self, "_login_challenge_options", None):
+                raise AuthFlowError.from_response("邮箱验证码校验", resp)
             body = resp.text or ""
             logger.warning("verify_otp FULL body (%s): %s", resp.status_code, body[:2000])
             body_lc = body.lower()
@@ -3829,7 +3876,9 @@ class AuthFlow:
 
     def _workspace_select(self, workspace_id: str) -> str:
         logger.info("执行 workspace 选择...")
-        headers = self._common_headers("https://auth.openai.com/sign-in-with-chatgpt/codex/consent")
+        referer = ("https://auth.openai.com/workspace" if getattr(self, "_login_challenge_options", None)
+                   else "https://auth.openai.com/sign-in-with-chatgpt/codex/consent")
+        headers = self._common_headers(referer)
         headers["Content-Type"] = "application/json"
         resp = self.session.post(
             "https://auth.openai.com/api/accounts/workspace/select",
@@ -3838,6 +3887,8 @@ class AuthFlow:
             timeout=30,
         )
         self._trace_http("workspace_select", resp)
+        if getattr(self, "_login_challenge_options", None) and resp.status_code != 200:
+            raise AuthFlowError.from_response("工作区选择", resp)
         return resp.json().get("continue_url", "") if resp.status_code == 200 else ""
 
     def _choose_account_select(self, html_text: str, current_url: str) -> str:
@@ -3976,6 +4027,8 @@ class AuthFlow:
                 current_url, headers=headers, timeout=30, allow_redirects=False
             )
             self._trace_http(f"redirect_hop_{i+1}", resp)
+            if getattr(self, "_login_challenge_options", None) and resp.status_code >= 400:
+                raise AuthFlowError.from_response("登录跳转", resp)
 
             if "/api/auth/callback/openai" in current_url:
                 callback_url = current_url
@@ -4127,6 +4180,8 @@ class AuthFlow:
             timeout=30,
         )
         self._trace_http("chatgpt_auth_session", resp)
+        if getattr(self, "_login_challenge_options", None) and resp.status_code != 200:
+            raise AuthFlowError.from_response("session 获取", resp)
         resp.raise_for_status()
 
         try:
@@ -4189,6 +4244,8 @@ class AuthFlow:
                     allow_redirects=False,
                 )
                 self._trace_http(f"consume_callback_hop_{hop+1}", resp)
+                if getattr(self, "_login_challenge_options", None) and resp.status_code >= 400:
+                    raise AuthFlowError.from_response("登录回调", resp)
                 if resp.status_code not in (301, 302, 303, 307, 308):
                     break
                 loc = (resp.headers.get("Location", "") or "").strip()
@@ -4204,10 +4261,14 @@ class AuthFlow:
                     try:
                         self.session.get(current, timeout=20, allow_redirects=True)
                     except Exception:
+                        if getattr(self, "_login_challenge_options", None):
+                            raise
                         pass
                     break
             return bool(self.session.cookies.get("__Secure-next-auth.session-token", ""))
         except Exception as e:
+            if getattr(self, "_login_challenge_options", None):
+                raise
             logger.warning(f"消费 callback 失败: {e}")
             return False
 

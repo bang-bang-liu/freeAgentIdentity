@@ -19,8 +19,11 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import time
+import threading
 import weakref
+from urllib.parse import urljoin, urlsplit
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -30,6 +33,8 @@ from platforms.chatgpt.login_types import (
     LoginErrorCode,
     LoginMethod,
 )
+from platforms.chatgpt.token_validation import network_login_error, validate_chatgpt_token
+from registration_core.auth_errors import AuthFlowError
 
 
 # 单个认证阶段的默认上限（秒）。任何网络等待都必须有界，见设计 12.3。
@@ -97,6 +102,7 @@ class EmailOtpResolver:
         timeout: int = DEFAULT_EMAIL_OTP_TIMEOUT,
         log: Callable[[str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        email: str = "",
     ) -> None:
         self.rebuilt = rebuilt
         self.manual_handle = manual_handle
@@ -104,6 +110,7 @@ class EmailOtpResolver:
         self.timeout = max(int(timeout or DEFAULT_EMAIL_OTP_TIMEOUT), 1)
         self.log = log or (lambda _message: None)
         self.cancel_check = cancel_check
+        self.email = _text(email)
         self.last_source = ""
 
     @property
@@ -231,7 +238,7 @@ class EmailOtpResolver:
 
     def _fetch_manual(self, *, purpose: str) -> str:
         handle = self.manual_handle
-        email = getattr(self.rebuilt, "email", "") if self.rebuilt else ""
+        email = self.email or (getattr(self.rebuilt, "email", "") if self.rebuilt else "")
         try:
             request_id = handle.open_request(email)
         except Exception as exc:
@@ -272,7 +279,9 @@ def _page_type(auth: Any, step: dict | None) -> str:
 
 def _continue_url(auth: Any, step: dict | None) -> str:
     try:
-        return _text(auth._normalize_continue_url(auth._extract_continue_url_from_step(step)))
+        value = _text(auth._extract_continue_url_from_step(step))
+        # AuthFlow 的通用 normalize 还会提交 workspace/select；此处只解析地址。
+        return urljoin("https://auth.openai.com", value) if value.startswith("/") else value
     except Exception:
         return ""
 
@@ -285,22 +294,80 @@ def _is_password_page(page_type: str, continue_url: str) -> bool:
     return page_type == "login_password" or "/log-in/password" in (continue_url or "")
 
 
+def _is_rejected_otp(exc: Exception) -> bool:
+    detail = f"{getattr(exc, 'error_code', '')} {exc}".lower()
+    return bool(re.search(
+        r"(?:invalid|incorrect|wrong|expired)[_\s-]*(?:email[_\s-]*)?(?:totp|otp|code)"
+        r"|(?:totp|otp|code)[_\s-]*(?:invalid|incorrect|wrong|expired)", detail,
+    ))
+
+
+def _login_landing_step(auth: Any) -> dict:
+    """按实际 OAuth 落地页继续，避免再次提交已推进过的 authorize/continue。"""
+    landed = _text(getattr(auth, "_oauth_landed_url", ""))
+    parsed = urlsplit(landed)
+    path = parsed.path.rstrip("/")
+    if parsed.hostname == "auth.openai.com":
+        page_type = ""
+        if path == "/log-in/password":
+            page_type = "login_password"
+        elif path == "/email-verification":
+            page_type = "email_otp_verification"
+        elif path.startswith("/mfa-challenge/"):
+            page_type = "mfa_challenge"
+        elif path.startswith("/workspace"):
+            page_type = "workspace"
+        if page_type:
+            return {"page": {"type": page_type}, "continue_url": landed}
+        # 只有真正停在邮箱输入页时才继续提交邮箱。
+        if path in {"/log-in", "/login", "/u/login", "/create-account", "/log-in-or-create-account"}:
+            return {}
+    elif parsed.hostname == "chatgpt.com" and (
+        path.startswith("/api/auth/callback/") or path == ""
+    ):
+        return {"page": {"type": "existing_session"}, "continue_url": landed}
+    raise ChatGPTLoginError(LoginErrorCode.API_RESPONSE_INVALID,
+                           f"OAuth 返回未识别的登录页：{path or '/'}")
+
+
 def _finish_session(auth: Any, continue_url: str) -> None:
-    """跟随 redirect 链并读取 session。多路兜底，任何一路成功即可。"""
+    """Consume the web callback before asking NextAuth for its session."""
     if continue_url:
-        try:
+        parsed = urlsplit(continue_url)
+        if parsed.hostname == "chatgpt.com" and parsed.path.startswith("/api/auth/callback/"):
+            callback_url = continue_url
+        else:
             callback_url, _final_url = auth.follow_redirect_chain(continue_url)
-            if callback_url and hasattr(auth, "oauth_token_exchange"):
-                try:
-                    auth.oauth_token_exchange(callback_url, continue_url)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        if callback_url:
+            auth._consume_callback_for_session(callback_url)
     auth.get_auth_session()
     if not _text(getattr(auth.result, "access_token", "")):
         time.sleep(0.5)
         auth.get_auth_session()
+
+
+def _select_workspace(auth: Any, step: dict, continue_url: str, emit: Callable) -> str:
+    # Adapted from toSub2's selectChatgptLoginWorkspaceIfNeeded (MIT).
+    if "workspace" not in _page_type(auth, step) and "/workspace" not in continue_url:
+        return continue_url
+    step = step if isinstance(step, dict) else {}
+    data = step.get("oai-client-auth-session") or step.get("data") or {}
+    data = data if isinstance(data, dict) else {}
+    workspaces = data.get("workspaces") or step.get("workspaces") or []
+    workspace_id = str(data.get("workspace_id") or step.get("workspace_id") or "")
+    if not workspace_id:
+        selectable = [w for w in workspaces if isinstance(w, dict) and w.get("id")]
+        preferred = next((w for w in selectable if w.get("kind") == "organization"), None)
+        workspace_id = str((preferred or next(iter(selectable), {})).get("id") or "")
+    workspace_id = workspace_id or auth._extract_workspace_id()
+    if not workspace_id:
+        # follow_redirect_chain also extracts workspace IDs from SSR HTML.
+        return continue_url
+    emit("选择 ChatGPT 工作区")
+    next_url = auth._workspace_select(workspace_id)
+    if not next_url:
+        raise ChatGPTLoginError(LoginErrorCode.API_RESPONSE_INVALID, "工作区选择未返回下一步地址")
+    return urljoin("https://auth.openai.com", next_url)
 
 
 def _decode_account_id(access_token: str) -> str:
@@ -340,6 +407,8 @@ def login_chatgpt_web(
     cancel_check: Callable[[], bool] | None = None,
     register_cancel_callback: Callable[[Callable[[], None]], None] | None = None,
     deadline_seconds: int = DEFAULT_ACCOUNT_DEADLINE,
+    _proxy_attempt: int = 0,
+    _deadline: float | None = None,
 ) -> ChatGPTLoginResult:
     """重新登录 ChatGPT web，返回新的凭据快照。
 
@@ -367,7 +436,7 @@ def login_chatgpt_web(
     if not email:
         raise ChatGPTLoginError(LoginErrorCode.MISSING_EMAIL, "账号邮箱为空")
 
-    deadline = time.monotonic() + max(int(deadline_seconds or DEFAULT_ACCOUNT_DEADLINE), 1)
+    deadline = _deadline or time.monotonic() + max(int(deadline_seconds or DEFAULT_ACCOUNT_DEADLINE), 1)
 
     def _check_budget() -> None:
         if cancel_check and cancel_check():
@@ -376,7 +445,8 @@ def login_chatgpt_web(
             raise ChatGPTLoginError(LoginErrorCode.NETWORK_TIMEOUT, "单账号认证超时")
 
     _check_budget()
-    auth = AuthFlow(Config(proxy=proxy or None))
+    auth = AuthFlow(Config(proxy=proxy or None, registration_mode="protocol"))
+    auth.enable_login_challenge_handling(log=emit, check_budget=_check_budget, deadline=deadline)
     # A running HTTP request may otherwise keep the task worker alive for the
     # request timeout after the cancel endpoint has returned.  Register a
     # weak-reference callback so the task can close the auth session promptly
@@ -410,229 +480,312 @@ def login_chatgpt_web(
             register_cancel_callback(auth_cancel_callback)
         except Exception:
             auth_cancel_callback = None
-    auth.result.email = email
-    if password:
-        auth.result.password = password
-
-    emit("初始化 ChatGPT 协议登录")
-    try:
-        csrf = auth.get_csrf_token()
-        auth_url = auth.get_auth_url(csrf, email=email)
-        device_id = auth.auth_oauth_init(auth_url)
-        sentinel = auth.get_sentinel_token(device_id)
-    except Exception as exc:
-        if cancel_check and cancel_check():
-            raise ChatGPTLoginError(LoginErrorCode.CANCELLED, "任务已取消") from exc
-        raise ChatGPTLoginError(
-            LoginErrorCode.NETWORK_TIMEOUT, f"登录引导失败: {type(exc).__name__}"
-        ) from exc
-
-    _check_budget()
-    otp_before_ids: set = set()
-    otp_issued_after: float | None = None
-    if otp_resolver is not None:
-        # Existing-account authorize/continue can dispatch the first OTP
-        # before returning.  Establish the baseline immediately beforehand so
-        # that message is eligible even when the mailbox API is polled later.
-        _check_budget()
-        otp_before_ids = otp_resolver.baseline()
-        otp_issued_after = time.time()
-        _check_budget()
-    try:
-        step = auth.authorize_continue(
-            email=email,
-            sentinel_token=sentinel,
-            screen_hint="login",
-            referer="https://auth.openai.com/log-in",
-            trace_step="authorize_continue_login_refresh",
-        )
-    except Exception as exc:
-        if cancel_check and cancel_check():
-            raise ChatGPTLoginError(LoginErrorCode.CANCELLED, "任务已取消") from exc
-        raise ChatGPTLoginError(
-            LoginErrorCode.NETWORK_TIMEOUT, f"进入登录流程失败: {type(exc).__name__}"
-        ) from exc
-
-    page_type = _page_type(auth, step)
-    continue_url = _continue_url(auth, step)
-    login_method = ""
-
-    # ---- 第一段认证：密码 或 邮箱 OTP
-    if password and _is_password_page(page_type, continue_url):
-        emit("提交密码验证")
-        _check_budget()
+    def close_at_deadline():
         try:
-            auth.get_sentinel_token(device_id)
+            auth.close()
         except Exception:
             pass
-        try:
-            step = auth.login_password_verify(password)
-        except Exception as exc:
-            if cancel_check and cancel_check():
-                raise ChatGPTLoginError(LoginErrorCode.CANCELLED, "任务已取消") from exc
-            low = str(exc).lower()
-            if "invalid_username_or_password" in low or "401" in low:
-                raise ChatGPTLoginError(
-                    LoginErrorCode.INVALID_PASSWORD, "密码被服务端拒绝"
-                ) from exc
-            raise ChatGPTLoginError(
-                LoginErrorCode.NETWORK_TIMEOUT, f"密码验证失败: {type(exc).__name__}"
-            ) from exc
-        login_method = LoginMethod.PASSWORD
-        page_type = _page_type(auth, step)
-        continue_url = _continue_url(auth, step)
-    elif _is_email_otp_page(page_type, continue_url) or not password:
-        if otp_resolver is None:
-            raise ChatGPTLoginError(
-                LoginErrorCode.EMAIL_OTP_INVALID, "需要邮箱验证码但未提供取码途径"
-            )
-        emit(f"进入邮箱验证码登录: {otp_resolver.describe()}")
-        _check_budget()
-        try:
-            if not auth.kickoff_otp_delivery("existing_passwordless_login"):
-                auth.send_otp("https://auth.openai.com/email-verification")
-        except Exception as exc:
-            if cancel_check and cancel_check():
-                raise ChatGPTLoginError(LoginErrorCode.CANCELLED, "任务已取消") from exc
-            raise ChatGPTLoginError(
-                LoginErrorCode.NETWORK_TIMEOUT, f"发送邮箱验证码失败: {type(exc).__name__}"
-            ) from exc
-
-        code = otp_resolver.fetch(
-            purpose="email_login",
-            before_ids=otp_before_ids,
-            issued_after=otp_issued_after,
-        )
-        _check_budget()
-        emit("提交邮箱验证码")
-        try:
-            step = auth.verify_otp(code)
-        except Exception as exc:
-            if cancel_check and cancel_check():
-                raise ChatGPTLoginError(LoginErrorCode.CANCELLED, "任务已取消") from exc
-            raise ChatGPTLoginError(
-                LoginErrorCode.EMAIL_OTP_INVALID, f"邮箱验证码校验失败: {type(exc).__name__}"
-            ) from exc
-        login_method = LoginMethod.EMAIL_OTP
-        page_type = _page_type(auth, step)
-        continue_url = _continue_url(auth, step)
-    else:
-        raise ChatGPTLoginError(
-            LoginErrorCode.RISK_CONTROL,
-            f"未进入可识别的登录页 page_type={page_type or '(empty)'}",
-        )
-
-    # ---- 第二段认证：可选 TOTP
-    client_auth = _parse_client_auth_session(
-        _cookie_value(auth.session, "oai-client-auth-session")
-    )
-    factor_id = extract_factor_id(continue_url, step, client_auth)
-    if factor_id:
-        _check_budget()
-        emit("服务端要求 MFA 验证")
-        try:
-            issue_mfa_challenge(auth, factor_id)
-        except MfaLoginError as exc:
-            if cancel_check and cancel_check():
-                raise ChatGPTLoginError(LoginErrorCode.CANCELLED, "任务已取消") from exc
-            raise ChatGPTLoginError(LoginErrorCode.MFA_INVALID, exc.message) from exc
-        except Exception as exc:
-            if cancel_check and cancel_check():
-                raise ChatGPTLoginError(LoginErrorCode.CANCELLED, "任务已取消") from exc
-            raise ChatGPTLoginError(
-                LoginErrorCode.NETWORK_TIMEOUT, f"MFA challenge 失败: {type(exc).__name__}"
-            ) from exc
-
-        verified = False
-        if totp_secret:
-            emit("提交 TOTP 验证")
-            for window in (1, 2):
-                if verified:
-                    break
-                for candidate in totp_code_candidates(totp_secret, window=window):
-                    _check_budget()
-                    try:
-                        verify_resp = verify_mfa_totp(auth, factor_id, candidate)
-                    except Exception:
-                        continue
-                    verified = True
-                    continue_url = _continue_url(auth, verify_resp) or continue_url
-                    break
-            if not verified:
-                raise ChatGPTLoginError(LoginErrorCode.MFA_INVALID, "TOTP 验证未通过")
-        elif manual_totp_handle is not None:
-            emit("无已保存 TOTP，等待手动输入动态码")
-            remaining = int(max(deadline - time.monotonic(), 1))
-            manual_resolver = EmailOtpResolver(
-                manual_handle=manual_totp_handle,
-                mode="manual",
-                timeout=min(remaining, DEFAULT_EMAIL_OTP_TIMEOUT),
-                log=emit,
-                cancel_check=cancel_check,
-            )
-            manual_code = manual_resolver.fetch(purpose="mfa_login")
+        if callable(resolver_close):
             try:
-                verify_resp = verify_mfa_totp(auth, factor_id, manual_code)
+                resolver_close()
+            except Exception:
+                pass
+
+    timeout_timer = threading.Timer(max(0.01, deadline - time.monotonic()), close_at_deadline)
+    timeout_timer.daemon = True
+    timeout_timer.start()
+    try:
+        auth.result.email = email
+        if password:
+            auth.result.password = password
+
+        emit("初始化 ChatGPT 协议登录")
+        # OAuth 文档跳转可能直接发码，必须先建立邮件基线。
+        otp_before_ids: set = set()
+        otp_issued_after: float | None = None
+        try:
+            for bootstrap_attempt in range(2):
+                auth.open_chatgpt_home()
+                _check_budget()
+                auth.get_auth_providers()
+                _check_budget()
+                csrf = auth.get_csrf_token()
+                if not auth._get_cookie_value_by_name("__Host-next-auth.csrf-token"):
+                    raise ChatGPTLoginError(LoginErrorCode.API_RESPONSE_INVALID, "登录引导未建立 CSRF Cookie")
+                auth_url = auth.get_auth_url(csrf, email=email, screen_hint="login_or_signup", prompt="login")
+                if otp_resolver is not None:
+                    otp_before_ids = otp_resolver.baseline()
+                otp_issued_after = time.time()
+                _check_budget()
+                device_id = auth.auth_oauth_init(auth_url)
+                step = _login_landing_step(auth)
+                if not step:
+                    emit("OAuth 停在邮箱输入页，提交登录邮箱")
+                    sentinel = auth.get_sentinel_token(device_id)
+                    try:
+                        step = auth.authorize_continue(
+                            email=email, sentinel_token=sentinel, screen_hint="login",
+                            referer=_text(auth._oauth_landed_url).split("?")[0],
+                            trace_step="authorize_continue_login_refresh", allow_retry=False,
+                        )
+                    except AuthFlowError as exc:
+                        if (bootstrap_attempt == 0 and exc.status_code in (400, 409)
+                                and exc.error_code == "invalid_state"):
+                            emit("登录会话已失效，重新初始化并按新的 OAuth 落地页继续")
+                            continue
+                        raise
+                break
+            auth._is_existing_account = True
+        except ChatGPTLoginError:
+            raise
+        except Exception as exc:
+            if cancel_check and cancel_check():
+                raise ChatGPTLoginError(LoginErrorCode.CANCELLED, "任务已取消") from exc
+            raise network_login_error(exc, "登录引导") from exc
+
+        _check_budget()
+        page_type = _page_type(auth, step)
+        continue_url = _continue_url(auth, step)
+        login_method = ""
+
+        # ---- 第一段认证：密码 或 邮箱 OTP
+        if password and _is_password_page(page_type, continue_url):
+            emit("提交密码验证")
+            _check_budget()
+            try:
+                auth.get_sentinel_token(device_id, flow="password_verify")
+            except ChatGPTLoginError:
+                raise
+            except AuthFlowError as exc:
+                raise network_login_error(exc, "密码安全验证") from exc
+            except Exception:
+                _check_budget()
+            try:
+                step = auth.login_password_verify(password)
             except Exception as exc:
                 if cancel_check and cancel_check():
                     raise ChatGPTLoginError(LoginErrorCode.CANCELLED, "任务已取消") from exc
+                low = str(exc).lower()
+                if "invalid_username_or_password" in low or "401" in low:
+                    raise ChatGPTLoginError(
+                        LoginErrorCode.INVALID_PASSWORD, "密码被服务端拒绝"
+                    ) from exc
+                raise network_login_error(exc, "密码验证") from exc
+            login_method = LoginMethod.PASSWORD
+            page_type = _page_type(auth, step)
+            continue_url = _continue_url(auth, step)
+        if _is_email_otp_page(page_type, continue_url) or (not password and _is_password_page(page_type, continue_url)):
+            if otp_resolver is None:
                 raise ChatGPTLoginError(
-                    LoginErrorCode.MFA_INVALID, "手动输入的动态码验证失败"
-                ) from exc
-            continue_url = _continue_url(auth, verify_resp) or continue_url
-        else:
-            raise ChatGPTLoginError(
-                LoginErrorCode.MFA_REQUIRED, "服务端要求 MFA，但账号无可用 TOTP"
+                    LoginErrorCode.EMAIL_OTP_INVALID, "需要邮箱验证码但未提供取码途径"
+                )
+            emit(f"进入邮箱验证码登录: {otp_resolver.describe()}")
+            _check_budget()
+            try:
+                if not _is_email_otp_page(page_type, continue_url):
+                    if not auth.kickoff_otp_delivery("existing_passwordless_login"):
+                        auth.send_otp("https://auth.openai.com/email-verification")
+            except Exception as exc:
+                if cancel_check and cancel_check():
+                    raise ChatGPTLoginError(LoginErrorCode.CANCELLED, "任务已取消") from exc
+                raise network_login_error(exc, "发送邮箱验证码") from exc
+
+            otp_resolver.timeout = min(otp_resolver.timeout, max(1, int(deadline - time.monotonic())))
+            code = otp_resolver.fetch(
+                purpose="email_login",
+                before_ids=otp_before_ids,
+                issued_after=otp_issued_after,
             )
-        login_method = (
-            LoginMethod.PASSWORD_TOTP
-            if login_method == LoginMethod.PASSWORD
-            else LoginMethod.EMAIL_OTP_TOTP
+            _check_budget()
+            emit("提交邮箱验证码")
+            try:
+                step = auth.verify_otp(code)
+            except ChatGPTLoginError:
+                raise
+            except Exception as exc:
+                _check_budget()
+                if _is_rejected_otp(exc):
+                    raise ChatGPTLoginError(LoginErrorCode.EMAIL_OTP_INVALID, "邮箱验证码被服务端拒绝") from exc
+                raise network_login_error(exc, "邮箱验证码校验") from exc
+            login_method = LoginMethod.EMAIL_OTP
+            page_type = _page_type(auth, step)
+            continue_url = _continue_url(auth, step)
+        elif ("workspace" in page_type or "/workspace" in continue_url
+              or "/api/auth/callback/" in continue_url or "mfa" in page_type
+              or page_type == "existing_session"):
+            login_method = login_method or LoginMethod.EXISTING_SESSION
+        elif not login_method:
+            raise ChatGPTLoginError(
+                LoginErrorCode.API_RESPONSE_INVALID,
+                f"未进入可识别的登录页 page_type={page_type or '(empty)'}",
+            )
+
+        # ---- 第二段认证：可选 TOTP
+        client_auth = _parse_client_auth_session(
+            _cookie_value(auth.session, "oai-client-auth-session")
         )
+        factor_id = extract_factor_id(continue_url, step, client_auth)
+        if factor_id:
+            _check_budget()
+            emit("服务端要求 MFA 验证")
+            try:
+                issue_mfa_challenge(auth, factor_id)
+            except MfaLoginError as exc:
+                if cancel_check and cancel_check():
+                    raise ChatGPTLoginError(LoginErrorCode.CANCELLED, "任务已取消") from exc
+                raise ChatGPTLoginError(LoginErrorCode.MFA_INVALID, exc.message) from exc
+            except Exception as exc:
+                _check_budget()
+                if isinstance(exc, ChatGPTLoginError):
+                    raise
+                raise network_login_error(exc, "MFA challenge") from exc
 
-    # ---- 取 session
-    _check_budget()
-    emit("获取 ChatGPT session")
-    try:
-        _finish_session(auth, continue_url)
-    except Exception as exc:
-        if cancel_check and cancel_check():
-            raise ChatGPTLoginError(LoginErrorCode.CANCELLED, "任务已取消") from exc
-        raise ChatGPTLoginError(
-            LoginErrorCode.TOKEN_FETCH_TIMEOUT, f"session 获取失败: {type(exc).__name__}"
-        ) from exc
+            verified = False
+            if totp_secret:
+                emit("提交 TOTP 验证")
+                for window in (1, 2):
+                    if verified:
+                        break
+                    for candidate in totp_code_candidates(totp_secret, window=window):
+                        _check_budget()
+                        try:
+                            verify_resp = verify_mfa_totp(auth, factor_id, candidate)
+                        except Exception as exc:
+                            _check_budget()
+                            if isinstance(exc, ChatGPTLoginError):
+                                raise
+                            if _is_rejected_otp(exc):
+                                continue
+                            raise network_login_error(exc, "TOTP 验证") from exc
+                        verified = True
+                        step = verify_resp
+                        continue_url = _continue_url(auth, verify_resp) or continue_url
+                        break
+                if not verified:
+                    raise ChatGPTLoginError(LoginErrorCode.MFA_INVALID, "TOTP 验证未通过")
+            elif manual_totp_handle is not None:
+                emit("无已保存 TOTP，等待手动输入动态码")
+                remaining = int(max(deadline - time.monotonic(), 1))
+                manual_resolver = EmailOtpResolver(
+                    manual_handle=manual_totp_handle,
+                    mode="manual",
+                    timeout=min(remaining, DEFAULT_EMAIL_OTP_TIMEOUT),
+                    log=emit,
+                    cancel_check=cancel_check,
+                    email=email,
+                )
+                manual_code = manual_resolver.fetch(purpose="mfa_login")
+                try:
+                    verify_resp = verify_mfa_totp(auth, factor_id, manual_code)
+                except Exception as exc:
+                    _check_budget()
+                    if isinstance(exc, ChatGPTLoginError):
+                        raise
+                    if _is_rejected_otp(exc):
+                        raise ChatGPTLoginError(LoginErrorCode.MFA_INVALID, "手动输入的动态码被服务端拒绝") from exc
+                    raise network_login_error(exc, "TOTP 验证") from exc
+                step = verify_resp
+                continue_url = _continue_url(auth, verify_resp) or continue_url
+            else:
+                raise ChatGPTLoginError(
+                    LoginErrorCode.MFA_REQUIRED, "服务端要求 MFA，但账号无可用 TOTP"
+                )
+            login_method = (
+                LoginMethod.PASSWORD_TOTP
+                if login_method == LoginMethod.PASSWORD
+                else LoginMethod.EMAIL_OTP_TOTP
+            )
 
-    result = auth.result
-    access_token = _text(getattr(result, "access_token", ""))
-    if not access_token:
-        raise ChatGPTLoginError(
-            LoginErrorCode.SESSION_NOT_RETURNED, "登录完成但未返回 access_token"
-        )
-
-    built = ChatGPTLoginResult(
-        access_token=access_token,
-        session_token=_text(getattr(result, "session_token", "")),
-        refresh_token=_text(getattr(result, "refresh_token", "")),
-        id_token=_text(getattr(result, "id_token", "")),
-        cookie_header=_text(getattr(result, "cookie_header", "")),
-        auth_session_json=_text(getattr(result, "auth_session_json", "")),
-        device_id=_text(getattr(result, "device_id", "")) or _text(device_id),
-        account_id=_decode_account_id(access_token),
-        login_method=login_method or LoginMethod.PASSWORD,
-        access_token_expires_at=parse_access_token_expiry(access_token),
-    )
-    emit(
-        "session 获取成功: accessToken=yes, "
-        f"sessionToken={'yes' if built.session_token else 'no'}, "
-        f"expires_at={built.access_token_expires_at or '未知'}"
-    )
-    try:
-        auth.close()
-    except Exception:
-        pass
-    if callable(resolver_close):
+        # ---- 取 session
+        _check_budget()
         try:
-            resolver_close()
+            continue_url = _select_workspace(auth, step, continue_url, emit)
+        except ChatGPTLoginError:
+            raise
+        except Exception as exc:
+            _check_budget()
+            raise network_login_error(exc, "工作区选择") from exc
+        emit("获取 ChatGPT session")
+        try:
+            _finish_session(auth, continue_url)
+        except ChatGPTLoginError:
+            raise
+        except AuthFlowError as exc:
+            raise network_login_error(exc, "session 获取") from exc
+        except Exception as exc:
+            if cancel_check and cancel_check():
+                raise ChatGPTLoginError(LoginErrorCode.CANCELLED, "任务已取消") from exc
+            raise ChatGPTLoginError(
+                LoginErrorCode.TOKEN_FETCH_TIMEOUT, f"session 获取失败: {type(exc).__name__}"
+            ) from exc
+
+        result = auth.result
+        access_token = _text(getattr(result, "access_token", ""))
+        if not access_token:
+            raise ChatGPTLoginError(
+                LoginErrorCode.SESSION_NOT_RETURNED, "登录完成但未返回 access_token"
+            )
+
+        _check_budget()
+        emit("使用 Bearer Token 验证业务接口与账号身份")
+        profile = validate_chatgpt_token(
+            access_token, expected_email=email, proxy=proxy,
+            timeout=deadline - time.monotonic(), cancel_check=cancel_check,
+            register_cancel_callback=register_cancel_callback,
+            browser_profile=getattr(auth, "_browser_profile", None),
+            challenge_options=getattr(auth, "_login_challenge_options", None),
+        )
+        _check_budget()
+        from platforms.chatgpt.switch import extract_session_token
+        cookie_header = _text(getattr(result, "cookie_header", ""))
+        built = ChatGPTLoginResult(
+            access_token=access_token,
+            session_token=extract_session_token(_text(getattr(result, "session_token", "")), cookie_header),
+            refresh_token=_text(getattr(result, "refresh_token", "")),
+            id_token=_text(getattr(result, "id_token", "")),
+            cookie_header=cookie_header,
+            auth_session_json=_text(getattr(result, "auth_session_json", "")),
+            device_id=_text(getattr(result, "device_id", "")) or _text(device_id),
+            account_id=_decode_account_id(access_token) or _text(profile.get("account_id")) or _text(profile.get("id")),
+            login_method=login_method or LoginMethod.PASSWORD,
+            access_token_expires_at=parse_access_token_expiry(access_token),
+            token_verified=True,
+            verified_email=profile["email"],
+            verified_user_id=profile["id"],
+        )
+        emit(
+            "Token 已被业务接口接受，账号身份一致: accessToken=yes, "
+            f"sessionToken={'yes' if built.session_token else 'no'}, "
+            f"expires_at={built.access_token_expires_at or '未知'}"
+        )
+        return built
+    except ChatGPTLoginError as exc:
+        _check_budget()
+        if exc.code == LoginErrorCode.RISK_CONTROL and _proxy_attempt < 9:
+            from registration_core.login_transport import rotate_proxy_session
+            next_proxy = rotate_proxy_session(proxy or "")
+            if next_proxy:
+                emit(f"Cloudflare 挑战仍未通过，使用新的代理会话重新登录（{_proxy_attempt + 2}/10）")
+                timeout_timer.cancel()
+                auth.close()
+                return login_chatgpt_web(
+                    email=email, password=password, totp_secret=totp_secret, proxy=next_proxy,
+                    otp_resolver=otp_resolver, manual_totp_handle=manual_totp_handle,
+                    log=emit, cancel_check=cancel_check, register_cancel_callback=register_cancel_callback,
+                    deadline_seconds=deadline_seconds, _proxy_attempt=_proxy_attempt + 1, _deadline=deadline,
+                )
+        raise
+    except Exception:
+        _check_budget()
+        raise
+    finally:
+        timeout_timer.cancel()
+        try:
+            auth.close()
         except Exception:
             pass
-    return built
+        if callable(resolver_close):
+            try:
+                resolver_close()
+            except Exception:
+                pass

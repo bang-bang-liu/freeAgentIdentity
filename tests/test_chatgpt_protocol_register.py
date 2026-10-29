@@ -4,6 +4,8 @@ import json
 import sys
 import types
 
+import pytest
+
 from platforms.chatgpt.constants import CHATGPT_APP, OPENAI_API_ENDPOINTS, SENTINEL_REQ_URL
 from platforms.chatgpt.plugin import ChatGPTPlatform
 from platforms.chatgpt.fingerprint import (
@@ -57,6 +59,8 @@ class _FakeSession:
 
     def get(self, url, **kwargs):
         self.calls.append(("GET", url, kwargs))
+        if url == f"{CHATGPT_APP}/backend-api/me":
+            return _FakeResponse(payload={"id": "user-test", "email": "user@example.com"})
         if url == f"{CHATGPT_APP}/api/auth/csrf":
             return _FakeResponse(payload={"csrfToken": "csrf-token"})
         if url == "https://auth.openai.com/authorize-start":
@@ -124,6 +128,11 @@ class _FakeSession:
 
     def close(self):
         self.closed = True
+
+
+@pytest.fixture(autouse=True)
+def isolated_bearer_validation(monkeypatch):
+    monkeypatch.setattr("platforms.chatgpt.token_validation.create_http_session", lambda **_kwargs: _FakeSession())
 
 
 def test_protocol_register_completes_email_flow_without_browser():

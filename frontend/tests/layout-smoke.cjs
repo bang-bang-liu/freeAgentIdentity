@@ -5,7 +5,7 @@ const path = require('node:path');
 const baseURL = process.env.UI_BASE_URL || 'http://127.0.0.1:5173';
 const output = path.resolve(__dirname, '../../.runtime/taste-ui-qa');
 const accounts = Array.from({ length: 43 }, (_, i) => ({
-  id: i + 1, email: `test.account.${String(i + 1).padStart(2, '0')}@example.com`, password: 'test-only',
+  id: i + 1, platform: 'chatgpt', email: `test.account.${String(i + 1).padStart(2, '0')}@example.com`, password: 'test-only',
   display_status: i % 7 === 0 ? 'invalid' : 'registered', lifecycle_status: 'registered',
   plan_state: i % 5 === 0 ? 'subscribed' : 'free', validity_status: i % 7 === 0 ? 'invalid' : 'valid',
   created_at: '2026-09-01T08:24:00', registered_at: '2026-09-01T08:24:00',
@@ -24,8 +24,13 @@ const settings = catalog.slice(0, 2).map((p, i) => ({
 const platform = { name: 'chatgpt', display_name: 'ChatGPT', supported_identity_modes: ['mailbox'], supported_executors: ['protocol', 'headless', 'headed'] };
 
 async function mockAPI(page) {
-  const state = { failure: false, empty: false, healthCases: false, statsFailure: false, statsEmpty: false, taskType: 'register', taskSuccess: 1, taskFailed: 1, taskStatus: 'running', writes: [] };
+  const state = { failure: false, empty: false, healthCases: false, statsFailure: false, statsEmpty: false, taskType: 'register', taskSuccess: 1, taskFailed: 1, taskStatus: 'running', loginPreviewFailure: false, loginBlocked: false, loginIds: [], loginProxy: '', writes: [] };
   const taskResponse = () => ({ type: state.taskType, status: state.taskStatus, success: state.taskSuccess, error_count: state.taskFailed, cancellable: state.taskStatus === 'running', progress_detail: { total: 5, current: state.taskSuccess + state.taskFailed, label: `${state.taskSuccess + state.taskFailed} / 5` }, registration_stats: { success: state.taskSuccess, failed: state.taskFailed, completed: state.taskSuccess + state.taskFailed, success_rate: state.taskSuccess + state.taskFailed ? Math.round(state.taskSuccess / (state.taskSuccess + state.taskFailed) * 1000) / 10 : null, failure_stages: state.taskFailed ? [{ stage: 'verification', count: state.taskFailed }] : [], setup_failures: 0, setup_failure_stages: [] } });
+  const currentTask = () => state.taskType !== 'login_refresh' ? taskResponse() : ({ ...taskResponse(), data: { items: state.taskStatus === 'running' ? [] : state.loginIds.map((id, i) => ({
+    account_id: id, email: accounts.find(a => a.id === id)?.email, status: state.taskStatus === 'cancelled' ? 'cancelled' : i === 0 ? 'succeeded' : 'failed',
+    login_method: 'password_totp', proxy: state.loginProxy, token_verified: i === 0 && state.taskStatus !== 'cancelled',
+    token_expires_at: '2026-11-01T00:00:00Z', error_code: i > 0 ? 'CREDENTIAL_REVOKED' : '', error_message: i > 0 ? '凭据已撤销' : '',
+  })) } });
   await page.route('**/api/**', async route => {
     const req = route.request();
     const url = new URL(req.url());
@@ -56,13 +61,32 @@ async function mockAPI(page) {
       const start = (Number(url.searchParams.get('page') || 1) - 1) * size;
       return send({ items: rows.slice(start, start + size), total: rows.length });
     }
-    if (endpoint === '/actions/chatgpt') return send({ actions: [] });
+    if (endpoint === '/actions/chatgpt') return send({ actions: [
+      { id: 'query_state', label: '查询状态/订阅', params: [] },
+      { id: 'rebind_email', label: '换绑邮箱', params: [{ key: 'new_email', label: '新邮箱', type: 'text', required: true }] },
+    ] });
     if (/^\/accounts\/\d+$/.test(endpoint)) return send({ ok: true });
     if (endpoint.startsWith('/accounts/export/')) return send({ items: accounts });
     if (endpoint.startsWith('/accounts/check-') || endpoint === '/accounts/login-refresh') { state.taskType = 'account_check_all'; return send({ task_id: 'layout-test' }); }
     if (endpoint === '/tasks/register') { state.taskType = 'register'; state.taskStatus = 'running'; return send({ task_id: 'layout-test' }); }
-    if (endpoint === '/tasks/layout-test') return send(taskResponse());
-    if (endpoint.endsWith('/cancel')) { state.taskStatus = 'cancelled'; return send(taskResponse()); }
+    if (endpoint === '/login-refresh/preview') {
+      if (state.loginPreviewFailure) return send({ detail: 'Fixture login preview unavailable' }, 503);
+      const body = req.postDataJSON?.() || {};
+      const items = (body.ids?.length ? accounts.filter(a => body.ids.includes(a.id)) : accounts).map((a, i) => ({
+        account_id: a.id, email: a.email, ready: !state.loginBlocked,
+        refresh_mode: ['password_totp', 'email_otp', 'manual_required'][i % 3],
+        blocking_reasons: state.loginBlocked ? ['缺少邮箱'] : i % 3 === 2 ? ['需要邮箱验证码'] : [],
+      }));
+      return send({ accounts: items, can_start: items.length > 0 && !state.loginBlocked });
+    }
+    if (endpoint === '/login-refresh/create') {
+      const body = req.postDataJSON?.() || {};
+      state.loginIds = body.ids || [1]; state.loginProxy = body.proxy || ''; state.loginBody = body;
+      state.taskType = 'login_refresh'; state.taskStatus = 'running';
+      return send({ task_id: 'layout-test' });
+    }
+    if (endpoint === '/tasks/layout-test') return send(currentTask());
+    if (endpoint.endsWith('/cancel')) { state.taskStatus = 'cancelled'; return send(currentTask()); }
     if (endpoint.endsWith('/logs/stream')) return route.fulfill({ contentType: 'text/event-stream', body: 'data: {"id":1,"line":"[18:30:42] Worker 1: mailbox ready","detail":{"subtask_id":"worker_1","subtask_label":"Worker 1"}}\n\ndata: {"id":2,"line":"[18:30:45] Worker 1: account saved","detail":{"subtask_id":"worker_1","subtask_label":"Worker 1"}}\n\n' });
     if (endpoint.endsWith('/events') || endpoint.endsWith('/otp-requests')) return send({ items: [] });
     if (endpoint.endsWith('/mailboxes')) return send({ items: [{ email: 'mailbox.test@example.com', key: 'test-mailbox', used: false, active: false }] });
@@ -95,7 +119,7 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
   const browser = await chromium.launch({ headless: true, channel: process.env.UI_BROWSER_CHANNEL || 'msedge' });
   const errors = [];
   try {
-    for (const width of [1440, 1024, 390, 360]) {
+    for (const width of (process.env.UI_TEST_WIDTHS || '1440,1024,390,360').split(',').map(Number)) {
       for (const theme of ['light', 'dark']) {
         const context = await browser.newContext({ viewport: { width, height: 900 }, reducedMotion: 'reduce', isMobile: width < 768, hasTouch: width < 768 });
         const page = await context.newPage();
@@ -176,6 +200,7 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
     await page.getByRole('dialog', { name: '账号详情', exact: true }).waitFor();
     await page.keyboard.press('Escape');
     await page.getByRole('dialog').waitFor({ state: 'hidden' });
+    await page.waitForFunction(() => document.activeElement.textContent === 'test.account.02@example.com', null, { timeout: 2000 });
     assert.equal(await page.evaluate(() => document.activeElement.textContent), 'test.account.02@example.com');
     await page.getByRole('button', { name: '紧凑行高', exact: true }).click();
     assert.equal(await page.locator('.accounts-panel').getAttribute('data-density'), 'compact');
@@ -199,6 +224,7 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
     await page.reload();
     await page.getByRole('alert').first().waitFor();
     await page.screenshot({ path: path.join(output, 'accounts-error.png') });
+    if (!process.env.UI_TEST_WIDTHS || process.env.UI_TEST_WIDTHS.split(',').some(width => Number(width) < 768)) {
     await page.setViewportSize({ width: 390, height: 844 });
     await page.getByRole('button', { name: '展开侧栏', exact: true }).first().click();
     await page.locator('.app-sidebar.is-mobile-open').waitFor();
@@ -212,6 +238,7 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
     await page.getByRole('button', { name: '邮箱管理', exact: true }).first().click();
     await page.getByText('mailbox.test@example.com', { exact: true }).waitFor();
     await page.screenshot({ path: path.join(output, 'mailbox-manager-mobile.png') });
+    }
     await context.close();
     const healthContext = await browser.newContext({ viewport: { width: 1280, height: 720 } });
     const healthPage = await healthContext.newPage();

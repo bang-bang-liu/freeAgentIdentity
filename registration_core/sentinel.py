@@ -181,6 +181,11 @@ def fetch_sentinel_challenge(
             return response.json()
         logger.warning(f"Sentinel /req 非 200: {response.status_code}")
     except Exception as exc:
+        if callable(getattr(session, "check_budget", None)):
+            session.check()
+            from .auth_errors import AuthFlowError
+            if isinstance(exc, AuthFlowError):
+                raise
         logger.warning(f"Sentinel /req 异常: {exc}")
         return None
     return None

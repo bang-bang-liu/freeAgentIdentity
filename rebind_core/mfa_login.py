@@ -12,6 +12,7 @@ from .paths import ensure_icloud_on_path
 ensure_icloud_on_path()
 
 from registration_core.auth_flow import AuthFlow, AuthResult  # noqa: E402
+from registration_core.auth_errors import AuthFlowError  # noqa: E402
 from registration_core.config import Config  # noqa: E402
 from registration_core.mfa_totp_protocol import totp_code_candidates  # noqa: E402
 
@@ -175,6 +176,8 @@ def issue_mfa_challenge(auth: AuthFlow, factor_id: str) -> dict[str, Any]:
         except Exception:
             pass
     if resp.status_code != 200:
+        if getattr(auth, "_login_challenge_options", None):
+            raise AuthFlowError.from_response("MFA challenge", resp)
         raise MfaLoginError("MFA_FAILED", f"issue_challenge HTTP {resp.status_code}: {(resp.text or '')[:200]}")
     try:
         return resp.json()
@@ -187,6 +190,9 @@ def verify_mfa_totp(auth: AuthFlow, factor_id: str, code: str) -> dict[str, Any]
     headers = auth._common_headers(referer)
     headers["Content-Type"] = "application/json"
     headers["Accept"] = "application/json"
+    if getattr(auth, "_login_challenge_options", None):
+        auth.get_sentinel_token(auth.result.device_id, flow="password_verify")
+        auth._apply_sentinel_headers(headers, step="mfa_verify")
     resp = auth.session.post(
         "https://auth.openai.com/api/accounts/mfa/verify",
         headers=headers,
@@ -199,6 +205,8 @@ def verify_mfa_totp(auth: AuthFlow, factor_id: str, code: str) -> dict[str, Any]
         except Exception:
             pass
     if resp.status_code != 200:
+        if getattr(auth, "_login_challenge_options", None):
+            raise AuthFlowError.from_response("TOTP 验证", resp)
         raise MfaLoginError("MFA_FAILED", f"verify HTTP {resp.status_code}: {(resp.text or '')[:200]}")
     try:
         return resp.json()

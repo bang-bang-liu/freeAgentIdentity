@@ -10,6 +10,7 @@ import {
 import { useI18n } from "@/lib/i18n-context";
 import { RegistrationCharts } from "@/components/registration/RegistrationCharts";
 import { taskRegistrationStatistics } from "@/lib/registration-stats";
+import { loginMethodLabel } from "@/lib/login-refresh";
 
 /**
  * 单条日志事件。`subtaskId` 来自后端 ``serialize_event(...).detail.subtask_id``——
@@ -524,6 +525,24 @@ export function TaskLogPanel({
         </div>
       </div>
 
+      {task?.type === 'login_refresh' && Array.isArray(task?.data?.items) && task.data.items.length > 0 && (
+        <div className="max-h-64 space-y-2 overflow-y-auto" aria-label="重新登录执行结果">
+          {task.data.items.map((item: any) => <div key={item.account_id} className="rounded-lg border border-[var(--border)] bg-[var(--bg-pane)] p-3 text-xs">
+            <div className="flex flex-wrap justify-between gap-2">
+              <span className="break-all font-medium text-[var(--text-primary)]">{item.email || `账号 #${item.account_id}`}</span>
+              <span className={item.status === 'succeeded' && item.token_verified ? 'text-[var(--status-success)]' : item.status === 'failed' ? 'text-[var(--status-danger)]' : 'text-[var(--text-secondary)]'}>
+                {item.status === 'succeeded' && item.token_verified ? 'Token 验证通过 · 已保存' : item.status === 'cancelled' ? '已取消 · 保留原凭据' : '登录失败 · 保留原凭据'}
+              </span>
+            </div>
+            <p className="mt-1 break-all text-[var(--text-secondary)]">方式：{loginMethodLabel(item.login_method)} · 代理：{item.proxy || '直连'}</p>
+            {item.token_expires_at && <p className="mt-1 text-[var(--text-muted)]">Token 到期：{item.token_expires_at}</p>}
+            {item.error_message && <p className="mt-1 break-words text-[var(--status-danger)]">{item.error_code}：{item.error_message}</p>}
+          </div>)}
+        </div>
+      )}
+      {task?.type === 'login_refresh' && currentStatus === 'cancelled' && (
+        <p role="status" className="text-xs text-[var(--text-secondary)]">已取消。未完成登录的账号保留原凭据，已保存的成功结果仍保留。</p>
+      )}
       <div className="log-console min-h-[260px] flex-1 overflow-y-auto p-3 font-mono text-xs">
         {events.length === 0 ? (
           <div className="flex h-full min-h-[180px] items-center justify-center rounded-lg border border-dashed border-[var(--border)] text-[var(--text-muted)]">

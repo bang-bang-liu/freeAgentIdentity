@@ -1569,13 +1569,17 @@ class ChatGPTProtocolRegister:
                 "password_path": "registration_existing",
             }
         else:
-            password_result = self._setup_password_protocol(
-                email=email,
-                password=password,
-                secret=str(totp_result.get("totp_secret") or ""),
-                excluded_codes=excluded_codes,
-                registration_email_identities=registration_email_identities,
-            )
+            try:
+                password_result = self._setup_password_protocol(
+                    email=email,
+                    password=password,
+                    secret=str(totp_result.get("totp_secret") or ""),
+                    excluded_codes=excluded_codes,
+                    registration_email_identities=registration_email_identities,
+                )
+            except Exception as exc:
+                from platforms.chatgpt.registration_credentials import PartialSecuritySetupError
+                raise PartialSecuritySetupError(exc, {**totp_result, "password_set": bool(password), "password_path": "registration"}) from exc
         if password_result.get("password_set"):
             self.log(f"设置的密码: {password}")
         return {**totp_result, **password_result}
@@ -1639,13 +1643,14 @@ class ChatGPTProtocolRegister:
             cookies = self.session.cookies.get_dict()
         except Exception:
             cookies = {}
+        from platforms.chatgpt.switch import extract_session_token
         return {
             "email": email,
             "password": password,
             "account_id": account_id,
             "workspace_id": workspace_id,
             "access_token": access_token,
-            "session_token": str(payload.get("sessionToken") or ""),
+            "session_token": extract_session_token(str(payload.get("sessionToken") or ""), "; ".join(f"{k}={v}" for k, v in cookies.items())),
             "refresh_token": "",
             "id_token": "",
             "cookies": cookies,
@@ -1746,6 +1751,7 @@ class ChatGPTProtocolRegister:
                         "totp_set": False,
                         "totp_secret": "",
                         "otpauth": "",
+                        **getattr(exc, "partial_result", {}),
                     }
             else:
                 self.log("已跳过注册后的 TOTP+密码设置")
@@ -1767,7 +1773,8 @@ class ChatGPTProtocolRegister:
                     )
                     result = pre_security_session_result
                 else:
-                    raise
+                    self.log(f"最终 session 获取失败，保留已注册账号：{exc}")
+                    result = {"email": email, "password": password}
             result.update(
                 {
                     "password_set": bool(security_info.get("password_set")),
@@ -1780,7 +1787,12 @@ class ChatGPTProtocolRegister:
                 }
             )
             self.log("ChatGPT 协议注册完成并已获取 session")
-            return result
+            from platforms.chatgpt.registration_credentials import finalize_registered_credentials
+            return finalize_registered_credentials(
+                result, proxy=self.proxy, otp_callback=self.otp_callback, log=self.log,
+                cancel_check=self.cancel_check,
+                register_cancel_callback=getattr(self, "register_cancel_callback", None),
+            )
         finally:
             try:
                 self.sentinel.close()

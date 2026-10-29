@@ -76,6 +76,8 @@ class LoginRefreshAccountResult:
     totp_created: bool = False
     error_code: str = ""
     error_message: str = ""
+    proxy: str = ""
+    token_verified: bool = False
 
 
 @dataclass

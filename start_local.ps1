@@ -15,6 +15,15 @@ if (-not (Test-Path -LiteralPath $NodeExe)) {
     throw "Local Node.js runtime is missing: $NodeExe"
 }
 
+$LoginRuntime = Join-Path $Root "registration_core\cloudflare"
+if (-not (Test-Path -LiteralPath (Join-Path $LoginRuntime "node_modules\jsdom\package.json"))) {
+    Push-Location -LiteralPath $LoginRuntime
+    try {
+        & $NodeExe (Join-Path $Root ".tools\node\node_modules\npm\bin\npm-cli.js") ci --omit=dev
+        if ($LASTEXITCODE -ne 0) { throw "Login challenge runtime dependencies could not be installed." }
+    } finally { Pop-Location }
+}
+
 $Runtime = Join-Path $Root ".runtime"
 $env:LOCALAPPDATA = Join-Path $Runtime "appdata"
 $env:APPDATA = Join-Path $Runtime "appdata"

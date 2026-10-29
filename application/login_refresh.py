@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import json
-import secrets
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any
 
@@ -16,30 +16,27 @@ from application.login_refresh_types import (
     LoginRefreshAccountState,
     LoginRefreshPreview,
     LoginRefreshPreviewItem,
-    LoginRefreshRequest,
     LoginRefreshTaskResult,
 )
 from application.manual_otp import ManualOtpHandle, manual_otp_registry
 from application.tasks import (
     TASK_STATUS_CANCELLED,
     TASK_STATUS_FAILED,
-    TASK_STATUS_RUNNING,
     TASK_STATUS_SUCCEEDED,
     TASK_TYPE_LOGIN_REFRESH,
     TaskLogger,
     create_task,
 )
 from core.account_graph import load_account_graphs, patch_account_graph
-from core.auth_metadata import build_auth_metadata, get_auth_metadata, merge_auth_metadata, set_auth_metadata
+from core.auth_metadata import get_auth_metadata
 from core.db import AccountCredentialModel, AccountModel, AccountOverviewModel, engine
 from core.platform_accounts import resolve_primary_token
 from core.workbench_api_mailbox import WorkbenchApiRebuiltMailbox
-from platforms.chatgpt.login_client import EmailOtpResolver, login_chatgpt_web, mask_email
+from platforms.chatgpt.login_client import EmailOtpResolver, login_chatgpt_web
 from platforms.chatgpt.login_types import (
     ChatGPTLoginError,
     ChatGPTLoginResult,
     LoginErrorCode,
-    SecuritySetupResult,
 )
 
 
@@ -127,6 +124,7 @@ def _build_email_otp_resolver_from_graph(
             mode=email_otp_mode,
             log=log,
             cancel_check=cancel_check,
+            email=email,
         )
     elif email_otp_mode in ["auto", "auto_then_manual"]:
         # 自动或自动+手动模式
@@ -136,6 +134,7 @@ def _build_email_otp_resolver_from_graph(
             mode=email_otp_mode,
             log=log,
             cancel_check=cancel_check,
+            email=email,
         )
 
     return None
@@ -199,8 +198,8 @@ def get_login_refresh_account_overview(
                 LoginRefreshAccountState(
                     id=acc.id,
                     platform=acc.platform,
-                    email=mask_email(acc.email) if acc.email else "",
-                    lifecycle_status=acc.lifecycle_status or "",
+                    email=acc.email or "",
+                    lifecycle_status=graph.get("lifecycle_status") or "registered",
                     password_present=password_present,
                     totp_present=totp_present,
                     email_otp_source_present=email_otp_source_present,
@@ -328,6 +327,10 @@ def create_login_refresh_task(
     email_otp_mode: str = "auto_then_manual",
 ) -> dict[str, Any]:
     """创建持久化任务并唤醒 TaskRuntime。"""
+    if platform != "chatgpt":
+        raise ValueError("目前只支持 chatgpt 平台")
+    if email_otp_mode not in {"auto", "manual", "auto_then_manual"}:
+        raise ValueError("邮箱验证码来源无效")
     # 去重和限制
     unique_ids = list(dict.fromkeys(account_ids))
     if not unique_ids:
@@ -336,10 +339,6 @@ def create_login_refresh_task(
         raise ValueError("单次任务账号数量不能超过 100")
     if concurrency < 1 or concurrency > 3:
         concurrency = 1
-
-    # 拒绝 secret 字段
-    forbidden_keys = {"password", "totp_secret", "email_otp", "mail_api_key", "access_token", "session_token"}
-    # （这里只是示意；实际的入参结构已经限制为只有公开字段）
 
     payload = {
         "platform": platform,
@@ -450,19 +449,28 @@ def _execute_login_refresh_task(payload: dict[str, Any], logger: TaskLogger) -> 
     def consume_result(result: LoginRefreshAccountResult) -> None:
         nonlocal completed, cancelled, succeeded, failed
         nonlocal security_setup_completed, security_setup_partial
+        results.append(result)
         if result.status == "cancelled":
             cancelled = True
             return
-        results.append(result)
         completed += 1
         if result.status == "succeeded":
             succeeded += 1
+            record_success = getattr(logger, "record_success", None)
+            if callable(record_success):
+                record_success()
             if result.security_setup_status == "completed":
                 security_setup_completed += 1
             elif result.security_setup_status == "partial":
                 security_setup_partial += 1
         else:
             failed += 1
+            record_error = getattr(logger, "record_error", None)
+            if callable(record_error):
+                record_error(f"{result.email or result.account_id}: {result.error_code} {result.error_message}")
+        logger.set_result_data({"platform": platform, "requested": len(account_ids),
+                                "succeeded": succeeded, "failed": failed,
+                                "items": [asdict(item) for item in results]})
         # Keep the original one-argument logger contract; the task row already
         # carries ``progress_total`` from create_login_refresh_task().
         logger.set_progress(completed)
@@ -552,12 +560,7 @@ def _execute_login_refresh_task(payload: dict[str, Any], logger: TaskLogger) -> 
             "security_setup_completed": task_result.security_setup_completed,
             "security_setup_partial": task_result.security_setup_partial,
             "items": [
-                {
-                    "account_id": r.account_id,
-                    "status": r.status,
-                    "security_setup_status": r.security_setup_status,
-                }
-                for r in task_result.items
+                asdict(r) for r in task_result.items
             ],
         }
     )
@@ -576,336 +579,186 @@ def _execute_login_refresh_task(payload: dict[str, Any], logger: TaskLogger) -> 
 
 
 def _refresh_single_account(
-    *,
-    account_id: int,
-    platform: str,
-    proxy: str,
-    setup_security: bool,
-    email_otp_mode: str,
-    logger: TaskLogger,
+    *, account_id: int, platform: str, proxy: str, setup_security: bool,
+    email_otp_mode: str, logger: TaskLogger,
 ) -> LoginRefreshAccountResult:
-    """单账号刷新登录执行器。"""
+    """Login under the task's account lock; never save an unverified token."""
     with Session(engine) as session:
         account = session.get(AccountModel, account_id)
         if not account:
-            return LoginRefreshAccountResult(
-                account_id=account_id,
-                email="",
-                status="failed",
-                error_code="ACCOUNT_NOT_FOUND",
-                error_message="账号不存在",
-            )
-
-        if account.platform != platform:
-            return LoginRefreshAccountResult(
-                account_id=account_id,
-                email=mask_email(account.email) if account.email else "",
-                status="failed",
-                error_code="PLATFORM_UNSUPPORTED",
-                error_message="平台不匹配",
-            )
-
-        if not account.email:
-            return LoginRefreshAccountResult(
-                account_id=account_id,
-                email="",
-                status="failed",
-                error_code="MISSING_EMAIL",
-                error_message="账号邮箱为空",
-            )
-
+            return LoginRefreshAccountResult(account_id, "", "failed", error_code=LoginErrorCode.ACCOUNT_NOT_FOUND, error_message="账号不存在")
+        if account.platform != platform or platform != "chatgpt":
+            return LoginRefreshAccountResult(account_id, account.email, "failed", error_code=LoginErrorCode.PLATFORM_UNSUPPORTED, error_message="平台不匹配")
         graph = load_account_graphs(session, [account_id])[account_id]
-        creds_list = graph.get("credentials", [])
-        creds = {item["key"]: item["value"] for item in creds_list}
-
-        password = account.password or ""
-        totp_secret = creds.get("totp_secret", "")
-
-        has_password = bool(password)
-        has_totp = bool(totp_secret)
-        has_email_otp_source = _has_email_otp_source(graph)
-
-        logger.log(
-            f"读取已保存登录资料：password={'yes' if has_password else 'no'}, "
-            f"totp={'yes' if has_totp else 'no'}, email_otp_source={'yes' if has_email_otp_source else 'no'}"
+        creds = {item["key"]: item["value"] for item in graph.get("credentials", []) if item.get("scope") == "platform"}
+        password, totp_secret = account.password or "", creds.get("totp_secret", "")
+        password_created = totp_created = False
+        security_setup_status = "skipped"
+        login_result = None
+        otp_resolver = None
+        manual_handle = ManualOtpHandle(
+            task_id=logger.task_id, worker_id=f"account_{account_id}",
+            worker_label=account.email, registry=manual_otp_registry,
         )
+        register_cancel = getattr(logger, "register_cancel_callback", None)
 
-        # 构建手动 OTP 处理器
-        manual_otp_handle = ManualOtpHandle(
-            task_id=logger.task_id,
-            worker_id=f"account_{account_id}",
-            worker_label=mask_email(account.email),
-            registry=manual_otp_registry,
-        )
+        def check_cancelled():
+            if logger.is_cancel_requested():
+                raise ChatGPTLoginError(LoginErrorCode.CANCELLED, "任务已取消")
 
-        # 构建邮箱 OTP resolver
-        otp_resolver = _build_email_otp_resolver_from_graph(
-            graph=graph,
-            email=account.email,
-            manual_handle=manual_otp_handle,
-            email_otp_mode=email_otp_mode,
-            log=logger.log,
-            cancel_check=logger.is_cancel_requested,
-        )
-
-        # 构建手动 TOTP 处理器（当账号无保存的 TOTP 时使用）
-        manual_totp_handle = manual_otp_handle if not has_totp else None
+        def authenticate():
+            nonlocal otp_resolver
+            otp_resolver = _build_email_otp_resolver_from_graph(
+                graph=graph, email=account.email, manual_handle=manual_handle,
+                email_otp_mode=email_otp_mode, log=logger.log,
+                cancel_check=logger.is_cancel_requested,
+            )
+            return login_chatgpt_web(
+                email=account.email, password=password, totp_secret=totp_secret,
+                proxy=proxy or None, otp_resolver=otp_resolver,
+                manual_totp_handle=manual_handle if not totp_secret else None,
+                log=logger.log, cancel_check=logger.is_cancel_requested,
+                register_cancel_callback=register_cancel if callable(register_cancel) else None,
+            )
 
         try:
-            if logger.is_cancel_requested():
-                return LoginRefreshAccountResult(
-                    account_id=account_id,
-                    email=mask_email(account.email),
-                    status="cancelled",
-                    error_code=LoginErrorCode.CANCELLED,
-                    error_message="任务已取消",
-                )
-            # 主登录流程
-            logger.log("开始 ChatGPT 登录")
-            register_cancel_callback = getattr(logger, "register_cancel_callback", None)
-            login_result = login_chatgpt_web(
-                email=account.email,
-                password=password,
-                totp_secret=totp_secret,
-                proxy=proxy or None,
-                otp_resolver=otp_resolver,
-                manual_totp_handle=manual_totp_handle,
-                log=logger.log,
-                cancel_check=logger.is_cancel_requested,
-                register_cancel_callback=(
-                    register_cancel_callback
-                    if callable(register_cancel_callback)
-                    else None
-                ),
-            )
-
-            if logger.is_cancel_requested():
-                return LoginRefreshAccountResult(
-                    account_id=account_id,
-                    email=mask_email(account.email),
-                    status="cancelled",
-                    error_code=LoginErrorCode.CANCELLED,
-                    error_message="任务已取消",
-                )
-
-            logger.log(
-                f"登录成功：method={login_result.login_method}, "
-                f"access_token={'yes' if login_result.access_token else 'no'}"
-            )
-
-            # 安全设置流程
-            security_setup_status = "skipped"
-            password_created = False
-            totp_created = False
-            new_password_plaintext = ""
-
+            check_cancelled()
+            logger.log(f"开始登录 {account.email}；代理：{proxy or '直连'}")
+            login_result = authenticate()
+            check_cancelled()
+            if not login_result.is_valid():
+                raise ChatGPTLoginError(LoginErrorCode.CREDENTIAL_INVALID, "登录未返回经业务接口验证的 Token")
             if setup_security:
-                if logger.is_cancel_requested():
-                    return LoginRefreshAccountResult(
-                        account_id=account_id,
-                        email=mask_email(account.email),
-                        status="cancelled",
-                        error_code=LoginErrorCode.CANCELLED,
-                        error_message="任务已取消",
-                    )
-                logger.log(f"开始安全设置：has_password={has_password}, has_totp={has_totp}")
-
-                # 调用 ensure_security
                 from platforms.chatgpt.ensure_security import ensure_security
-
-                security_result = ensure_security(
-                    email=account.email,
-                    session=login_result,
-                    has_password=has_password,
-                    has_totp=has_totp,
-                    proxy=proxy or "",
-                    log=logger.log,
+                from platforms.chatgpt.token_validation import validate_chatgpt_token
+                security = ensure_security(
+                    email=account.email, session=login_result,
+                    has_password=bool(password), has_totp=bool(totp_secret),
+                    proxy=proxy, log=logger.log,
                 )
-
-                password_created = security_result.password_created
-                totp_created = security_result.totp_created
-                security_setup_status = security_result.security_setup_status
-
-                if security_result.password_created:
-                    password = security_result.new_password
-                    new_password_plaintext = security_result.new_password
-                if security_result.totp_created:
-                    totp_secret = security_result.totp_secret
-
-                logger.log(
-                    f"安全设置完成：status={security_setup_status}, "
-                    f"password_created={password_created}, totp_created={totp_created}"
+                password_created, totp_created = security.password_created, security.totp_created
+                security_setup_status = security.security_setup_status
+                # Persist completed security changes even if reauth is later cancelled.
+                # Session credentials remain untouched until the final validation passes.
+                if password_created or totp_created:
+                    if password_created:
+                        password = security.new_password
+                        account.password = password
+                    if totp_created:
+                        totp_secret = security.totp_secret
+                    patch_account_graph(session, account, credential_updates={
+                        "totp_secret": totp_secret, "otpauth": security.otpauth,
+                    })
+                    session.commit()
+                check_cancelled()
+                try:
+                    validate_chatgpt_token(
+                        login_result.access_token, expected_email=account.email, proxy=proxy or None,
+                        cancel_check=logger.is_cancel_requested, register_cancel_callback=register_cancel,
+                    )
+                except ChatGPTLoginError as exc:
+                    if exc.code not in {LoginErrorCode.CREDENTIAL_REVOKED, LoginErrorCode.CREDENTIAL_INVALID}:
+                        raise
+                    logger.log("安全设置后凭据失效，重新认证一次")
+                    login_result = authenticate()
+            check_cancelled()
+            logger.log("身份验证通过，保存新的登录凭据")
+            try:
+                _persist_credentials(
+                    account_id=account_id, account_email=account.email, password=password,
+                    totp_secret=totp_secret, login_result=login_result,
+                    password_created=password_created, totp_created=totp_created,
+                    security_setup_status=security_setup_status, session=session,
                 )
-
-            # 持久化凭据
-            if logger.is_cancel_requested():
-                return LoginRefreshAccountResult(
-                    account_id=account_id,
-                    email=mask_email(account.email),
-                    status="cancelled",
-                    error_code=LoginErrorCode.CANCELLED,
-                    error_message="任务已取消",
-                )
-            logger.log("保存新的 ChatGPT 登录凭据")
-            _persist_credentials(
-                account_id=account_id,
-                account_email=account.email,
-                password=password,
-                totp_secret=totp_secret,
-                login_result=login_result,
-                password_created=password_created,
-                totp_created=totp_created,
-                security_setup_status=security_setup_status,
-                session=session,
-            )
-
-            logger.log("刷新登录成功")
+            except ChatGPTLoginError:
+                raise
+            except Exception as exc:
+                session.rollback()
+                raise ChatGPTLoginError(LoginErrorCode.PERSIST_FAILED, f"凭据保存失败：{type(exc).__name__}") from exc
+            logger.log(f"重新登录成功：{account.email}，方式 {login_result.login_method}")
             return LoginRefreshAccountResult(
-                account_id=account_id,
-                email=mask_email(account.email),
-                status="succeeded",
-                login_method=login_result.login_method,
-                access_token_updated=bool(login_result.access_token),
-                session_token_updated=bool(login_result.session_token),
+                account_id, account.email, "succeeded", proxy=proxy,
+                login_method=login_result.login_method, token_verified=True,
+                access_token_updated=True, session_token_updated=bool(login_result.session_token),
                 token_expires_at=login_result.access_token_expires_at,
                 security_setup_status=security_setup_status,
-                password_created=password_created,
-                totp_created=totp_created,
+                password_created=password_created, totp_created=totp_created,
             )
-
-        except ChatGPTLoginError as e:
-            if e.code == LoginErrorCode.CANCELLED or logger.is_cancel_requested():
-                logger.log("登录已取消", level="warning")
-                return LoginRefreshAccountResult(
-                    account_id=account_id,
-                    email=mask_email(account.email),
-                    status="cancelled",
-                    error_code=LoginErrorCode.CANCELLED,
-                    error_message="任务已取消",
-                )
-            logger.log(f"登录失败：{e}", level="error")
+        except Exception as exc:
+            cancelled = logger.is_cancel_requested() or (isinstance(exc, ChatGPTLoginError) and exc.code == LoginErrorCode.CANCELLED)
+            code = LoginErrorCode.CANCELLED if cancelled else (exc.code if isinstance(exc, ChatGPTLoginError) else LoginErrorCode.API_RESPONSE_INVALID)
+            message = "任务已取消" if cancelled else (exc.message if isinstance(exc, ChatGPTLoginError) else f"登录异常：{type(exc).__name__}")
+            session.rollback()
+            _record_login_failure(session, account, code, message, cancelled=cancelled)
+            logger.log(f"{account.email} 登录{'取消' if cancelled else '失败'}：{message}", level="warning" if cancelled else "error")
             return LoginRefreshAccountResult(
-                account_id=account_id,
-                email=mask_email(account.email),
-                status="failed",
-                error_code=str(e.code or LoginErrorCode.NETWORK_TIMEOUT),
-                error_message=e.message or str(e),
-            )
-        except Exception as e:
-            if logger.is_cancel_requested():
-                logger.log("登录已取消", level="warning")
-                return LoginRefreshAccountResult(
-                    account_id=account_id,
-                    email=mask_email(account.email),
-                    status="cancelled",
-                    error_code=LoginErrorCode.CANCELLED,
-                    error_message="任务已取消",
-                )
-            logger.log(f"登录失败：{e}", level="error")
-            return LoginRefreshAccountResult(
-                account_id=account_id,
-                email=mask_email(account.email),
-                status="failed",
-                error_code="LOGIN_FAILED",
-                error_message=str(e),
+                account_id, account.email, "cancelled" if cancelled else "failed", proxy=proxy,
+                login_method=login_result.login_method if login_result else "",
+                error_code=code, error_message=message, security_setup_status=security_setup_status,
+                password_created=password_created, totp_created=totp_created,
             )
         finally:
-            close_resolver = getattr(otp_resolver, "close", None)
-            if callable(close_resolver):
-                try:
-                    close_resolver()
-                except Exception:
-                    pass
+            if otp_resolver is not None:
+                otp_resolver.close()
 
 
-def _persist_credentials(
-    *,
-    account_id: int,
-    account_email: str,
-    password: str,
-    totp_secret: str,
-    login_result: ChatGPTLoginResult,
-    password_created: bool,
-    totp_created: bool,
-    security_setup_status: str,
-    session: Session,
-) -> None:
-    """原子更新账号凭据、密码和 auth 元数据。
-
-    设计依据：docs/CHATGPT_LOGIN_REFRESH_DESIGN.md 10.2。
-    - credential_updates 传入 login_result.credential_updates()（已过滤空值）
-    - primary_token 用 access_token（主 token 固定走单独参数）
-    - 密码更新走 AccountModel.password
-    - totp_secret / device_id 等其他凭据走 credential_updates
-    - 所有写操作在同一个 session 事务内完成
-    """
-    from core.account_graph import patch_account_graph
-
-    account = session.get(AccountModel, account_id)
-    if not account:
-        raise ValueError(f"账号 {account_id} 不存在")
-
-    # 构建凭据更新字典
-    credential_updates = login_result.credential_updates()
-
-    # 如果新建了 TOTP，加入凭据更新
-    if totp_secret:
-        credential_updates["totp_secret"] = totp_secret
-
-    # 更新账号图谱：主 token + 其他凭据
-    patch_account_graph(
-        session=session,
-        model=account,
-        primary_token=login_result.access_token if login_result.access_token else None,
-        credential_updates=credential_updates,
-    )
-
-    # 更新密码（如果有新建或已有）
-    if password:
-        account.password = password
-
-    # 读取 account_overviews 并更新 auth 元数据
-    overview_record = session.exec(
-        select(AccountOverviewModel).where(AccountOverviewModel.account_id == account_id)
-    ).first()
-
-    if not overview_record:
-        overview_record = AccountOverviewModel(
-            account_id=account_id,
-            platform_id=account_email,
-            summary_json="{}",
-        )
-        session.add(overview_record)
-
-    import json
-    summary_json = json.loads(overview_record.summary_json) if overview_record.summary_json else {}
-    existing_auth = get_auth_metadata(summary_json)
-
-    now = datetime.now(timezone.utc)
-    new_auth = build_auth_metadata(
-        last_login_at=now,
-        last_login_method=login_result.login_method,
-        access_token_obtained_at=now,
-        access_token_expires_at=datetime.fromisoformat(login_result.access_token_expires_at.replace("Z", "+00:00")) if login_result.access_token_expires_at else None,
-        token_exp_source="jwt_exp" if login_result.access_token_expires_at else "",
-        last_login_status="succeeded",
-        last_login_error_code="",
-        security_setup_status=security_setup_status,
-        security_setup_requested=security_setup_status != "skipped",
-        security_setup_at=now if security_setup_status in ["completed", "partial"] else None,
-        credential_version=existing_auth.get("credential_version", 0) + 1,
-    )
-
-    merged_auth = merge_auth_metadata(existing_auth, new_auth)
-    updated_summary = set_auth_metadata(summary_json, merged_auth)
-    overview_record.summary_json = json.dumps(updated_summary, ensure_ascii=False)
-
+def _record_login_failure(session: Session, account: AccountModel, code: str, message: str, *, cancelled=False):
+    graph = load_account_graphs(session, [account.id])[account.id]
+    auth = dict(graph.get("overview", {}).get("auth") or {})
+    auth.update(last_login_attempt_at=datetime.now(timezone.utc).isoformat(),
+                last_login_status="cancelled" if cancelled else "failed",
+                last_login_error_code=code, last_login_error=message)
+    updates = {"auth": auth}
+    if code in {LoginErrorCode.CREDENTIAL_INVALID, LoginErrorCode.CREDENTIAL_REVOKED, LoginErrorCode.ANONYMOUS_PROFILE}:
+        updates.update(login_required=True, valid=None, check_state="credential_invalid", check_error=message)
+    patch_account_graph(session, account, summary_updates=updates)
     session.commit()
 
 
-def _generate_password() -> str:
-    """生成符合 ChatGPT 密码策略的随机密码。"""
-    # 16 位随机字符：包含大小写字母、数字和特殊字符
-    import string
-    chars = string.ascii_letters + string.digits + "!@#$%^&*"
-    return "".join(secrets.choice(chars) for _ in range(16))
+def _persist_credentials(
+    *, account_id: int, account_email: str, password: str, totp_secret: str,
+    login_result: ChatGPTLoginResult, password_created: bool, totp_created: bool,
+    security_setup_status: str, session: Session,
+) -> None:
+    """Atomically replace verified credentials, identity and auth metadata."""
+    if not login_result.is_valid():
+        raise ChatGPTLoginError(LoginErrorCode.CREDENTIAL_INVALID, "拒绝保存未经业务接口验证的凭据")
+    if login_result.verified_email.casefold() != account_email.casefold():
+        raise ChatGPTLoginError(LoginErrorCode.IDENTITY_MISMATCH, "拒绝保存其他账号的登录凭据")
+    account = session.get(AccountModel, account_id)
+    if not account:
+        raise ValueError(f"账号 {account_id} 不存在")
+    graph = load_account_graphs(session, [account_id])[account_id]
+    auth = dict(graph.get("overview", {}).get("auth") or {})
+    now = datetime.now(timezone.utc).isoformat()
+    auth.update(
+        last_login_at=now, last_login_attempt_at=now, last_login_method=login_result.login_method,
+        access_token_obtained_at=now, access_token_expires_at=login_result.access_token_expires_at,
+        token_exp_source="jwt_exp" if login_result.access_token_expires_at else "",
+        token_verified_at=now, verified_email=login_result.verified_email,
+        verified_user_id=login_result.verified_user_id,
+        last_login_status="succeeded", last_login_error_code="", last_login_error="",
+        security_setup_status=security_setup_status, security_setup_requested=security_setup_status != "skipped",
+        credential_version=int(auth.get("credential_version") or 0) + 1,
+    )
+    credentials = login_result.credential_updates()
+    existing_keys = {item["key"] for item in graph.get("credentials", []) if item.get("scope") == "platform"}
+    for alias in ("legacy_token", "accessToken"):
+        if alias in existing_keys:
+            credentials[alias] = login_result.access_token
+    if "sessionToken" in existing_keys and login_result.session_token:
+        credentials["sessionToken"] = login_result.session_token
+    if totp_secret:
+        credentials["totp_secret"] = totp_secret
+    patch_account_graph(
+        session, account, primary_token=login_result.access_token,
+        credential_updates=credentials,
+        summary_updates={"auth": auth, "valid": True, "check_state": "valid", "check_error": "",
+                         "login_required": False, "checked_at": now},
+    )
+    if password:
+        account.password = password
+    if login_result.account_id:
+        account.user_id = login_result.account_id
+    account.updated_at = datetime.now(timezone.utc)
+    session.commit()

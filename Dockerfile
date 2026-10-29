@@ -6,6 +6,11 @@ RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
+# 登录挑战脚本的独立 Node 依赖，与前端产物分开安装。
+WORKDIR /app/registration_core/cloudflare
+COPY registration_core/cloudflare/package*.json ./
+RUN npm ci --omit=dev
+
 # Stage 2: Python 后端 + 运行环境
 FROM python:3.12-slim
 
@@ -46,6 +51,8 @@ RUN rm -rf .venv frontend
 
 # 复制前端构建产物
 COPY --from=frontend-builder /app/static ./static
+COPY --from=frontend-builder /usr/local/bin/node /usr/local/bin/node
+COPY --from=frontend-builder /app/registration_core/cloudflare/node_modules ./registration_core/cloudflare/node_modules
 
 # 启动脚本
 COPY docker-entrypoint.sh /docker-entrypoint.sh

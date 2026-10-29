@@ -200,80 +200,94 @@ def test_completed_account_is_kept_when_cancel_arrives_before_result_is_consumed
 
     assert logger.finished[-1][0] == TASK_STATUS_CANCELLED
     assert logger.result_data["succeeded"] == 1
-    assert logger.result_data["items"] == [
-        {
-            "account_id": 101,
-            "status": "succeeded",
-            "security_setup_status": "",
-        }
-    ]
+    assert len(logger.result_data["items"]) == 1
+    assert logger.result_data["items"][0]["account_id"] == 101
+    assert logger.result_data["items"][0]["status"] == "succeeded"
 
 
-def test_preview_identifies_password_totp_mode(tmp_path):
-    """预检：有密码有 TOTP 时识别为 password_totp 模式。"""
-    # 这是单元测试层面的逻辑验证，不依赖真实数据库
-    # 实际的 preview_login_refresh 需要数据库，这里只测试分类逻辑
-    pass  # 实际实现会读取账号和凭据，这里省略真实数据库依赖
+
+def test_preview_identifies_password_totp_and_manual_modes():
+    from core.account_graph import patch_account_graph
+    with Session(engine) as session:
+        accounts = [AccountModel(platform="chatgpt", email="password@example.com", password="saved"),
+                    AccountModel(platform="chatgpt", email="manual@example.com", password="")]
+        session.add_all(accounts)
+        session.commit()
+        ids = [a.id for a in accounts]
+        patch_account_graph(session, accounts[0], credential_updates={"totp_secret": "SAVEDSECRET"})
+        session.commit()
+    preview = preview_login_refresh(platform="chatgpt", account_ids=ids)
+    modes = {item.email: item.refresh_mode for item in preview.items}
+    assert modes == {"password@example.com": "password_totp", "manual@example.com": "manual_required"}
+    assert preview.can_start and all(item.ready for item in preview.items)
 
 
 def test_persist_credentials_updates_password_and_tokens():
-    """凭据持久化：更新密码、主 token、其他凭据和 auth 元数据。"""
-    # 验证 credential_updates 的调用逻辑，不依赖真实数据库
-    with patch("core.account_graph.patch_account_graph") as mock_patch:
-        mock_session = MagicMock()
-
-        # Mock 账号对象
-        mock_account = MagicMock()
-        mock_account.id = 999
-        mock_account.platform = "chatgpt"
-        mock_account.email = "test@example.com"
-        mock_account.password = ""
-        mock_session.get.return_value = mock_account
-
-        # Mock overview 查询
-        mock_session.exec.return_value.first.return_value = None
-
-        login_result = ChatGPTLoginResult(
-            access_token="fake_access_token",
-            session_token="fake_session_token",
-            refresh_token="",
-            id_token="",
-            cookie_header="fake_cookie",
-            auth_session_json="{}",
-            device_id="fake_device",
-            account_id="fake_account_id",
-            login_method="password",
-            access_token_expires_at="2026-09-10T00:00:00Z",
+    from core.account_graph import load_account_graphs, patch_account_graph
+    with Session(engine) as session:
+        account = AccountModel(platform="chatgpt", email="test@example.com", password="old")
+        session.add(account)
+        session.commit()
+        patch_account_graph(session, account, credential_updates={
+            "legacy_token": "old-legacy-token", "accessToken": "old-camel-token",
+            "sessionToken": "old-camel-session",
+        })
+        session.commit()
+        login = ChatGPTLoginResult(
+            access_token="fresh-token", session_token="fresh-session", cookie_header="new-cookies",
+            account_id="new-account-id", login_method="password_totp", token_verified=True,
+            verified_email=account.email, verified_user_id="user-test",
+            access_token_expires_at="2026-11-01T00:00:00Z",
         )
-
-        # 注意：这里直接传入 mock_session 而不是用 Session(engine)
-        _persist_credentials(
-            account_id=999,
-            account_email="test@example.com",
-            password="new_password_123",
-            totp_secret="ABCD1234",
-            login_result=login_result,
-            password_created=True,
-            totp_created=True,
-            security_setup_status="completed",
-            session=mock_session,
-        )
-
-        # 验证 patch_account_graph 被调用
-        assert mock_patch.called
-        call_kwargs = mock_patch.call_args.kwargs
-        assert call_kwargs["primary_token"] == "fake_access_token"
-        assert "totp_secret" in call_kwargs["credential_updates"]
-        assert call_kwargs["credential_updates"]["totp_secret"] == "ABCD1234"
-
-        # 验证密码更新
-        assert mock_account.password == "new_password_123"
+        _persist_credentials(account_id=account.id, account_email=account.email, password="saved-password",
+                             totp_secret="KEPTSECRET", login_result=login, password_created=False,
+                             totp_created=False, security_setup_status="skipped", session=session)
+        graph = load_account_graphs(session, [account.id])[account.id]
+        creds = {c["key"]: c["value"] for c in graph["credentials"]}
+        assert creds["access_token"] == "fresh-token" and creds["session_token"] == "fresh-session"
+        assert creds["legacy_token"] == creds["accessToken"] == "fresh-token"
+        assert creds["sessionToken"] == "fresh-session"
+        assert creds["cookies"] == "new-cookies" and creds["account_id"] == "new-account-id"
+        assert creds["totp_secret"] == "KEPTSECRET"
+        assert account.password == "saved-password" and account.user_id == "new-account-id"
+        assert graph["validity_status"] == "valid"
+        assert graph["overview"]["auth"]["last_login_status"] == "succeeded"
+        assert graph["overview"]["login_required"] is False
 
 
-def test_persist_credentials_creates_overview_if_missing():
-    """凭据持久化：不存在 overview 记录时自动创建。"""
-    # 完整测试需要数据库初始化，这里只验证逻辑分支
-    pass
+@pytest.mark.parametrize("failure", ["revoked", "cancelled", "password", "unverified"])
+def test_failed_login_preserves_credentials_and_records_reason(monkeypatch, failure):
+    from core.account_graph import patch_account_graph, load_account_graphs
+    from application.login_refresh import _refresh_single_account
+    with Session(engine) as session:
+        account = AccountModel(platform="chatgpt", email="test@example.com", password="old-password")
+        session.add(account)
+        session.commit()
+        aid = account.id
+        patch_account_graph(session, account, primary_token="old-token", credential_updates={
+            "session_token": "old-session", "cookies": "old-cookies", "totp_secret": "OLDSECRET",
+        })
+        session.commit()
+    code = {"revoked": LoginErrorCode.CREDENTIAL_REVOKED, "cancelled": LoginErrorCode.CANCELLED,
+            "password": LoginErrorCode.INVALID_PASSWORD, "unverified": LoginErrorCode.CREDENTIAL_INVALID}[failure]
+    def login(**_kwargs):
+        if failure == "unverified": return ChatGPTLoginResult(access_token="unverified")
+        raise ChatGPTLoginError(code, "fixture reason")
+    monkeypatch.setattr("application.login_refresh.login_chatgpt_web", login)
+    logger = MagicMock()
+    logger.task_id = "fixture-task"
+    logger.is_cancel_requested.return_value = False
+    result = _refresh_single_account(account_id=aid, platform="chatgpt", proxy="http://127.0.0.1:7897",
+                                     setup_security=False, email_otp_mode="manual", logger=logger)
+    assert result.error_code == code
+    assert result.status == ("cancelled" if failure == "cancelled" else "failed")
+    with Session(engine) as session:
+        graph = load_account_graphs(session, [aid])[aid]
+        creds = {c["key"]: c["value"] for c in graph["credentials"]}
+        assert creds["access_token"] == "old-token" and creds["session_token"] == "old-session"
+        assert creds["cookies"] == "old-cookies" and creds["totp_secret"] == "OLDSECRET"
+        assert session.get(AccountModel, aid).password == "old-password"
+        assert graph["overview"]["auth"]["last_login_error_code"] == code
 
 
 def test_credential_updates_excludes_empty_values():
@@ -300,3 +314,18 @@ def test_credential_updates_excludes_empty_values():
     # 空值字段不应该出现
     assert "refresh_token" not in updates
     assert "id_token" not in updates
+
+
+def test_task_query_exposes_persisted_login_results(client):
+    from core.db import TaskModel
+    data = {"items": [{"account_id": 1, "status": "succeeded", "token_verified": True,
+                        "email": "target@example.com", "login_method": "password_totp"}]}
+    with Session(engine) as session:
+        task = TaskModel(id="login-query-test", type="login_refresh", platform="chatgpt", status="succeeded")
+        task.set_result({"data": data})
+        session.add(task)
+        session.commit()
+    response = client.get('/api/tasks/login-query-test')
+    assert response.status_code == 200
+    assert response.json()["data"] == data
+    assert response.json()["result"]["data"] == data

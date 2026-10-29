@@ -10,6 +10,8 @@ from urllib.parse import unquote
 
 from curl_cffi import requests
 
+from platforms.chatgpt.query_auth import http_error_details, raise_for_status
+
 logger = logging.getLogger(__name__)
 WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 WHAM_USAGE_USER_AGENT = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
@@ -303,7 +305,9 @@ def fetch_plus_trial_checkout_chain(account, proxy: Optional[str] = None) -> dic
     if status_code != 200:
         return {
             "plus_trial_checkout_state": "unavailable",
-            "plus_trial_checkout_error": f"HTTP {status_code}",
+            "plus_trial_checkout_error": (
+                http_error_details(response)["error"] if status_code == 401 else f"HTTP {status_code}"
+            ),
         }
     try:
         payload = response.json()
@@ -356,7 +360,7 @@ def _usage(account, proxy: Optional[str]) -> dict:
         timeout=20,
         impersonate="chrome124",
     )
-    response.raise_for_status()
+    raise_for_status(response)
     data = response.json()
     if not isinstance(data, dict):
         raise ValueError("wham/usage response format is invalid")
@@ -434,14 +438,14 @@ def fetch_plus_trial_eligibility(
         if status_code == 403 or ("country" in params and status_code in {400, 422}):
             last_response = response
             continue
-        response.raise_for_status()
+        raise_for_status(response)
         data = response.json()
         if not isinstance(data, dict):
             raise ValueError("accounts/check response format is invalid")
         break
     else:
         if last_response is not None:
-            last_response.raise_for_status()
+            raise_for_status(last_response)
         raise RuntimeError("accounts/check request did not return a response")
 
     account_data = _plus_trial_account_data(data, account)
@@ -505,7 +509,7 @@ def fetch_subscription_status_details(
             timeout=20,
             impersonate="chrome110",
         )
-        response.raise_for_status()
+        raise_for_status(response)
         data = response.json()
         if isinstance(data, dict):
             usage = None

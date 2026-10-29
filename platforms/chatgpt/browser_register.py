@@ -973,10 +973,10 @@ def _recover_signup_password_page(page, log) -> bool:
     return True
 
 
-def _wait_for_signup_entry_transition(page, log, timeout: int = 20) -> dict:
+def _wait_for_signup_entry_transition(page, log, timeout: int = 20, *, context: str = "邮箱提交") -> dict:
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if _click_passwordless_login_if_available(page, log, context="邮箱页提交后"):
+        if _click_passwordless_login_if_available(page, log, context=f"{context}后"):
             time.sleep(0.5)
             continue
         state = _derive_registration_state_from_page(page)
@@ -994,9 +994,9 @@ def _wait_for_signup_entry_transition(page, log, timeout: int = 20) -> dict:
             return state
         error_text = _extract_auth_error_text(page)
         if error_text:
-            raise RuntimeError(f"邮箱页提交失败: {error_text[:300]}")
+            raise RuntimeError(f"{context}失败: {error_text[:300]}")
         time.sleep(0.25)
-    raise RuntimeError("邮箱页提交后未进入密码/验证码页面")
+    raise RuntimeError(f"{context}页面未推进：未进入密码/验证码/资料页面")
 
 
 def _start_browser_signup_via_page(page, email: str, log) -> dict:
@@ -1061,7 +1061,7 @@ def _start_browser_signup_via_authorize(page, email: str, device_id: str, log) -
     final_url = _browser_authorize(page, authorize_url, log)
     if not final_url:
         raise RuntimeError("访问 authorize URL 失败")
-    return _derive_registration_state_from_page(page)
+    return _wait_for_signup_entry_transition(page, log, context="OAuth 授权")
 
 
 def _dump_debug(page, prefix: str) -> None:
@@ -1119,7 +1119,10 @@ def _chatgpt_session_result_from_data(data: dict, page, cookies_dict: dict, log)
         latest_cookies.update(_get_cookies(page))
     except Exception as exc:
         log(f"ChatGPT session cookies 读取失败，使用已捕获 cookies: {exc}")
-    session_token = str(latest_cookies.get("__Secure-next-auth.session-token") or "").strip()
+    from platforms.chatgpt.switch import extract_session_token
+    session_token = extract_session_token(
+        str(data.get("sessionToken") or data.get("session_token") or ""), _cookies_to_header(latest_cookies),
+    )
     account_id = _extract_chatgpt_account_id(access_token)
     result = {
         "access_token": access_token,
@@ -1151,7 +1154,7 @@ def _chatgpt_session_result_from_text(text: str, page, cookies_dict: dict, log) 
 
 def _fetch_chatgpt_session_via_same_origin(page, cookies_dict: dict, log, session_url: str) -> tuple[dict | None, str, bool]:
     current_url = str(getattr(page, "url", "") or "")
-    if "chatgpt.com" not in current_url.lower():
+    if not _same_origin(current_url, session_url):
         return None, "", False
 
     log(f"浏览器内请求 ChatGPT session API: {session_url}")
@@ -1315,34 +1318,58 @@ def _generate_datadog_trace_headers() -> dict:
     }
 
 
+def _same_origin(left: str, right: str) -> bool:
+    try:
+        origins = []
+        for value in (left, right):
+            parsed = urlparse(value)
+            scheme = parsed.scheme.lower()
+            if scheme not in {"http", "https"} or not parsed.hostname:
+                return False
+            port = parsed.port if parsed.port is not None else (443 if scheme == "https" else 80)
+            origins.append((scheme, parsed.hostname.lower(), port))
+        return origins[0] == origins[1]
+    except ValueError:
+        return False
+
+
+def _is_chatgpt_callback_url(url: str) -> bool:
+    return (_same_origin(url, CHATGPT_APP)
+            and urlparse(url).path.rstrip("/") == "/api/auth/callback/openai"
+            and bool(_extract_code_from_url(url)))
+
+
 def _infer_page_type(data: dict | None, current_url: str = "") -> str:
     raw = data if isinstance(data, dict) else {}
     page_type = str(((raw.get("page") or {}).get("type")) or "").strip().lower().replace("-", "_").replace("/", "_").replace(" ", "_")
     if page_type:
         return page_type
-    url = (current_url or "").lower()
-    if "code=" in url:
+    if _is_chatgpt_callback_url(current_url):
         return "oauth_callback"
-    if "create-account/password" in url:
+    app_origin = _same_origin(current_url, CHATGPT_APP)
+    if not app_origin and not _same_origin(current_url, OPENAI_AUTH):
+        return ""
+    path = urlparse(current_url).path.lower().rstrip("/")
+    if app_origin:
+        return "chatgpt_home" if path == "" else ""
+    if path == "/create-account/password":
         return "create_account_password"
-    if "email-verification" in url or "email-otp" in url:
+    if path == "/email-verification" or "/email-otp" in path:
         return "email_otp_verification"
-    if "about-you" in url:
+    if path == "/about-you":
         return "about_you"
-    if "log-in/password" in url:
+    if path == "/log-in/password":
         return "login_password"
-    if "sign-in-with-chatgpt" in url and "consent" in url:
+    if "sign-in-with-chatgpt" in path and "consent" in path:
         return "consent"
-    if "workspace" in url and "select" in url:
+    if "workspace" in path and "select" in path:
         return "workspace_selection"
-    if "organization" in url and "select" in url:
+    if "organization" in path and "select" in path:
         return "organization_selection"
-    if "add-phone" in url:
+    if path == "/add-phone":
         return "add_phone"
-    if "/api/oauth/oauth2/auth" in url:
+    if path == "/api/oauth/oauth2/auth":
         return "external_url"
-    if "chatgpt.com" in url:
-        return "chatgpt_home"
     return ""
 
 
@@ -2823,32 +2850,65 @@ def _setup_chatgpt_password_and_totp(
         log("2FA 已存在且未返回 secret，保留注册时已设置的密码")
         password_result = {"password_set": True, "password_path": "registration_existing"}
     else:
-        password_result = _setup_chatgpt_password(
-            page=page,
-            email=session_email,
-            password=password,
-            secret=str(totp_result.get("totp_secret") or ""),
-            otp_callback=otp_callback,
-            excluded_email_codes=excluded_email_codes,
-            registration_email_identities=registration_email_identities,
-            log=log,
-        )
+        try:
+            password_result = _setup_chatgpt_password(
+                page=page,
+                email=session_email,
+                password=password,
+                secret=str(totp_result.get("totp_secret") or ""),
+                otp_callback=otp_callback,
+                excluded_email_codes=excluded_email_codes,
+                registration_email_identities=registration_email_identities,
+                log=log,
+            )
+        except Exception as exc:
+            from platforms.chatgpt.registration_credentials import PartialSecuritySetupError
+            raise PartialSecuritySetupError(exc, {**totp_result, "password_set": bool(password), "password_path": "registration"}) from exc
     if password_result.get("password_set"):
         log(f"设置的密码: {password}")
     return {**totp_result, **password_result}
 
 
 def _is_registration_complete(state: dict) -> bool:
-    page_type = str(state.get("page_type") or "")
-    url = str(state.get("current_url") or state.get("continue_url") or "").lower()
-    return page_type in {"callback", "oauth_callback", "chatgpt_home"} or (
-        "chatgpt.com" in url and "redirect_uri" not in url and "about-you" not in url
-    )
+    url = str(state.get("continue_url") or state.get("current_url") or "")
+    return _infer_page_type(None, url) in {"oauth_callback", "chatgpt_home"}
+
+
+def _complete_registration_navigation(page, state: dict, log, timeout: int = 20) -> dict:
+    target = str(state.get("continue_url") or state.get("current_url") or "")
+    current_url = str(page.url or "")
+    # DOM 提交可能已消费回调并落到首页；有会话 Cookie 时不重复消费 code。
+    from platforms.chatgpt.switch import extract_session_token
+    landed_with_session = (_infer_page_type(None, current_url) == "chatgpt_home"
+                           and bool(extract_session_token("", _cookies_to_header(_get_cookies(page)))))
+    if target != current_url and not (_is_chatgpt_callback_url(target) and landed_with_session):
+        log("跟随注册完成跳转，建立 ChatGPT 登录会话")
+        try:
+            # 回调 code 只能消费一次，页面已推进时等待重定向完成。
+            _goto_with_retry(page, target, wait_until="domcontentloaded", timeout=30000, attempts=1, log=log)
+        except Exception as exc:
+            if (not _is_transient_nav_error(exc)
+                    or _infer_page_type(None, page.url) not in {"oauth_callback", "chatgpt_home"}):
+                raise
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        actual = _derive_registration_state_from_page(page)
+        if actual.get("page_type") == "chatgpt_home":
+            _handle_post_signup_onboarding(page, log)
+            return _extract_flow_state(None, page.url)
+        if actual.get("page_type") and actual["page_type"] != "oauth_callback":
+            return actual
+        error = _extract_auth_error_text(page)
+        if error:
+            raise RuntimeError(f"注册回调失败: {error[:300]}")
+        time.sleep(0.25)
+    raise RuntimeError("注册回调页面未推进，尚未建立 ChatGPT 登录会话")
 
 
 def _handle_post_signup_onboarding(page, log) -> None:
     current_url = str(page.url or "")
-    if "chatgpt.com" not in current_url:
+    if not _same_origin(current_url, CHATGPT_APP):
         return
     try:
         # 可能弹出 persistent storage 提示，优先点 Allow，不影响主流程也可点 Block。
@@ -2897,13 +2957,13 @@ def _is_password_registration(state: dict) -> bool:
 
 
 def _is_email_otp(state: dict) -> bool:
-    target = f"{state.get('continue_url') or ''} {state.get('current_url') or ''}".lower()
-    return str(state.get("page_type") or "") == "email_otp_verification" or "email-verification" in target or "email-otp" in target
+    target = str(state.get("continue_url") or state.get("current_url") or "")
+    return str(state.get("page_type") or "") == "email_otp_verification" or _infer_page_type(None, target) == "email_otp_verification"
 
 
 def _is_about_you(state: dict) -> bool:
-    target = f"{state.get('continue_url') or ''} {state.get('current_url') or ''}".lower()
-    return str(state.get("page_type") or "") == "about_you" or "about-you" in target
+    target = str(state.get("continue_url") or state.get("current_url") or "")
+    return str(state.get("page_type") or "") == "about_you" or _infer_page_type(None, target) == "about_you"
 
 
 def _requires_registration_navigation(state: dict) -> bool:
@@ -3037,8 +3097,6 @@ def _submit_oauth_password_direct(page, password: str, log) -> dict:
         page_type = str(state.get("page_type") or "")
         if page_type in {"email_otp_verification", "about_you", "consent", "workspace_selection",
                          "organization_selection", "add_phone", "oauth_callback", "chatgpt_home", "external_url"}:
-            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
-        if "code=" in current_url:
             return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
         error_text = _extract_auth_error_text(page)
         if error_text:
@@ -3258,11 +3316,10 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
     while time.time() < deadline:
         current_url = page.url
         last_url = current_url or last_url
-        if "about-you" in current_url:
-            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
-        if "add-phone" in current_url or "chatgpt.com" in current_url or "code=" in current_url:
-            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
-        if "consent" in current_url or "sign-in-with-chatgpt" in current_url or "workspace" in current_url or "organization" in current_url:
+        if _infer_page_type(None, current_url) in {
+            "about_you", "add_phone", "chatgpt_home", "oauth_callback", "consent",
+            "workspace_selection", "organization_selection",
+        }:
             return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
         try:
             error_text = page.locator("text=Invalid code").first.text_content(timeout=400)
@@ -3848,9 +3905,7 @@ def _submit_about_you_via_page(page, log) -> dict:
     while time.time() < deadline:
         current_url = page.url
         last_url = current_url or last_url
-        if "code=" in current_url or "chatgpt.com" in current_url or "sign-in-with-chatgpt" in current_url:
-            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
-        if "add-phone" in current_url:
+        if _infer_page_type(None, current_url) in {"oauth_callback", "chatgpt_home", "consent", "add_phone"}:
             return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
         try:
             error_text = page.locator("text=Sorry, we cannot create your account").first.text_content(timeout=500)
@@ -3948,6 +4003,7 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, lo
     )
     log(f"注册状态起点: page={state.get('page_type') or '-'} url={(state.get('current_url') or '')[:100]}")
     register_submitted = False
+    account_created = False
     seen_states: dict[str, int] = {}
 
     for step in range(12):
@@ -3968,8 +4024,17 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, lo
             raise RuntimeError(f"注册状态卡住: page={state.get('page_type') or '-'}")
 
         if _is_registration_complete(state):
-            _handle_post_signup_onboarding(page, log)
-            return _extract_flow_state(None, page.url)
+            try:
+                state = _complete_registration_navigation(page, state, log)
+            except Exception:
+                if not account_created:
+                    raise
+                log("账号资料已提交，回调未完成，继续尝试获取注册凭据")
+                state = _extract_flow_state(None, page.url)
+                return {**state, "account_created": True}
+            if state.get("page_type") == "chatgpt_home":
+                return {**state, "account_created": account_created}
+            continue
 
         if _is_password_registration(state):
             log("[registration:authorization] 设置注册密码")
@@ -4056,6 +4121,7 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, lo
             log(f"about_you 提交状态: {about_resp.get('status', 0)}")
             if not about_resp.get("ok"):
                 raise RuntimeError(f"about_you 提交失败: {(about_resp.get('text') or '')[:300]}")
+            account_created = True
             state = _extract_flow_state(about_resp.get("data"), about_resp.get("url", page.url))
             if not state.get("page_type"):
                 state = _derive_registration_state_from_page(page)
@@ -4185,7 +4251,8 @@ class ChatGPTBrowserRegister:
                 capture_registration_otp,
                 self.log,
             )
-            self.log(f"注册流程完成: page={final_state.get('page_type') or '-'}")
+            self.log(f"注册页面流程结束: page={final_state.get('page_type') or '-'}，正在确认注册结果")
+            account_created = bool(final_state.get("account_created"))
             if registration_email_codes:
                 self.log("已记录注册阶段邮箱验证码，re-auth 将强制等待新的邮箱验证码")
 
@@ -4203,6 +4270,8 @@ class ChatGPTBrowserRegister:
                     )
                     self.log("已在安全设置前保存 ChatGPT access token 快照")
                 except Exception as exc:
+                    if not account_created:
+                        raise RuntimeError("未确认账号创建成功：注册后未获取到有效 ChatGPT session/accessToken") from exc
                     self.log(f"安全设置前获取 access token 快照失败: {exc}")
 
             if self.setup_security:
@@ -4239,6 +4308,7 @@ class ChatGPTBrowserRegister:
                         "totp_set": False,
                         "totp_secret": "",
                         "otpauth": "",
+                        **getattr(exc, "partial_result", {}),
                     }
             else:
                 self.log("已跳过注册后的 TOTP+密码设置")
@@ -4265,7 +4335,12 @@ class ChatGPTBrowserRegister:
                     )
                     session_info = pre_security_session_info
                 else:
-                    raise
+                    if not account_created:
+                        raise RuntimeError("未确认账号创建成功：注册后未获取到有效 ChatGPT session/accessToken") from exc
+                    self.log(f"最终 session 获取失败，保留已注册账号：{exc}")
+                    session_info = {}
+            if not account_created and not session_info.get("access_token"):
+                raise RuntimeError("未确认账号创建成功：注册后未获取到有效 ChatGPT session/accessToken")
             result = {
                 "email": email,
                 "password": password,
@@ -4291,4 +4366,13 @@ class ChatGPTBrowserRegister:
             with self._active_lock:
                 self._active_page = None
                 self._active_browser = None
+            from platforms.chatgpt.registration_credentials import finalize_registered_credentials
+            result = finalize_registered_credentials(
+                result, proxy=self.proxy, otp_callback=self.otp_callback, log=self.log,
+                cancel_check=lambda: self.cancel_check() or self._cancel_requested.is_set(),
+                register_cancel_callback=getattr(self, "register_cancel_callback", None),
+            )
+            if not account_created and not result.get("token_verified"):
+                raise RuntimeError(f"未确认账号创建成功：{result.get('credential_error') or 'ChatGPT 登录凭据验证失败'}")
+            self.log(f"注册流程完成: page={final_state.get('page_type') or '-'}")
             return result

@@ -57,6 +57,7 @@ class TasksQueryService:
             "finished_at": serialize_datetime(item.finished_at),
             "updated_at": serialize_datetime(item.updated_at),
             "result": item.result,
+            "data": item.result.get("data"),
         }
         if item.type == "register":
             data["registration_stats"] = registration_snapshot(

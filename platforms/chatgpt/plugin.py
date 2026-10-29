@@ -321,6 +321,11 @@ class ChatGPTPlatform(BasePlatform):
                 "otpauth": result.get("otpauth", ""),
                 "security_setup_ok": result.get("security_setup_ok", True),
                 "security_setup_error": result.get("security_setup_error", ""),
+                "token_verified": result.get("token_verified", False),
+                "login_required": result.get("login_required", False),
+                "credential_error_code": result.get("credential_error_code", ""),
+                "credential_error": result.get("credential_error", ""),
+                "account_overview": result.get("account_overview", {}),
             },
         )
 
@@ -340,6 +345,7 @@ class ChatGPTPlatform(BasePlatform):
             register_cancel = (ctx.extra or {}).get("_register_cancel_callback")
             if callable(register_cancel):
                 register_cancel(worker.cancel)
+                worker.register_cancel_callback = register_cancel
             return worker
 
         return BrowserRegistrationAdapter(
@@ -366,6 +372,7 @@ class ChatGPTPlatform(BasePlatform):
             register_cancel = (ctx.extra or {}).get("_register_cancel_callback")
             if callable(register_cancel):
                 register_cancel(worker.close)
+                worker.register_cancel_callback = register_cancel
             return worker
 
         return ProtocolMailboxAdapter(
@@ -679,12 +686,13 @@ class ChatGPTPlatform(BasePlatform):
                 proxy_pool.report_fail(proxy)
             data = candidate
         if self._state_query_has_credential_error(data):
-            # A 401 response proves the saved bearer credential is no longer
-            # usable. The account itself can still be active through a newer
-            # browser session, so do not turn it into an account-invalid flag.
+            # A rejected token or anonymous profile means this query could not
+            # authenticate the account. Keep that separate from account validity.
             data.pop("valid", None)
             data["check_state"] = "credential_invalid"
-            data["check_error"] = data.get("profile_error") or "ChatGPT rejected the saved access token"
+            data["login_required"] = True
+            profile_error = data.get("profile_error") or {}
+            data["check_error"] = profile_error.get("error") or profile_error
         elif not self._state_query_is_terminal(data):
             # A timeout, rate limit, or connection failure says nothing about
             # account validity. A 403 can also be a WAF or network policy
@@ -696,6 +704,7 @@ class ChatGPTPlatform(BasePlatform):
             data["check_state"] = "invalid"
         else:
             data["check_state"] = "valid"
+            data["login_required"] = False
 
         if not include_trial:
             for key in ("plus_trial_eligible", "plus_trial_check_state", "plus_trial_error"):
@@ -748,17 +757,17 @@ class ChatGPTPlatform(BasePlatform):
     def _state_query_is_terminal(data: dict) -> bool:
         if data.get("valid") is True:
             return True
-        profile_error = data.get("profile_error")
-        if isinstance(profile_error, dict):
-            return int(profile_error.get("status_code") or 0) == 401
-        return False
+        return ChatGPTPlatform._state_query_has_credential_error(data)
 
     @staticmethod
     def _state_query_has_credential_error(data: dict) -> bool:
         profile_error = data.get("profile_error")
         if not isinstance(profile_error, dict):
             return False
-        return int(profile_error.get("status_code") or 0) == 401
+        return (
+            int(profile_error.get("status_code") or 0) == 401
+            or profile_error.get("error_code") == "anonymous_profile"
+        )
 
     def _handle_upload_cpa(self, account: Account, params: dict) -> dict:
         return self._execute_platform_action("upload_cpa", account, params)
